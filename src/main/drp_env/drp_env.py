@@ -25,7 +25,7 @@ class DrpEnv(gym.Env):
 			reward_list={"goal": 100, "collision": -10, "wait": -10, "move": -1},
 			task_flag=False,
 			task_list = None,
-			use_lare_path=False,
+			use_lare_path=True,
 			use_lare_path_training=True,
 			lare_path_factor_dim=10,
 			lare_path_decoder_hidden_dim=64,
@@ -34,15 +34,15 @@ class DrpEnv(gym.Env):
 			lare_path_transformer_heads=4,
 			lare_path_transformer_depth=2,
 			lare_path_buffer_capacity=512,
-			lare_path_min_buffer=64,
-			lare_path_update_freq=32,
+			lare_path_min_buffer=256,
+			lare_path_update_freq=3,
 			lare_path_batch_size=32,
 			lare_path_lr=5e-4,
 			use_pretrained_lare_path=False,
 			pretrained_lare_path_model_path=None,
 			use_finetuning_lare_path=False,
 			finetuning_lare_path_model_path=None,
-			lare_path_autosave=False,
+			lare_path_autosave=True,
 			lare_path_autosave_path=None,
 			lare_path_save_dir=None,
 			# --- LaRe-Task (System B) ---
@@ -52,8 +52,8 @@ class DrpEnv(gym.Env):
 			lare_task_decoder_hidden_dim=64,
 			lare_task_decoder_n_layers=2,
 			lare_task_buffer_capacity=512,
-			lare_task_min_buffer=32,
-			lare_task_update_freq=16,
+			lare_task_min_buffer=256,
+			lare_task_update_freq=3,
 			lare_task_batch_size=32,
 			lare_task_lr=5e-4,
 			use_pretrained_lare_task=False,
@@ -84,7 +84,7 @@ class DrpEnv(gym.Env):
 
 		self.time_limit = time_limit
 
-		self.colli_distan_value = 0.1
+		self.colli_distan_value = self.speed
 		self.r_flag = 0
 		self.flag_indicate = 0
 		self.episode_account = 0

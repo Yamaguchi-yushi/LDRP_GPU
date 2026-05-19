@@ -23,7 +23,7 @@ class DrpEnv(gym.Env):
 			collision,
 			map_name="map_3x3",
 			reward_list={"goal": 100, "collision": -10, "wait": -10, "move": -1},
-			task_flag=False,
+			task_flag=True,
 			task_list = None,
 			use_lare_path=True,
 			use_lare_path_training=True,
@@ -601,6 +601,33 @@ class DrpEnv(gym.Env):
 		return obs
 		
 
+	def _default_task_assign_tp(self):
+		"""Built-in nearest-pending-task assigner used when the caller does not
+		supply a task action (e.g., epymarl's gymma wrapper passes only a path
+		action list). Mirrors src/task_assign/task_policy/tp.py inline so the
+		env has no runtime dependency on the task_assign package.
+
+		Returns: list of length agent_num. Each element is -1 (no assignment)
+		or an index j into self.current_tasklist (assign task j to agent i).
+		"""
+		assigned_local = list(self.assigned_list)
+		task_assign = [-1] * self.agent_num
+		for i in range(self.agent_num):
+			if self.assigned_tasks[i] == [] and self.current_tasklist:
+				shortest = float("inf")
+				best = -1
+				for j in range(len(self.current_tasklist)):
+					if assigned_local[j] != -1:
+						continue
+					path_len = self.get_path_length(self.goal_array[i], self.current_tasklist[j][0])
+					if path_len < shortest:
+						shortest = path_len
+						best = j
+				if best != -1:
+					assigned_local[best] = i
+					task_assign[i] = best
+		return task_assign
+
 	def step(self, joint_action):
 
 		#print("tasks",self.current_tasklist)
@@ -608,6 +635,15 @@ class DrpEnv(gym.Env):
 		if isinstance(joint_action, dict):
 			task_assign = joint_action.get("task", None)
 			joint_action = joint_action.get("pass", joint_action)
+		else:
+			task_assign = None
+
+		# Fallback: callers that pass only path actions (e.g., epymarl's gymma
+		# wrapper, which sends list[int]) don't supply task decisions. When the
+		# task system is active, use the built-in TP assigner so MARL training
+		# can run with task_flag=True without an external task policy.
+		if self.is_tasklist and task_assign is None:
+			task_assign = self._default_task_assign_tp()
 
 		# LaRe-Path: snapshot per-agent onehot positions BEFORE movement.
 		if self.use_lare_path and self.lare_path_module is not None:

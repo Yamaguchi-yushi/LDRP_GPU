@@ -864,3 +864,56 @@ LDRP における二つの報酬問題：
 ```
 
 **実装の優先順位:** System B（タスク割り当て）→ System A（経路計画）の順で実装する．System B は決定が疎で実装が単純であり，現状の `sum(rew_n)` という明確な問題を修正する効果が見えやすいため．
+
+---
+
+## 14. 今後の拡張 (未実装)
+
+実装済みのコードを書き換えずに，今後追加していく改修を集約する章．既存の章 (1〜13) は設計時の根拠を残すため変更しない．
+
+### 14-1. epymarl 経由での同時学習 (PPO タスク割当 + MARL 経路計画 + LaRe 両系統)
+
+**動機**: 現状 `train.py` (epymarl サブプロセス) で学習されるのは経路計画 MARL のみで，タスク割当は env 内蔵の TP フォールバック (後述 14-2) によりベースラインヒューリスティックで固定される．経路と割当を **共進化** させたい場合に必要．
+
+**現状の制約**:
+
+1. **epymarl の gymma wrapper は path action (`list[int]`) しか env に渡せない**．タスクアクションを epymarl の action space に持ち込めないため，割当決定を学習可能にするには env 内部に PPO を埋め込む必要がある (LaRe-Path / LaRe-Task と同じパターン)．
+2. **既存の PPOAgent には複数のバグがある** ([src/task_assign/task_policy/ppo.py](src/task_assign/task_policy/ppo.py))．
+   - Bug A: `assign_task(env, current_tasklist, assigned_tasklist)` のシグネチャが TaskManager の呼び出し `assign_task(env)` と不整合
+   - Bug B: `update()` の `for _ in range(self.args.epochs):` 内側 `for batch in loader:` の後にインデントされた勾配計算が，バッチごとに走らず epoch ごとに最後の batch だけを使う
+   - Bug C: `runner.py` の training 分岐が `self.task_Agent.task_assigner...` を参照しているが，本来 `self.task_manager` の typo (epymarl 経由学習では使われないので残置されている)
+   - Bug D: `test.py` で `Runner(config, env, reward_list)` が呼ばれており，`training=True` が渡されない
+
+**実装方針 (案)**:
+
+1. **PPO バグ修正 (A, B)**: epymarl 経路で使う前に必須．Bug C, D は test.py 経由の場合に必要なのでこのフェーズでは保留可．
+2. **env への PPO 内蔵**: [drp_env.py](src/main/drp_env/drp_env.py) に `self.ppo_task_module` を追加 (LaRe-Path / LaRe-Task と同じ位置).
+   - `use_ppo_task=True` フラグで有効化．
+   - `step()` 内で list 形式アクション + `task_flag=True` の場合，TP フォールバックの代わりに PPO で `task_assign` を推論．
+   - 状態・行動・log_prob を内部バッファに蓄積．
+   - エピソード終了で `process_end_episode()` + `update_ready()` → `update()`.
+   - autosave 命名: `Safe_{ALGO}_TASKPPO_{map}_{N}agents_{X.X}M_checkpoint.pth` (LaRe と並列).
+3. **LaRe-Task との連携**: 既存の `lare_task_module` が PPO の `assign_task` 決定時に encoder を呼んで proxy 報酬を生成する設計なので，PPO 内蔵時は PPO バッファに記録する報酬を環境報酬合計から **`info["lare_task_proxy_reward"]`** に切り替える．既存の runner.py:108-117 と同じロジックを env step() 内に移植．
+
+**実装規模見積もり**:
+
+| 項目 | 見積もり |
+| --- | --- |
+| ppo.py の Bug A, B 修正 | 50〜100 行 |
+| drp_env.py への PPO 統合 (init / step / end_episode / save) | 200〜300 行 |
+| yaml / register 設定追加 | 30〜50 行 |
+| 動作検証 (smoke test) | 1 日 |
+| 合計 | 2〜3 日 |
+
+**先送りの判断**:
+
+優先度は低い．理由:
+
+- まず経路計画単体での LaRe-Path 効果を切り分けて確認したい．共進化を入れると効果の原因切り分けが難しくなる．
+- 元論文 LaRe (AAAI-2025) も「報酬整形器の学習」と「方策学習」を独立に検証している．まずは方針 A (2 段階) で検証して，必要性が見えたら同時学習に踏み込む．
+
+### 14-2. TP フォールバック (実装済み, 2026-05-19)
+
+epymarl 経由で `task_flag=True` 学習を成立させるための env 内蔵タスク割当．`drp_env.step()` が dict 形式アクションを受け取らない (list のみ) 場合，かつ `task_flag=True` のとき，[src/task_assign/task_policy/tp.py](src/task_assign/task_policy/tp.py) と同じ最近隣ヒューリスティックを env メソッドとして実行する．test.py 経由 (dict アクション) の動作は変えない．14-1 で PPO を内蔵するときは，このフォールバックを「PPO 未有効時のデフォルト」として残す．
+
+実装位置: [drp_env.py](src/main/drp_env/drp_env.py) の `_default_task_assign_tp()` メソッドおよび `step()` 冒頭の分岐．

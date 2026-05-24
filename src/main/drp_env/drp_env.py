@@ -63,9 +63,14 @@ class DrpEnv(gym.Env):
 			lare_task_autosave=False,
 			lare_task_autosave_path=None,
 			lare_task_save_dir=None,
+			# PBS 互換モード: True にすると待機分岐で current_goal を非 None に保つ
+			# (PBS の path 計画で必要). False にすると SafeEnv の保護が待機 agent
+			# にも効く. デフォルト False = 安全制御優先 (詳細は CLAUDE.md).
+			pbs_mode=False,
 		  ):
 		self.agent_num = agent_num
 		self.n_agents = agent_num # for epymarl
+		self.pbs_mode = bool(pbs_mode)
 		self.state_repre_flag = state_repre_flag
 		self.map_name = map_name
 		self.speed = speed
@@ -686,13 +691,16 @@ class DrpEnv(gym.Env):
 			elif self.pos[int(action_i)][0]==self.obs[i][0] and self.pos[int(action_i)][1]==self.obs[i][1]:
 				self.obs_prepare.append(self.obs_current_chache[i])
 				self.wait_count[i] += 1
-				# 元々は「PBS のため待機時も current_goal を None のままにしない」
-				# 目的で下記の代入をしていたが、これを行うと SafeEnv (wrapper/safe_marl.py)
-				# の `if self.current_goal[i] == None:` ガードが待機 agent に対して
-				# 機能せず、衝突回避ロジックがバイパスされてしまう.
-				# 安全制御を優先する判断で 2026-05-19 にコメントアウト. PBS を再度
-				# 有効化するときはここを戻す必要あり.
-				# self.current_goal_prepare[i] = action_i   # ← PBS 用 (現在は安全制御優先で無効化)
+				# pbs_mode=True のとき: PBS が他 agent の待機予定を path 計画に反映できる
+				#   ように current_goal を非 None (= action_i, = 待機ノード) に保つ.
+				# pbs_mode=False のとき: SafeEnv (wrapper/safe_marl.py) の
+				#   `if self.current_goal[i] == None:` ガードが待機 agent でも機能し、
+				#   同一目的地衝突・head-on swap を事前回避できる.
+				# デフォルトは False (安全制御優先). test.py 側で path_planner=='pbs' を
+				#   検出して自動で True にする運用. 詳細は CLAUDE.md「SafeEnv と PBS の
+				#   トレードオフ」を参照.
+				if self.pbs_mode:
+					self.current_goal_prepare[i] = action_i
 			# if available ⇢ obs_prepare update by obs_i_
 			else:
 				#self.joint_action_old[i] = joint_action[i]

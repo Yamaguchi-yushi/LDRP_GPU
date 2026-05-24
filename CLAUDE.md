@@ -89,19 +89,25 @@ LDRP/
   - フォルダは `src/lare/path/saved_models/` と `src/lare/task/saved_models/` で分離
 - 既存ファイルへの編集は最小限。新機能は新ディレクトリに分離
 
-### SafeEnv と PBS のトレードオフ (重要)
+### SafeEnv と PBS のトレードオフ (= `pbs_mode` フラグで切替可能)
 
-[src/main/drp_env/drp_env.py](src/main/drp_env/drp_env.py) の `step()` 内、「if action_i is current start node -> stop」分岐 (= 待機アクション) に `self.current_goal_prepare[i] = action_i` という 1 行があった。これは元々 **PBS path planner のために** 待機時も `current_goal` を None のままにしない目的で追加されたもの。
+[src/main/drp_env/drp_env.py](src/main/drp_env/drp_env.py) の `step()` 内、「if action_i is current start node -> stop」分岐 (= 待機アクション) に `self.current_goal_prepare[i] = action_i` という代入がある。これは元々 **PBS path planner のために** 待機時も `current_goal` を None のままにしない目的で追加されたもの。
 
-ただし、この行があると **SafeEnv (`src/main/drp_env/wrapper/safe_marl.py`) のガード `if self.current_goal[i] == None:` が待機 agent に対して false になり、衝突回避ロジックがバイパスされてしまう**。結果として、待機中の agent と動いている agent の衝突を SafeEnv が防げなくなる。
+ただし、この代入が常に実行されると **SafeEnv (`src/main/drp_env/wrapper/safe_marl.py`) のガード `if self.current_goal[i] == None:` が待機 agent に対して false になり、衝突回避ロジックがバイパスされてしまう**。結果として、待機中の agent と動いている agent の衝突を SafeEnv が防げなくなる。
 
-**現在の判断 (2026-05-19 〜)**: 安全制御を優先するため、当該行は **コメントアウト** されている。よって:
+**現在の判断 (2026-05-19 〜)**: `pbs_mode` (bool) フラグで切替可能にしている。
 
-- **QMIX / IQL / VDN / MAA2C 等の MARL path planner を使う限りは安全制御が機能** (これが現状の標準ユースケース)
-- **PBS を再度有効化したい場合は、当該行をアンコメントする必要あり** (= 安全制御は失う)
-- どちらかしか同時に満たせない既知の制約
+| `pbs_mode` | 待機分岐の動作 | 影響 |
+|---|---|---|
+| **False** (デフォルト) | 代入をスキップ → `current_goal` は None のまま | **SafeEnv が待機 agent も保護** ✓ MARL 系 (QMIX/IQL/VDN/MAA2C) で衝突減 |
+| **True** | 代入実行 → `current_goal = 待機ノード id` | **PBS の path 計画が正しく動く** ✓ ただし SafeEnv の保護は失う |
 
-履歴: 開発者から「あのコメント行を消すと安全制御が機能する」との情報を受けて修正。以前にこの行起因の SafeEnv 無限ループバグも見つけたが (2026-05-13 修正)、根本原因がこの行であることが分かったため、SafeEnv の bug fix は元に戻し、原因側の行を消す方針に統一。
+`test.py` は `config.path_planner == "pbs"` のとき自動で `pbs_mode=True` を `gym.make()` に渡す ([test.py](test.py))。MARL 系では `False` (= デフォルト) のまま。
+
+履歴:
+
+- 2026-05-13: 当該行に起因する SafeEnv 無限ループバグを発見 → safe_marl.py に値変化チェックを追加 (= 対症療法)
+- 2026-05-19: 開発者から「待機分岐の代入をコメントアウトすると安全制御が機能する」との情報を受けて、根本原因側を無効化し safe_marl.py を元に戻した。同時に `pbs_mode` フラグで両立できるよう条件分岐化
 
 ---
 

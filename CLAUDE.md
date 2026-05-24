@@ -89,6 +89,20 @@ LDRP/
   - フォルダは `src/lare/path/saved_models/` と `src/lare/task/saved_models/` で分離
 - 既存ファイルへの編集は最小限。新機能は新ディレクトリに分離
 
+### SafeEnv と PBS のトレードオフ (重要)
+
+[src/main/drp_env/drp_env.py](src/main/drp_env/drp_env.py) の `step()` 内、「if action_i is current start node -> stop」分岐 (= 待機アクション) に `self.current_goal_prepare[i] = action_i` という 1 行があった。これは元々 **PBS path planner のために** 待機時も `current_goal` を None のままにしない目的で追加されたもの。
+
+ただし、この行があると **SafeEnv (`src/main/drp_env/wrapper/safe_marl.py`) のガード `if self.current_goal[i] == None:` が待機 agent に対して false になり、衝突回避ロジックがバイパスされてしまう**。結果として、待機中の agent と動いている agent の衝突を SafeEnv が防げなくなる。
+
+**現在の判断 (2026-05-19 〜)**: 安全制御を優先するため、当該行は **コメントアウト** されている。よって:
+
+- **QMIX / IQL / VDN / MAA2C 等の MARL path planner を使う限りは安全制御が機能** (これが現状の標準ユースケース)
+- **PBS を再度有効化したい場合は、当該行をアンコメントする必要あり** (= 安全制御は失う)
+- どちらかしか同時に満たせない既知の制約
+
+履歴: 開発者から「あのコメント行を消すと安全制御が機能する」との情報を受けて修正。以前にこの行起因の SafeEnv 無限ループバグも見つけたが (2026-05-13 修正)、根本原因がこの行であることが分かったため、SafeEnv の bug fix は元に戻し、原因側の行を消す方針に統一。
+
 ---
 
 ## ユーザー嗜好

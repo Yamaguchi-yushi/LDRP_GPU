@@ -30,12 +30,8 @@ class SafeEnv(DrpEnv):
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
 						if j != i and joint_action[i] == joint_action[j]:
-							# 値が変わるときだけ do=True にして再ループ. 既に
-							# current_start[i] と一致している場合に更新+再ループを
-							# 繰り返すと無限ループになるため.
-							if joint_action[i] != self.current_start[i]:
-								joint_action[i] = self.current_start[i]
-								do = True
+							joint_action[i] = self.current_start[i]
+							do = True #条件が変わる可能性があるため，もう一度ループを回す
 							break
 
 				#act9，正面衝突
@@ -43,9 +39,8 @@ class SafeEnv(DrpEnv):
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
 						if j != i and (joint_action[j] == self.current_start[i] and joint_action[i] == self.current_start[j]):
-							if joint_action[i] != self.current_start[i]:
-								joint_action[i] = self.current_start[i]
-								do = True
+							joint_action[i] = self.current_start[i]
+							do = True
 							break
 
 		joint_action = {"pass": joint_action, "task": task_assign} if task_assign is not None else joint_action

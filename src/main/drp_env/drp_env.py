@@ -686,9 +686,13 @@ class DrpEnv(gym.Env):
 			elif self.pos[int(action_i)][0]==self.obs[i][0] and self.pos[int(action_i)][1]==self.obs[i][1]:
 				self.obs_prepare.append(self.obs_current_chache[i])
 				self.wait_count[i] += 1
-				#pbsのため，その場待機でもcurrent_goalをNoneのままでないように変更
-				#従来のdrpは以下の行はなし
-				self.current_goal_prepare[i] = action_i
+				# 元々は「PBS のため待機時も current_goal を None のままにしない」
+				# 目的で下記の代入をしていたが、これを行うと SafeEnv (wrapper/safe_marl.py)
+				# の `if self.current_goal[i] == None:` ガードが待機 agent に対して
+				# 機能せず、衝突回避ロジックがバイパスされてしまう.
+				# 安全制御を優先する判断で 2026-05-19 にコメントアウト. PBS を再度
+				# 有効化するときはここを戻す必要あり.
+				# self.current_goal_prepare[i] = action_i   # ← PBS 用 (現在は安全制御優先で無効化)
 			# if available ⇢ obs_prepare update by obs_i_
 			else:
 				#self.joint_action_old[i] = joint_action[i]

@@ -66,6 +66,11 @@ class EpisodeRunner:
             # Receive the actions for each agent at this timestep in a batch of size 1
             actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
 
+            # LaRe-Path/Task の保存ファイル名 ({X.X}M) を t_env と一致させるため
+            # train step のみ env に共有する. test 中は呼ばないので test step は除外される.
+            if not test_mode and hasattr(self.env, "set_train_step"):
+                self.env.set_train_step(self.t_env + self.t + 1)
+
             reward, terminated, env_info = self.env.step(actions[0])
             if test_mode and self.args.render:
                 self.env.render()

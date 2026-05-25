@@ -25,7 +25,7 @@ class DrpEnv(gym.Env):
 			reward_list={"goal": 100, "collision": -10, "wait": -10, "move": -1},
 			task_flag=True,
 			task_list = None,
-			use_lare_path=False,
+			use_lare_path=True,
 			use_lare_path_training=True,
 			lare_path_factor_dim=10,
 			lare_path_decoder_hidden_dim=64,
@@ -155,9 +155,13 @@ class DrpEnv(gym.Env):
 		self.lare_path_module = None
 		self._lare_prev_onehot_pos = None
 		self._lare_current_colliding_pairs = None
-		# Cumulative step counter (NOT reset between episodes) — used to derive
-		# the "{N.N}M" steps token in saved-model filenames, mirroring Safe-TSL-DBCT.
+		# Cumulative step counter — saved-model filename の "{N.N}M" トークンに使う.
+		# epymarl 経路では set_train_step(t_env) で外部から train step だけを反映
+		# させたいので, 一度 set_train_step が呼ばれて _lare_step_externally_set が
+		# True になったら以降 step() での auto-increment を停止する.
+		# 呼ばれなかった場合 (test.py 等) は従来通り step() ごとに +1.
 		self._lare_total_step_account = 0
+		self._lare_step_externally_set = False
 
 		# --- LaRe-Task (System B) ---
 		self.use_lare_task = bool(use_lare_task)
@@ -599,6 +603,16 @@ class DrpEnv(gym.Env):
 	def get_avail_agent_actions(self, agent_id, n_actions):
 		return self._get_avail_agent_actions(agent_id, n_actions)
 
+	def set_train_step(self, t_env):
+		"""epymarl など外部の学習ループから train step (t_env) を共有してもらい,
+		LaRe-Path/Task の保存ファイル名 ({X.X}M トークン) に反映する.
+		この setter が一度でも呼ばれた env では step() ごとの auto-increment を停止し,
+		以降は外部から渡される値だけを使う (test step を除外できる).
+		呼ばれなかった env (test.py 等) は従来通り step() で auto-increment.
+		"""
+		self._lare_total_step_account = int(t_env)
+		self._lare_step_externally_set = True
+
 	def seed(self, seed=None):
 		"""Gym 0.21 互換シード設定. gym 0.26 で削除された API だが epymarl の
 		gymma wrapper (src/epymarl/src/envs/__init__.py) が直接呼ぶため互換実装.
@@ -710,9 +724,11 @@ class DrpEnv(gym.Env):
 		if self.use_lare_path and self.lare_path_module is not None:
 			self._lare_prev_onehot_pos = self._lare_capture_prev_onehot_pos()
 		# Advance the cumulative step counter (shared by Path & Task naming).
+		# 外部 (epymarl の set_train_step) から管理されている場合は auto-increment しない.
 		if (self.use_lare_path and self.lare_path_module is not None) or \
 		   (self.use_lare_task and self.lare_task_module is not None):
-			self._lare_total_step_account += 1
+			if not self._lare_step_externally_set:
+				self._lare_total_step_account += 1
 
 		#transite env based on joint_action
 		self.step_account += 1

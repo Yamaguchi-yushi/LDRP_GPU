@@ -31,11 +31,11 @@ use_lare_path_training: true        # false: デコーダだけ学習、報酬�
 
 # Pretrained モード (ロード + 凍結 / 推論専用)
 use_pretrained_lare_path: false
-pretrained_lare_path_model_path: null
+pretrained_lare_path_model_name: null
 
 # Finetuning モード (ロード + 学習継続)
 use_finetuning_lare_path: false
-finetuning_lare_path_model_path: null
+finetuning_lare_path_model_name: null
 
 # 自動保存
 lare_path_autosave: false
@@ -49,10 +49,10 @@ use_lare_task: false
 use_lare_task_training: true
 
 use_pretrained_lare_task: false
-pretrained_lare_task_model_path: null
+pretrained_lare_task_model_name: null
 
 use_finetuning_lare_task: false
-finetuning_lare_task_model_path: null
+finetuning_lare_task_model_name: null
 
 lare_task_autosave: false
 lare_task_autosave_path: null

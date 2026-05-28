@@ -79,11 +79,11 @@ lare_task_autosave: true
 ```yaml
 use_lare_path: true
 use_pretrained_lare_path: true
-pretrained_lare_path_model_path: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
+pretrained_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
 
 use_lare_task: true
 use_pretrained_lare_task: true
-pretrained_lare_task_model_path: "Safe_QMIX_TASK_map_8x5_4agents_2.0M_checkpoint.pth"
+pretrained_lare_task_model_name: "Safe_QMIX_TASK_map_8x5_4agents_2.0M_checkpoint.pth"
 ```
 
 → 重みをロード → デコーダは凍結 (`frozen=True`) → 推論専用。
@@ -93,7 +93,7 @@ pretrained_lare_task_model_path: "Safe_QMIX_TASK_map_8x5_4agents_2.0M_checkpoint
 ```yaml
 use_lare_path: true
 use_finetuning_lare_path: true
-finetuning_lare_path_model_path: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
+finetuning_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
 lare_path_autosave: true
 ```
 
@@ -172,9 +172,9 @@ env 初期化時に標準出力に出ます。例:
 | キー | デフォルト | 説明 |
 |---|---|---|
 | `use_pretrained_lare_path` | false | Pretrained モードに入る |
-| `pretrained_lare_path_model_path` | null | ロード対象パス (絶対 or 相対 or ファイル名のみ) |
+| `pretrained_lare_path_model_name` | null | ロード対象パス (絶対 or 相対 or ファイル名のみ) |
 | `use_finetuning_lare_path` | false | Finetuning モードに入る |
-| `finetuning_lare_path_model_path` | null | ロード対象パス |
+| `finetuning_lare_path_model_name` | null | ロード対象パス |
 | `lare_path_autosave` | false | 学習中の自動保存 (scratch / finetuning でのみ動作) |
 | `lare_path_autosave_path` | null | 明示的な保存パス (固定文字列で1ファイル上書き) |
 | `lare_path_save_dir` | null | 保存先ディレクトリ (null なら `src/lare/path/saved_models/`) |
@@ -323,8 +323,8 @@ DrpEnv(
     # System A
     use_lare_path=False, use_lare_path_training=True,
     lare_path_factor_dim=10, lare_path_decoder_hidden_dim=64, ...
-    use_pretrained_lare_path=False, pretrained_lare_path_model_path=None,
-    use_finetuning_lare_path=False, finetuning_lare_path_model_path=None,
+    use_pretrained_lare_path=False, pretrained_lare_path_model_name=None,
+    use_finetuning_lare_path=False, finetuning_lare_path_model_name=None,
     lare_path_autosave=False, lare_path_autosave_path=None, lare_path_save_dir=None,
     # System B
     use_lare_task=False, use_lare_task_training=True, ...
@@ -484,7 +484,7 @@ lare_task_autosave: true
 ```yaml
 use_lare_path: true
 use_pretrained_lare_path: true
-pretrained_lare_path_model_path: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
+pretrained_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth"
 use_lare_task: false
 ```
 
@@ -492,7 +492,7 @@ use_lare_task: false
 ```yaml
 use_lare_path: true
 use_finetuning_lare_path: true
-finetuning_lare_path_model_path: "Safe_QMIX_PATH_map_8x5_4agents_1.0M_checkpoint.pth"
+finetuning_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_4agents_1.0M_checkpoint.pth"
 lare_path_autosave: true
 use_lare_task: true
 lare_task_autosave: true
@@ -552,7 +552,7 @@ cp src/lare/path/checkpoints/Safe_QMIX_PATH_map_8x5_4agents_2.0M_checkpoint.pth 
 # 3. 利用 (pretrained or finetuning)
 #    default.yaml で:
 #      use_pretrained_lare_path: true
-#      pretrained_lare_path_model_path: "best_v1"     # ← ファイル名だけで models/ から自動解決
+#      pretrained_lare_path_model_name: "best_v1"     # ← ファイル名だけで models/ から自動解決
 ```
 
 ---

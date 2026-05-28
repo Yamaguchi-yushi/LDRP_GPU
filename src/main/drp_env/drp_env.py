@@ -38,10 +38,10 @@ class DrpEnv(gym.Env):
 			lare_path_update_freq=3,
 			lare_path_batch_size=256,
 			lare_path_lr=5e-4,
-			use_pretrained_lare_path=False,
-			pretrained_lare_path_model_path=None,
+			use_pretrained_lare_path=True,
+			pretrained_lare_path_model_name="QMIX_LARE_map_8x5_2agents_1.2M_final.pth",
 			use_finetuning_lare_path=False,
-			finetuning_lare_path_model_path=None,
+			finetuning_lare_path_model_name="QMIX_LARE_map_8x5_2agents_1.2M_final.pth",
 			lare_path_autosave=True,
 			lare_path_autosave_path=None,
 			lare_path_save_dir=None,
@@ -57,9 +57,9 @@ class DrpEnv(gym.Env):
 			lare_task_batch_size=256,
 			lare_task_lr=5e-4,
 			use_pretrained_lare_task=False,
-			pretrained_lare_task_model_path=None,
+			pretrained_lare_task_model_name=None,
 			use_finetuning_lare_task=False,
-			finetuning_lare_task_model_path=None,
+			finetuning_lare_task_model_name=None,
 			lare_task_autosave=False,
 			lare_task_autosave_path=None,
 			lare_task_save_dir=None,           # deprecated: 旧 saved_models/ 用 (load の後方互換解決にのみ使用)
@@ -146,9 +146,9 @@ class DrpEnv(gym.Env):
 		self.use_lare_path = bool(use_lare_path)
 		self.use_lare_path_training = bool(use_lare_path_training)
 		self.use_pretrained_lare_path = bool(use_pretrained_lare_path)
-		self.pretrained_lare_path_model_path = pretrained_lare_path_model_path
+		self.pretrained_lare_path_model_name = pretrained_lare_path_model_name
 		self.use_finetuning_lare_path = bool(use_finetuning_lare_path)
-		self.finetuning_lare_path_model_path = finetuning_lare_path_model_path
+		self.finetuning_lare_path_model_name = finetuning_lare_path_model_name
 		self.lare_path_autosave = bool(lare_path_autosave)
 		self.lare_path_autosave_path = lare_path_autosave_path
 		self.lare_path_save_dir = lare_path_save_dir
@@ -167,9 +167,9 @@ class DrpEnv(gym.Env):
 		self.use_lare_task = bool(use_lare_task)
 		self.use_lare_task_training = bool(use_lare_task_training)
 		self.use_pretrained_lare_task = bool(use_pretrained_lare_task)
-		self.pretrained_lare_task_model_path = pretrained_lare_task_model_path
+		self.pretrained_lare_task_model_name = pretrained_lare_task_model_name
 		self.use_finetuning_lare_task = bool(use_finetuning_lare_task)
-		self.finetuning_lare_task_model_path = finetuning_lare_task_model_path
+		self.finetuning_lare_task_model_name = finetuning_lare_task_model_name
 		self.lare_task_autosave = bool(lare_task_autosave)
 		self.lare_task_autosave_path = lare_task_autosave_path
 		self.lare_task_save_dir = lare_task_save_dir
@@ -253,12 +253,14 @@ class DrpEnv(gym.Env):
 		return f"{steps_in_millions:.1f}M"
 
 	def _lare_get_source_base_name(self):
-		"""For finetuning: strip directories, ".pth", "_final"/"_checkpoint", and leading "FT_"."""
-		path = self.finetuning_lare_path_model_path
-		if not path:
+		"""For finetuning: model_name から ".pth"/"_final"/"_checkpoint"/先頭 "FT_" を除いた
+		ベース名を返す (FT_ プレフィックスの多重付与を防ぐ). model_name は models/ 配下の
+		ファイル名だが, 念のため os.path.basename でディレクトリ成分も剥がす."""
+		model_name = self.finetuning_lare_path_model_name
+		if not model_name:
 			return "unknown_source"
 		try:
-			name = os.path.basename(str(path))
+			name = os.path.basename(str(model_name))
 			if name.endswith(".pth"):
 				name = name[:-4]
 			name = name.replace("_final", "").replace("_checkpoint", "")
@@ -284,7 +286,7 @@ class DrpEnv(gym.Env):
 		map_name = getattr(self, "map_name", "unknown_map")
 		agents = getattr(self, "agent_num", "?")
 		steps = self._lare_get_steps_str()
-		if self.use_finetuning_lare_path and self.finetuning_lare_path_model_path:
+		if self.use_finetuning_lare_path and self.finetuning_lare_path_model_name:
 			source = self._lare_get_source_base_name()
 			return f"FT_{safe_seg}{source}_{map_name}_{agents}agents_{steps}_{suffix}.pth"
 		return f"{safe_seg}{algo}_PATH_{map_name}_{agents}agents_{steps}_{suffix}.pth"
@@ -318,11 +320,11 @@ class DrpEnv(gym.Env):
 		return self.lare_task_save_dir or os.path.join(self._lare_repo_root(), "src", "lare", "task", "saved_models")
 
 	def _lare_task_get_source_base_name(self):
-		path = self.finetuning_lare_task_model_path
-		if not path:
+		model_name = self.finetuning_lare_task_model_name
+		if not model_name:
 			return "unknown_source"
 		try:
-			name = os.path.basename(str(path))
+			name = os.path.basename(str(model_name))
 			if name.endswith(".pth"):
 				name = name[:-4]
 			name = name.replace("_final", "").replace("_checkpoint", "")
@@ -344,7 +346,7 @@ class DrpEnv(gym.Env):
 		map_name = getattr(self, "map_name", "unknown_map")
 		agents = getattr(self, "agent_num", "?")
 		steps = self._lare_get_steps_str()
-		if self.use_finetuning_lare_task and self.finetuning_lare_task_model_path:
+		if self.use_finetuning_lare_task and self.finetuning_lare_task_model_name:
 			source = self._lare_task_get_source_base_name()
 			return f"FT_{safe_seg}{source}_{map_name}_{agents}agents_{steps}_{suffix}.pth"
 		return f"{safe_seg}{algo}_TASK_{map_name}_{agents}agents_{steps}_{suffix}.pth"
@@ -369,10 +371,10 @@ class DrpEnv(gym.Env):
 			from src.lare.path.lare_path_module import LaRePathConfig, LaRePathModule
 
 			# Decide effective training/frozen flags based on the mode.
-			pretrained = self.use_pretrained_lare_path and self.pretrained_lare_path_model_path
+			pretrained = self.use_pretrained_lare_path and self.pretrained_lare_path_model_name
 			finetuning = (
 				self.use_finetuning_lare_path
-				and self.finetuning_lare_path_model_path
+				and self.finetuning_lare_path_model_name
 				and not pretrained
 			)
 			# Pretrained -> frozen; finetuning -> trainable (continues from loaded weights);
@@ -413,9 +415,9 @@ class DrpEnv(gym.Env):
 
 			# Resolve and load weights for pretrained / finetuning modes.
 			if pretrained:
-				self._load_lare_path_weights(self.pretrained_lare_path_model_path, freeze=True, label="PRETRAINED")
+				self._load_lare_path_weights(self.pretrained_lare_path_model_name, freeze=True, label="PRETRAINED")
 			elif finetuning:
-				self._load_lare_path_weights(self.finetuning_lare_path_model_path, freeze=False, label="FINETUNE")
+				self._load_lare_path_weights(self.finetuning_lare_path_model_name, freeze=False, label="FINETUNE")
 			else:
 				print(
 					f"[LaRe-Path] Initialized (mode=scratch, training={self.use_lare_path_training}, "
@@ -426,43 +428,34 @@ class DrpEnv(gym.Env):
 			self.use_lare_path = False
 			self.lare_path_module = None
 
-	def _load_lare_path_weights(self, model_path, freeze, label):
-		"""Try common locations for `model_path`, then call module.load_model(..., freeze=freeze).
+	def _load_lare_path_weights(self, model_name, freeze, label):
+		"""`model_name` (= src/lare/path/models/ 配下のファイル名) を解決して
+		module.load_model(..., freeze=freeze) を呼ぶ.
 
-		解決順:
-		  1. 絶対パス
-		  2. カレントディレクトリ相対
-		  3. リポジトリルート相対
-		  4. **src/lare/path/models/** 配下 (= 整理済みモデルの正規置き場)
-		  5. src/lare/path/checkpoints/ 配下 (= autosave 出力からの直接読込にも対応)
-		  6. src/lare/path/saved_models/ 配下 (= 旧パスの後方互換)
-		上記いずれも .pth 拡張子なしで指定された場合は .pth を補完.
+		解決ルール:
+		  - src/lare/path/models/ 配下のファイル名として解釈
+		  - 拡張子 .pth は省略可 (自動補完)
+
+		例: pretrained_lare_path_model_name = "Safe_QMIX_PATH_map_8x5_2agents_1.0M_checkpoint"
+		    → src/lare/path/models/Safe_QMIX_PATH_map_8x5_2agents_1.0M_checkpoint.pth をロード
+
+		ファイルが見つからない場合は scratch fallback せず, FileNotFoundError で
+		プロセスを停止する (指定ミスを早期に検知するため).
 		"""
-		repo_root = self._lare_repo_root()
 		models_dir = self._lare_default_models_dir()
-		checkpoint_dir = self._lare_default_save_dir()
-		legacy_dir = self._lare_legacy_saved_models_dir()
-		candidates = []
-		if os.path.isabs(model_path):
-			candidates.append(model_path)
-		else:
-			candidates.append(model_path)
-			candidates.append(os.path.join(repo_root, model_path))
-			candidates.append(os.path.join(models_dir, model_path))
-			candidates.append(os.path.join(checkpoint_dir, model_path))
-			candidates.append(os.path.join(legacy_dir, model_path))
-		# Allow filenames without extension.
-		extra = []
-		for p in candidates:
-			if not p.endswith(".pth"):
-				extra.append(p + ".pth")
-		candidates += extra
+		resolved = os.path.join(models_dir, model_name)
+		if not resolved.endswith(".pth"):
+			resolved += ".pth"
 
-		resolved = next((p for p in candidates if os.path.exists(p)), None)
-		if resolved is None:
-			print(f"[LaRe-Path][{label}] Model not found in: {candidates}")
-			print(f"[LaRe-Path][{label}] Falling back to scratch training.")
-			return
+		if not os.path.exists(resolved):
+			msg = (
+				f"[LaRe-Path][{label}] Model not found: {resolved}\n"
+				f"  期待される置き場: {models_dir}/\n"
+				f"  指定: pretrained_lare_path_model_name = '{model_name}'\n"
+				f"  → ファイル名のタイポ, または models/ への配置忘れがないか確認."
+			)
+			print(msg)
+			raise FileNotFoundError(msg)
 
 		try:
 			self.lare_path_module.load_model(resolved, freeze=freeze)
@@ -480,10 +473,10 @@ class DrpEnv(gym.Env):
 				sys.path.append(repo_root)
 			from src.lare.task.lare_task_module import LaReTaskConfig, LaReTaskModule
 
-			pretrained = self.use_pretrained_lare_task and self.pretrained_lare_task_model_path
+			pretrained = self.use_pretrained_lare_task and self.pretrained_lare_task_model_name
 			finetuning = (
 				self.use_finetuning_lare_task
-				and self.finetuning_lare_task_model_path
+				and self.finetuning_lare_task_model_name
 				and not pretrained
 			)
 			cfg_frozen = bool(pretrained)
@@ -518,9 +511,9 @@ class DrpEnv(gym.Env):
 			self.lare_task_module = LaReTaskModule(self, cfg, graph_diameter=gd)
 
 			if pretrained:
-				self._load_lare_task_weights(self.pretrained_lare_task_model_path, freeze=True, label="PRETRAINED")
+				self._load_lare_task_weights(self.pretrained_lare_task_model_name, freeze=True, label="PRETRAINED")
 			elif finetuning:
-				self._load_lare_task_weights(self.finetuning_lare_task_model_path, freeze=False, label="FINETUNE")
+				self._load_lare_task_weights(self.finetuning_lare_task_model_name, freeze=False, label="FINETUNE")
 			else:
 				print(
 					f"[LaRe-Task] Initialized (mode=scratch, training={self.use_lare_task_training}, "
@@ -531,33 +524,25 @@ class DrpEnv(gym.Env):
 			self.use_lare_task = False
 			self.lare_task_module = None
 
-	def _load_lare_task_weights(self, model_path, freeze, label):
-		# 解決順 (Path 側と対称):
-		#   1. 絶対 → 2. cwd 相対 → 3. repo root 相対
-		#   → 4. src/lare/task/models/ → 5. src/lare/task/checkpoints/ → 6. saved_models/ (後方互換)
-		repo_root = self._lare_repo_root()
+	def _load_lare_task_weights(self, model_name, freeze, label):
+		"""Path 側と対称: src/lare/task/models/ 配下のファイル名として解釈.
+		.pth は省略可. ファイル不在時は FileNotFoundError で停止する.
+		"""
 		models_dir = self._lare_task_default_models_dir()
-		checkpoint_dir = self._lare_task_default_save_dir()
-		legacy_dir = self._lare_task_legacy_saved_models_dir()
-		candidates = []
-		if os.path.isabs(model_path):
-			candidates.append(model_path)
-		else:
-			candidates.append(model_path)
-			candidates.append(os.path.join(repo_root, model_path))
-			candidates.append(os.path.join(models_dir, model_path))
-			candidates.append(os.path.join(checkpoint_dir, model_path))
-			candidates.append(os.path.join(legacy_dir, model_path))
-		extra = []
-		for p in candidates:
-			if not p.endswith(".pth"):
-				extra.append(p + ".pth")
-		candidates += extra
-		resolved = next((p for p in candidates if os.path.exists(p)), None)
-		if resolved is None:
-			print(f"[LaRe-Task][{label}] Model not found in: {candidates}")
-			print(f"[LaRe-Task][{label}] Falling back to scratch training.")
-			return
+		resolved = os.path.join(models_dir, model_name)
+		if not resolved.endswith(".pth"):
+			resolved += ".pth"
+
+		if not os.path.exists(resolved):
+			msg = (
+				f"[LaRe-Task][{label}] Model not found: {resolved}\n"
+				f"  期待される置き場: {models_dir}/\n"
+				f"  指定: pretrained_lare_task_model_name = '{model_name}'\n"
+				f"  → ファイル名のタイポ, または models/ への配置忘れがないか確認."
+			)
+			print(msg)
+			raise FileNotFoundError(msg)
+
 		try:
 			self.lare_task_module.load_model(resolved, freeze=freeze)
 			mode = "frozen (inference only)" if freeze else "trainable (finetuning)"

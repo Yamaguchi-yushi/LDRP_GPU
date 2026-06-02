@@ -40,23 +40,50 @@
 
 ## 2. 環境改修のスコープ
 
-ユーザの当初の懸念は「目的地が複数になり元環境の大改修が必要」だが、実は影響範囲は限定的:
+ユーザの当初の懸念は「目的地が複数になり元環境の大改修が必要」だが、実は影響範囲は限定的。
+本節は **採用方針 = Option B (学習する tour 順, 推奨)** を前提に env 改修の必要範囲を整理する。
+Option A (FIFO) / Option C (全 agent 間再配分) との比較は [§3.2](#32-3-案の差分--allocator-が変えられる範囲) を参照。
+
+### 2.1 Option B の設計コンセプト
+
+Allocator は **イベント駆動** で「保持タスクのどれを次に実行するか / 新タスクを取りに行くか」を毎イベント決める:
+
+- タスクの **ownership は固定** (一度 agent X に渡したタスクは他 agent に移動しない)
+- 各 agent 内の **tour 順だけ** が Allocator の制御対象
+- 行動空間: `agent × {held_tasks ∪ unassigned_tasks ∪ {wait}}` (現状は `agent × unassigned_tasks` のみ)
+
+### 2.2 env 改修内訳
 
 | 要素 | 変更要否 | 内容 |
 |---|---|---|
-| `assigned_tasks[i]` | 変更 | `[task]` → `[task1, task2, ...]` のキュー化 |
-| `goal_array[i]` | 変更 | 単一ノード → キュー先頭タスクの現在ステージ (pickup/dropoff) を都度導出 |
-| `step()` の goal 切替 | 小変更 | 完了時に dequeue → 次タスクへ自動遷移 (現 pickup→dropoff 切替ロジックを再利用) |
+| `assigned_tasks[i]` | 変更 | `[task]` → 保持タスクの集合 (順序は Allocator が動的に選ぶ) |
+| `goal_array[i]` | 変更 | 単一ノード → Allocator が集合から毎イベント「次に向かう先」を選択 |
+| `step()` の goal 切替 | 中変更 | 完了時に **イベント発火 → Allocator に次行動を問い合わせ**. 自動 dequeue はしない |
 | 衝突判定 | 無変更 | エージェント位置のみ依存 |
-| `task_assign` API | 変更 | 「何 step に何タスクまで追加するか」のセマンティクス再定義 |
-| 観測 (obs_repre) | 中変更 | 複数の pending タスクの符号化が必要 |
+| `task_assign` API | **大変更** | 「次行動 = {保持タスク X を実行 / 新タスク Y をピックアップ / 待機}」を選ぶセマンティクスに拡張 |
+| 観測 (obs_repre) | 中変更 | 保持タスク集合 + pending タスク一覧の符号化 (可変長) が必要 |
 | `info["task_completion"]` | 無変更 | カウント自体は変わらず |
 | LaRe-Path | ほぼ無変更 | 経路系エンコーダはタスク数に独立 |
-| LaRe-Task | 変更 | 一部因子 (idle_assignment, pickup_proximity 等) の再定義 |
+| LaRe-Task | 変更 | 一部因子 (idle_assignment, pickup_proximity 等) の再定義. 詳細は [§5.2](#52-lare-task-との接続) |
 | PBS | 中変更 | 既存 PBS は単一目的地前提. tour 版が必要 |
-| ALMA Allocator | 大変更 | 1:1 制約解除でアーキ刷新 |
+| ALMA Allocator | **大変更** | 1:1 制約解除 + 出力候補集合を held タスクも含むよう拡張 (auto-regressive pointer-net の自然な拡張). 詳細は [§5.1](#51-alma-との接続) |
 
-→ **元環境への変更は moderate (≒数百行)。本当の重さは Allocator 側の tour 計画化**。
+→ **env 改修は moderate (〜400-500 行)。本当の重さは Allocator 側の tour-aware 化 (〜800 行)**。
+
+### 2.3 Option A (FIFO, 参考) との差分
+
+Option A は FIFO キューを採用する素朴版。Allocator はタスクの追加先 agent しか選べない (順序は env が自動決定):
+
+| 要素 | Option A | Option B (採用) |
+|---|---|---|
+| `assigned_tasks[i]` の順序 | FIFO キュー (Allocator は順序を変えられない) | 集合 (Allocator が動的に順序選択) |
+| `goal_array[i]` | キュー先頭から自動導出 | Allocator がイベントごとに選択 |
+| 完了時の挙動 | 自動 dequeue + 自動遷移 | イベント発火 + Allocator 再判断 |
+| 行動空間 | `agent × unassigned_tasks` (現状と同形, 二部マッチング) | `agent × {held ∪ unassigned ∪ wait}` (拡張) |
+| Allocator の学習自由度 | 「誰のキューに入れるか」のみ | 「誰に渡すか + その agent 内の順序」 |
+| 実装規模目安 | 〜200 行 | 〜400-500 行 (env) + 〜800 行 (Allocator) |
+
+A は段階的実装の Step として有用 (例: §7 のロードマップで A → B と段階移行)。最終的に B を目指す前提で、A は中間目標として位置付ける。
 
 ---
 

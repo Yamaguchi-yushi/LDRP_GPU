@@ -725,7 +725,8 @@ class DrpEnv(gym.Env):
 		self.current_goal_prepare = copy.deepcopy(self.current_goal)
 		# 1) first judge action_i whether available, to output !!!obs_prepare & obs_onehot_prepare!!!
 		for i in range(self.agent_num):
-			action_i = joint_action[i]  
+			action_i = joint_action[i]
+			is_unavailable_stop = (self.assigned_tasks[i] == [])  
 			# 1) first judge action_i whether available, to output obs_prepare: 
 			# if unavailable ⇢ obs_prepare.append( self.obs_old[i])
 			#print("Avaible actions",self.get_avail_agent_actions(i, self.n_actions)[1])
@@ -733,13 +734,14 @@ class DrpEnv(gym.Env):
 				#print("This is not Avaible",i,action_i,self.get_avail_agent_actions(i, self.n_actions)[1])
 				self.obs_prepare.append(self.obs_current_chache[i])
 				#self.obs_onehot_prepare[i]= self.obs_onehot[i]
-
-				self.wait_count[i] += 1
+				if not is_unavailable_stop:
+					self.wait_count[i] += 1
 
 			# if action_i is current start node -> stop
 			elif self.pos[int(action_i)][0]==self.obs[i][0] and self.pos[int(action_i)][1]==self.obs[i][1]:
 				self.obs_prepare.append(self.obs_current_chache[i])
-				self.wait_count[i] += 1
+				if not is_unavailable_stop:
+					self.wait_count[i] += 1
 				# pbs_mode=True のとき: PBS が他 agent の待機予定を path 計画に反映できる
 				#   ように current_goal を非 None (= action_i, = 待機ノード) に保つ.
 				# pbs_mode=False のとき: SafeEnv (wrapper/safe_marl.py) の
@@ -755,6 +757,7 @@ class DrpEnv(gym.Env):
 				#self.joint_action_old[i] = joint_action[i]
 				self.current_goal_prepare[i] = joint_action[i] #update 行き先ノード when avable action is taken
 				obs_i = self.obs[i]
+				self.wait_count[i] = 0
 		
 				#calculate current distance
 				current_goal = list(self.pos[int(action_i)])

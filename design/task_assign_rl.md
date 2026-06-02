@@ -35,8 +35,7 @@ LDRP の **タスク割当 (task assignment)** を強化学習で行うコンポ
 |---|---|---|---|
 | `fifo` | `Random` | ✗ | 動作 |
 | `tp` | `TP` | ✗ | 動作 |
-| `ppo` | `PPOAgent` | ✓ | **実装途中・未検証** |
-| `ppo_v1` | `PPOAgent_1` | ✓ | 旧版 (参考) |
+| `ppo` | `PPOAgent` | ✓ | **実装途中・未検証** (旧版を参考に実装) |
 
 **新 RL アルゴ (DQN 等) を足す = `task_policy/` にクラスを 1 個追加 + task_manager に分岐 1 行**。
 runner ループ側は共通インターフェース呼び出しなので、契約を満たせば原則無改修。
@@ -116,6 +115,31 @@ if self.task_Agent.task_assigner.update_ready():
 | 更新 | PPO clip + actor/critic optimizer 分離の骨子あり |
 | 行動選択 | `test_mode` で argmax / サンプリング切替まで記述 |
 | save/load | **stub (空実装)** |
+
+### 3.1.1 報酬: 元々はグローバル報酬
+
+元々の PPO は **グローバル報酬 (チーム共有報酬)** で学習する設計。
+[runner.py:107-117](../runner.py#L107-L117) で 1 step ごとに次のスカラを `buffer_add_rewards` に投入:
+
+```python
+if info.get("lare_task_is_trained", False):
+    task_reward = float(info.get("lare_task_proxy_reward", 0.0))  # LaRe-Task 有効時のみ差し替え
+else:
+    task_reward = float(sum(rew_n))                               # ← 元々の報酬 = 全agentの和
+```
+
+| 条件 | PPO に渡る報酬 |
+|---|---|
+| **LaRe-Task OFF (元々)** | `sum(rew_n)` = **全エージェントの env 報酬 (goal/collision/wait/move) の総和**。単一スカラ |
+| LaRe-Task が trained | `lare_task_proxy_reward` (分解された proxy 報酬) に差し替え |
+
+含意:
+
+- `rew_n` は agent ごとの報酬リストだが、**総和を取って 1 スカラ**にしている = チーム全体の報酬
+- これを `compute_returns` で割引和にし、各 (agent, task) 割当行動に **同じグローバルリターンが帰属**
+- → **個々の割当がチーム成果にどれだけ寄与したかの credit assignment は無い** (全行動が同じ報酬を共有)
+- この「グローバル報酬だと個々の割当の貢献が分からない」点が **LaRe-Task (報酬分解) 導入の動機**。
+  trained になると proxy 報酬に差し替わる
 
 ### 3.2 完成までの残作業 (要対応)
 

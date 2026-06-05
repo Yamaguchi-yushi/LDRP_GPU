@@ -10,7 +10,7 @@
 
 1. [GPU 環境への移行](#1-gpu-環境への移行)
 2. [LaRe-Path 因子の正規化 (3 因子)](#2-lare-path-因子の正規化-3-因子)
-3. [wait_count の連続 wait カウント化 (リセット追加)](#3-wait_count-の連続-wait-カウント化-リセット追加)
+3. [encoder の距離計算が壊れている (エッジ上の partial onehot 破壊)](#3-encoder-の距離計算が壊れている-エッジ上の-partial-onehot-破壊)
 4. [encoder.py のログ整形 (at_goal の出力位置)](#4-encoderpy-のログ整形-at_goal-の出力位置)
 
 ### 重い設計書 (別ファイル)
@@ -63,7 +63,7 @@
 | 1 | `prog_goal` | dist_prev - dist_curr | **[-D, +D]** (D=graph_diameter ≈ 200) | ❌ |
 | 2 | `in_collision` | 0 or 1 | {0, 1} | ✓ |
 | 3 | `others_in_collision` | 0 or 1 | {0, 1} | ✓ |
-| 4 | `wait_norm` | wait_count (生) | **[0, time_limit]** (= [0, 500]) | ❌ |
+| 4 | `wait_norm` | wait_count (連続カウント、リセット済み) | **[0, time_limit]** 理論上限。実態は数十 step 程度に収束 | ❌ |
 | 5 | `dist_goal_norm` | dist / D | [0, 1] | ✓ |
 | 6 | `min_sep_norm` | min_sep / D | [0, 1] | ✓ |
 | 7 | `avg_sep_norm` | avg_sep / D | [0, 1] | ✓ |
@@ -85,7 +85,7 @@
 
 → **MARL4DRP の参照実装 (`marl4drp-lookup` subagent) で揃え先を確認するのが安全**。
 
-#### wait_norm (連続 wait 回数 - ※項目3も合わせて適用)
+#### wait_norm (連続 wait 回数。リセット動作は既に [drp_env.py:759](../src/main/drp_env/drp_env.py#L759) で適用済み、残るは正規化のみ)
 
 | 案 | 分母 | 範囲 | 評価 |
 |---|---|---|---|
@@ -110,48 +110,71 @@
 
 ---
 
-## 3. wait_count の連続 wait カウント化 (リセット追加)
+## 3. encoder の距離計算が壊れている (エッジ上の partial onehot 破壊)
 
 ### 背景
 
-`wait_norm` は「**連続でどれくらい wait しているか**」を意図した設計だが、現実装は **エピソード開始からの累積カウント** になっている。動いた瞬間にリセットされず、過去の wait 回数を保持し続ける。
+LaRe-Path encoder の **距離関係因子** (`prog_goal`, `dist_goal_norm`, `at_goal` 等) が、エージェントの実際の移動を反映できていない。具体的には:
 
-### 現状
+- agent がエッジ上を動いても、encoder からは **常にノード位置にいる**ように見える
+- 結果として `prog_goal=0` が連発、`dist_goal_norm` がノード間距離の **2 値を往復**するだけ
+- agent が動いた step でも因子が変化しない → デコーダの proxy 報酬がエッジ上での進捗を学習できない
 
-[src/main/drp_env/drp_env.py:737, 742](../src/main/drp_env/drp_env.py#L737):
+### 原因
+
+[src/main/drp_env/drp_env.py:961-963](../src/main/drp_env/drp_env.py#L961-L963) の `is_tasklist=True` ブロック末尾で `obs_onehot[i]` を **全クリア + current_start に full 1** に書き直しているため、action 処理 ([drp_env.py:781-784](../src/main/drp_env/drp_env.py#L781-L784)) で書き込んだ **partial onehot** (例: `current_start=0.6, action_i=0.4`) が消えてしまう:
 
 ```python
-for i in range(self.agent_num):
-    action_i = joint_action[i]
-    if action_i not in self._get_avail_agent_actions(i, self.n_actions)[1]:
-        ...
-        self.wait_count[i] += 1   # ① unavailable で wait
-    elif self.pos[int(action_i)][0]==self.obs[i][0] and ...:
-        ...
-        self.wait_count[i] += 1   # ② action=現在位置で wait
-    else:
-        # 動いた分岐 — ★リセットが入っていない★
-        self.current_goal_prepare[i] = joint_action[i]
-        ...
+# 現状: drp_env.py:961-963
+self.obs_onehot[i] = np.zeros((1, len(list(self.G.nodes()))*2))
+self.obs_onehot[i][int(self.current_start[i])] = 1        # ← partial を破壊して full 1 にする
+self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
 ```
+
+これにより encoder の `_agent_curr_onehot` (= `obs_onehot[i]` 前半を読む) が常にノード位置の full onehot を返し、`estimate_partial_distance` の 2 要素分岐 ([encoder.py:96-109](../src/lare/path/encoder.py#L96-L109)) が動かない。
+
+### 症状の再現
+
+学習中ログから観測された例 (agent 0 を追跡):
+
+```text
+prog_goal: [0, 0, ...]                ← 動いてるのに変化なし
+dist_goal_norm: [0.61, 0.52, ...]     ← 0.61 と 0.52 の 2 値を往復のみ
+wait_norm: [0, 0, ...]                ← 動いている (= else 分岐に入っている) のは確実
+```
+
+`wait_norm=0` (= 動いた step) で `prog_goal=0` (= 距離変化なし) は矛盾。エッジ上の移動を encoder が拾えていない証拠。
 
 ### 対策案
 
-else 分岐 (動いた step) の冒頭で 1 行追加:
+[src/main/drp_env/drp_env.py:961-963](../src/main/drp_env/drp_env.py#L961-L963) を「**前半 (current position) は触らず、後半 (goal) だけ更新する**」形に変更:
 
 ```python
-else:
-    self.wait_count[i] = 0   # 動いたら連続wait カウントを 0 にリセット
-    self.current_goal_prepare[i] = joint_action[i]
-    ...
+# Before
+self.obs_onehot[i] = np.zeros((1, len(list(self.G.nodes()))*2))
+self.obs_onehot[i][int(self.current_start[i])] = 1
+self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
+
+# After
+n = len(list(self.G.nodes()))
+oh = np.asarray(self.obs_onehot[i]).flatten()
+oh[n:2*n] = 0                                       # 後半 (goal 部分) だけクリア
+oh[int(self.goal_array[i]) + n] = 1                 # 新しい goal に 1
+self.obs_onehot[i] = oh
 ```
+
+### 期待される効果
+
+- エッジ上の agent は encoder から「ノード A と ノード B の間 (例えば 0.6 : 0.4)」と認識される
+- `estimate_partial_distance` の 2 要素分岐が動き、**重み付きで距離が計算される**
+- `dist_goal` が連続的に変化 → `prog_goal` が動いた step ごとに非ゼロを返す
+- デコーダの proxy 報酬がエッジ上の進捗を学習できる
 
 ### 影響範囲
 
-- [src/main/drp_env/drp_env.py:754](../src/main/drp_env/drp_env.py#L754) 周辺の 1 行追加
-- `wait_norm` 因子の意味が変わる (累積 → 連続)
-  - 既存学習済みモデルとは互換性が崩れる (因子のセマンティクスが変わるため再学習推奨)
-- 項目 2 の `wait_norm` 正規化と合わせて適用するのが自然
+- [src/main/drp_env/drp_env.py:961-963](../src/main/drp_env/drp_env.py#L961-L963) の 3 行を 4-5 行に書き換え
+- `prog_goal` / `dist_goal_norm` の値分布が変わるので **既存の学習済み LaRe-Path モデルは再学習推奨**
+- LaRe-Task は経路の質に依存しないので影響なし
 
 ---
 
@@ -188,4 +211,4 @@ at_goal: ...      ← 最後
 
 ---
 
-最終更新: 2026-06-01
+最終更新: 2026-06-05

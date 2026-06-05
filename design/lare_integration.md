@@ -917,3 +917,67 @@ LDRP における二つの報酬問題：
 epymarl 経由で `task_flag=True` 学習を成立させるための env 内蔵タスク割当．`drp_env.step()` が dict 形式アクションを受け取らない (list のみ) 場合，かつ `task_flag=True` のとき，[src/task_assign/task_policy/tp.py](src/task_assign/task_policy/tp.py) と同じ最近隣ヒューリスティックを env メソッドとして実行する．test.py 経由 (dict アクション) の動作は変えない．14-1 で PPO を内蔵するときは，このフォールバックを「PPO 未有効時のデフォルト」として残す．
 
 実装位置: [drp_env.py](src/main/drp_env/drp_env.py) の `_default_task_assign_tp()` メソッドおよび `step()` 冒頭の分岐．
+
+LaRe 機能のファイル対応表
+1. 10 因子エンコーダ (factor extraction)
+役割	MARL4DRP	LDRP
+Path 用 factor 関数 (env state → 10 次元 factor)	drp_env/reward_model/LLMrd/fallback_functions/evaluation_func.py	src/lare/path/encoder.py evaluation_func()
+マップ別の特殊 factor 関数 (オプション)	LLMrd/pre_fallback_functions/map_*_*agents.py	(LDRP では未移植)
+Task 用 factor 関数	(MARL4DRP は Task LaRe 持たず)	src/lare/task/encoder.py evaluation_func_task()
+2. デコーダ (factor → reward)
+役割	MARL4DRP	LDRP
+Path デコーダ MLP	drp_env/reward_model/LLMrd/factor_reward_model.py (FactorRewardModel)	src/lare/path/decoder.py (PathRewardDecoder)
+Task デコーダ MLP	(なし)	src/lare/task/decoder.py
+factor + state → reward 統合層	LLMrd/factor_reward_decompose.py (FactorRewardDecomposer)	(LDRP は module 側に直接統合)
+3. モジュール / オーケストレータ (バッファ + 学習を回す本体)
+役割	MARL4DRP	LDRP
+Path 学習ループの司令塔	drp_env/drp_env.py の initialize_lare_system(), perform_episode_update(), evaluation_period 状態機械 (1340-1382 行)	src/lare/path/lare_path_module.py (LaRePathModule クラス)
+Task 学習ループの司令塔	(なし)	src/lare/task/lare_task_module.py
+重要な違い: MARL4DRP は env (drp_env.py) 内部に直接 LaRe 制御を書いている。LDRP は LaRePathModule という独立クラスに切り出して env からは委譲する設計。
+
+4. エピソードバッファ (経験データの保管)
+役割	MARL4DRP	LDRP
+エピソードバッファ実装	epymarl/src/utils/replay_memory.py (ReplayMemory_episode)	src/lare/path/buffer.py (PathEpisodeBuffer), src/lare/task/buffer.py
+置換戦略	circular buffer (position % capacity)	deque(maxlen=capacity) (FIFO)
+memory 分離 (goal/collision/timeup)	goal_memory, collision_memory, timeup_memory を別々に持つ	単一 buffer のみ (LDRP は未移植)
+5. 訓練ステップ (loss + gradient)
+役割	MARL4DRP	LDRP
+train_step 関数 (1 batch の forward + backward + optimizer.step)	epymarl/src/utils/util.py make_train_step() (163-280 行)	src/lare/path/lare_path_module.py:200-254 _update() メソッド
+6. Transformer (AREL Time-Agent Attention, オプション)
+役割	MARL4DRP	LDRP
+時系列・エージェント間の注意機構	drp_env/reward_model/arel/transformers.py	src/lare/path/transformer.py (TimeAgentTransformer)
+基本 attention モジュール	drp_env/reward_model/arel/modules.py	src/lare/shared/attention.py
+utility (positional encoding 等)	drp_env/reward_model/arel/util.py	(transformer.py 内に統合)
+7. MARD (Shapley Attention for assignment, 未移植)
+役割	MARL4DRP	LDRP
+割当クレジット用 Shapley attention	drp_env/reward_model/mard/mard.py	(未移植。Task LaRe で別アプローチを採用)
+MARD の attention モジュール	drp_env/reward_model/mard/modules.py	(なし)
+状態正規化	drp_env/reward_model/mard/norm.py	(なし)
+8. LLM プロンプト (factor 関数の自動生成)
+役割	MARL4DRP	LDRP
+GPT に factor 関数を生成させるコード	drp_env/reward_model/LLMrd/factor_chat_with_gpt.py	(未移植。fallback の evaluation_func を直接使用)
+プロンプトテンプレート	drp_env/reward_model/LLMrd/prompt_template.py	(なし)
+9. env 統合 (step フックポイント)
+役割	MARL4DRP	LDRP
+env.step() 内 LaRe 呼び出し箇所	drp_env/drp_env.py の step() 内 (1431 行〜)、collision 後の reward 置換 (1601-1619 行)、reset() 内の evaluation_period 管理 (1340-1382 行)	drp_env.py:879-882 で proxy 報酬置換、step 内の _lare_total_step_account += 1
+env 設定	drp_env.py コンストラクタの use_lare_reward, use_lare_training, use_pretrained_model, pretrained_model_name	drp_env.py の use_lare_path, use_lare_path_training, use_pretrained_lare_path, pretrained_lare_path_model_name 等
+10. ベース報酬モデルの抽象化
+役割	MARL4DRP	LDRP
+共通基底クラス	drp_env/reward_model/base_reward_model.py	(LDRP では Path/Task で抽象化していない)
+module レジストリ	drp_env/reward_model/init.py	(LDRP は分離設計でレジストリ不要)
+設計思想の差
+軸	MARL4DRP	LDRP
+構造	env (drp_env.py) に LaRe ロジックが内蔵	LaRe を別パッケージ (src/lare/) に切り出し、env はフックポイントのみ
+Task LaRe	無し (Path 用のみ)	Path / Task の 2 系統 を独立に実装
+memory 分離	termination タイプ別に 3 バッファ + weighted sampling	単一 buffer + uniform sampling
+LLM 連携	GPT で factor 関数を自動生成可	fallback を直接使用 (LLM 未移植)
+MARD (Shapley)	割当に Shapley attention 使用可	未移植 (Task LaRe で別アプローチ)
+補足: 未移植の機能
+MARL4DRP にあって LDRP に持ってきていないもの:
+
+MARD (Shapley attention) — assignment 用クレジット分解の高度な仕組み
+LLM による factor 自動生成 — factor_chat_with_gpt.py, prompt_template.py
+マップ別の pre_fallback_functions — map_8x5_3agents 専用の factor 関数等
+termination 別 memory 分離 (goal_memory, collision_memory, timeup_memory) + 60/20/20 weighted sampling
+use_separete_memory モード — MARL4DRP には memory 分離オプションあり
+特に 4 はデコーダの安定学習に効きそうなので、現在の loss 振動が止まらない場合は移植検討の価値ありです。

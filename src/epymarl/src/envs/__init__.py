@@ -199,6 +199,13 @@ class _GymmaWrapper(MultiAgentEnv):
 
     def get_stats(self):
         return {}
+    
+    def set_train_step(self, t_env):
+        """
+        Send the current training step to avoid counting it as episode step in the env when testing during training. 
+        """
+        if hasattr(self.original_env, "set_train_step"):
+            self.original_env.set_train_step(t_env)
 
 
 REGISTRY["gymma"] = partial(env_fn, env=_GymmaWrapper)

@@ -43,6 +43,20 @@
 - LaRe-Path encoder の Dijkstra ループが CPU bound なので、GPU 化しても全体の速度向上が頭打ちになりやすい点
 - epymarl の `args.use_cuda` 等の設定との整合 ([src/epymarl/src/config/default.yaml](src/epymarl/src/config/default.yaml))
 
+### GPU 化より先にやるべき最適化: APSP 前計算でテーブル参照化
+
+現状 [encoder.py:75-113](../src/lare/path/encoder.py#L75-L113) の `dijkstra(start, goal)` は `evaluation_func` の内部関数で、**毎 step・各 agent・prev/curr 位置ごと**に隣接リストを組み直してヒープ探索する (距離キャッシュなし)。一方 `graph_diameter` は [lare_path_module.py](../src/lare/path/lare_path_module.py) の init で 1 回だけ計算済み = 「直径は 1 回・ペア距離は毎回」の非対称になっている。
+
+**マップは run 全体で不変** (reset でも変わらない) なので、ペア距離も init で全点対最短距離 (APSP) を前計算してテーブル参照にできる。GPU 化よりこちらの方が距離系因子には効く。
+
+- reset ごとですらなく **module init で N×N の APSP を 1 回**作れば十分。`graph_diameter` と同じパターンで統合でき、**APSP テーブルの最大有限値 = graph_diameter** として両者を 1 回の前計算にまとめられる。
+- `functools.lru_cache` は不可: `dijkstra` が `evaluation_func` 内で毎回再定義されるため永続しない。
+- 実装方針:
+  1. module init で `apsp = compute_apsp(env)` (networkx `all_pairs_dijkstra_path_length` を dict→`np.full((N, N), graph_diameter)` 化、未接続は `graph_diameter`)
+  2. `compute_factors` → `evaluation_func` に `apsp` を 1 本通す
+  3. 内部の `dijkstra(start, goal)` 呼び出しを `apsp[start, goal]` 参照に置換 (`estimate_partial_distance` の重み補間はテーブル 2 引きに変わるだけで挙動同一)
+- **値は完全に不変、速くなるだけ**。小マップ (N≈20〜40) では per-step コストは小さいので、**encoder がボトルネックと実測されてから**着手で十分。
+
 ### 影響範囲
 
 - `requirements.txt` / `setup_env.sh` の torch バージョン指定変更

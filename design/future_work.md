@@ -12,6 +12,7 @@
 2. [LaRe-Path 因子の正規化 (3 因子)](#2-lare-path-因子の正規化-3-因子)
 3. [LaRe-Path 距離因子の残課題 (エッジ補間精度・タスク切替時の prog_goal)](#3-lare-path-距離因子の残課題-エッジ補間精度タスク切替時の-prog_goal)
 4. [LaRe モデルの学習ステップ数と保存名の {X.X}M が一致しない](#4-lare-モデルの学習ステップ数と保存名の-xxm-が一致しない)
+5. [実験パラメータを専用ファイル (exp_config.yaml) に分離](#5-実験パラメータを専用ファイル-exp_configyaml-に分離)
 
 ### 重い設計書 (別ファイル)
 
@@ -232,4 +233,72 @@ LaRe-Path / LaRe-Task の autosave 保存名 `{...}_{X.X}M_{checkpoint|final}.pt
 
 ---
 
-最終更新: 2026-06-09
+## 5. 実験パラメータを専用ファイル (exp_config.yaml) に分離
+
+### 背景
+
+実験ごとに頻繁に変える値 (報酬モード・マップ・エージェント数・学習ステップ数など) が **本体コードに直書き**されているため、`git pull` のたびに衝突する。特に [drp_env.py](../src/main/drp_env/drp_env.py) の `__init__` signature の LaRe パラメータ群 (`use_lare_path` / `use_pretrained_lare_path` / `pretrained_lare_path_model_name` 等) を実験のたびに書き換えており、ここが衝突源。`gymma.yaml` の `t_max`、`train.py` の `env_args.key` も同様。
+
+### 現状
+
+- 実験値と本体ロジックが同じファイルに混在 (drp_env.py signature / gymma.yaml / train.py)
+- [CLAUDE.md](../CLAUDE.md) は「実験値は signature を書き換えず env_args (train.py) / yaml (test.py) で上書きする」と定めているが、実運用では signature を直接編集してしまっている = 不変条件と乖離
+- 観測された衝突例: drp_env.py の LaRe フラグ、gymma.yaml の `t_max` (50M vs 150M)、train.py の map/agent 数
+
+### 対策案: exp_config.yaml (git 管理外) + 汎用 env_args パススルー
+
+毎回いじる値を 1 ファイルに集約し、train.py が epymarl(sacred) の `with key=value` で上書きする。これにより **gymma.yaml / drp_env.py を一切編集しなくなり、衝突が構造的に消える**。`.claude/settings.local.json` と同じ「ローカル設定は git 外、テンプレはコミット」方式。
+
+- **ファイル**:
+  - `exp_config.yaml` (git 管理外, `.gitignore` に追加) ← 各自の実験値
+  - `exp_config.example.yaml` (コミット) ← テンプレ
+- **スキーマ案** (top-level = sacred 制御, `env_args:` = drp_env 引数を丸ごと上書き):
+
+  ```yaml
+  algo: qmix
+  t_max: 50050000
+  num_runs: 1
+  max_processes: 1
+  env_args:
+    time_limit: 500
+    key: "drp_env:drp_safe-5agent_map_8x5-v2"
+    state_repre_flag: onehot_fov
+    # 普段 drp_env.py で書き換えていた行をここに移すだけ
+    use_lare_path: false
+    use_lare_path_training: false
+    use_pretrained_lare_path: false
+    pretrained_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth"
+    use_lare_task: false
+  ```
+
+- **train.py 側**: `env_args:` ブロックを丸ごと `env_args.<k>=<v>` に展開して `with` に渡す (個別キーを列挙しない = 将来の drp_env 引数追加に自動対応)。bool は `True`/`False`、str は要クォートのリテラル化が必要。
+
+  ```python
+  def lit(v):
+      if isinstance(v, bool): return "True" if v else "False"
+      if isinstance(v, str):  return f'"{v}"'
+      return str(v)
+  parts = [f't_max={cfg["t_max"]}']
+  for k, v in cfg.get("env_args", {}).items():
+      parts.append(f'env_args.{k}={lit(v)}')
+  command = (f'python src/epymarl/src/main.py --config={cfg["algo"]} '
+             f'--env-config=gymma with ' + ' '.join(parts))
+  ```
+
+- **書いたキーだけ上書き、未記載キーは drp_env.py の signature デフォルトが効く** ので、「普段いじる行」だけ移せばよい。
+
+### 未決事項 (実装時に決める)
+
+- env key を `env_args.key` で直書きするか、`map` / `agent_num` / `safe` から `drp_env:drp_safe-5agent_map_8x5-v2` を自動生成するか
+- スコープ: まず train.py のみ。test.py / run.py への同様適用 (同じ exp_config を読ませる) は別途
+- sacred 動作確認: `with t_max=...` と `env_args.use_lare_path=False` が実際に効くか、短い `t_max` で 1 回実起動して確認
+
+### 影響範囲
+
+- `train.py` の書き換え + `exp_config.example.yaml` / `.gitignore` の追加 (新規ファイル中心)
+- `gymma.yaml` / `drp_env.py` は**編集しなくなる** (= 衝突解消)。デフォルト値の単一の真実は drp_env.py signature のまま維持され、CLAUDE.md の不変条件に整合
+- 学習・推論の挙動自体は不変 (パラメータの渡し方が変わるだけ)
+
+---
+
+最終更新: 2026-06-11

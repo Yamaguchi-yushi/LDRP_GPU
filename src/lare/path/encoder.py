@@ -163,6 +163,18 @@ def evaluation_func(observation, eps=1e-6):
     avg_sep_norm = np.nan_to_num(avg_sep_norm, nan=0.0)
     safety_margin = np.nan_to_num(safety_margin, nan=0.0)
 
+    print("====================================================")
+    print(f"prog_goal: {prog_goal.flatten()}")
+    print(f"in_collision: {in_collision.flatten()}")
+    print(f"others_in_collision: {others_in_collision.flatten()}")
+    print(f"wait_norm: {wait_norm.flatten()}")
+    print(f"dist_goal_norm: {dist_goal_norm.flatten()}")
+    print(f"min_sep_norm: {min_sep_norm.flatten()}")
+    print(f"avg_sep_norm: {avg_sep_norm.flatten()}")
+    print(f"safety_margin: {safety_margin.flatten()}")
+    print(f"collision_risk: {collision_risk.flatten()}")
+    print(f"at_goal: {at_goal.flatten()}")
+
     return [
         prog_goal,
         in_collision,

@@ -19,7 +19,7 @@ for i in range(num_runs):
     command = (
         f'python src/epymarl/src/main.py --config=qmix --env-config=gymma '
         f'with env_args.time_limit=500 '
-        f'env_args.key="drp_env:drp_safe-4agent_map_8x5-v2" '
+        f'env_args.key="drp_env:drp_safe-5agent_map_aoba00-v2" '
         f'env_args.state_repre_flag="onehot_fov" '
         )
     proc = subprocess.Popen(command, shell=True)

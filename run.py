@@ -6,14 +6,14 @@ import sys
 map_name = [
     #"map_5x4",
     "map_8x5",
-    #"map_aoba00",
+    "map_aoba00",
     #"map_aoba01",
 ]
 
 agent_num = [
-    3,
+    #3,
     4,
-    5,
+    #5,
 ]
 
 path_planner = [

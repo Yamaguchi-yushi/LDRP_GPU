@@ -3,7 +3,7 @@
 # =============================================================================
 
 # --- 環境 / アルゴリズム選択 ---
-env_name: "drp_env:drp_safe-4agent_map_8x5-v2"
+env_name: "drp_env:drp-4agent_map_8x5-v2"
 #env_name: "drp_env:drp-5agent_map_8x5-v2"
 agent_num: 4
 map_name: "map_8x5"
@@ -12,7 +12,7 @@ path_planner: "qmix"
 
 # --- 実行制御 ---
 time_limit: 1000
-test_num: 1
+test_num: 1000
 # タスク割当の選択肢・結果を stdout に出力 (実際に何かを割当てたステップだけ)
 debug_task_assign: False
 # PPO タスク割当の学習打ち切りステップ数 (累積環境ステップ).

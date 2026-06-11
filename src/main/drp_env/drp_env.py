@@ -24,7 +24,7 @@ class DrpEnv(gym.Env):
 			map_name="map_3x3",
 			reward_list={"goal": 100, "collision": -10, "wait": -10, "move": -1},
 			task_flag=True,
-			task_list = None,
+			task_list =None,
 			use_lare_path=True,
 			use_lare_path_training=True,
 			lare_path_factor_dim=10,
@@ -41,7 +41,7 @@ class DrpEnv(gym.Env):
 			use_pretrained_lare_path=True,
 			pretrained_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
 			use_finetuning_lare_path=False,
-			finetuning_lare_path_model_name="QMIX_LARE_map_8x5_2agents_1.2M_final.pth",
+			finetuning_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
 			lare_path_autosave=True,
 			lare_path_autosave_path=None,
 			lare_path_save_dir=None,
@@ -996,8 +996,7 @@ class DrpEnv(gym.Env):
 							raise ValueError("Error in task execution")
 						
 				self.obs_prepare[i] = [self.obs[i][0], self.obs[i][1], self.start_ori_array[i], self.goal_array[i]]
-				self.obs_onehot[i] = np.zeros((1, len(list(self.G.nodes()))*2))
-				self.obs_onehot[i][int(self.current_start[i])] = 1
+				self.obs_onehot[i][len(list(self.G.nodes())):len(list(self.G.nodes()))*2] = 0 # reset goal one-hot
 				self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
 
 			self.obs = tuple([np.array(i) for i in self.obs_prepare])

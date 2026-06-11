@@ -1,36 +1,31 @@
 # LDRP の主要依存パッケージ. Python 3.9 を前提.
 # 詳細セットアップ手順: ./setup_env.sh または MANUAL.md を参照.
+#
+# 注意: 次の 2 つはここでは管理せず, setup_env.sh が個別に pip install する.
+#   - torch  : GPU/CPU で wheel が変わる (cu128 用 --index-url が必要)
+#   - gym    : Safe-TSL-DBCT gpu と揃えて特定 commit を git+ で固定
+#
+# numpy / matplotlib は Safe-TSL-DBCT gpu freeze に揃えた (numpy 2.x 対応).
 
 # --- LDRP 本体 (test.py 推論用) ---
-gym==0.26.2
 networkx==3.2.1
-numpy==1.26.4
-torch==2.8.0
+numpy==2.0.2
 PyYAML==6.0.3
-matplotlib==3.8.2
+matplotlib==3.9.4
 
 # --- epymarl 経由の MARL 学習 (train.py 用) ---
-# sacred:             epymarl の実験管理フレームワーク (main.py で必須)
-# tensorboard-logger: epymarl の use_tensorboard=True (デフォルト) で必須.
-#                     学習ログを results/tb_logs/ にイベントファイルとして書き出す.
-# tensorboard:        書き出されたイベントファイルを可視化する本体. 学習途中の
-#                     リアルタイム監視に使う (`tensorboard --logdir results/tb_logs`).
-#                     ==2.8.0 にピン: 研究室の元 drp env と合わせる + 最新版は
-#                     protobuf>=4 を要求して下の `protobuf<4` 制約と衝突するため.
-# einops:             PAC 系 learner が eager import するため qmix/iql/vdn でも必須
-#                     (learners/__init__.py の REGISTRY で全 learner を eager 登録するため)
-# 注意: PAC DCG critic は torch_scatter を要するが, critics/__init__.py の
-#       register_pac_critics() 遅延ロードで分離 → qmix/iql/vdn では不要.
-#       PAC DCG を実際に使うときだけ `pip install torch_scatter` する.
-sacred
-tensorboard-logger
-tensorboard==2.8.0
-einops
-# tensorboard-logger 0.1.0 が古い protobuf API を使うため <4 にピン.
-# 新しい protobuf (6 系) を入れると `Descriptors cannot be created directly` で死ぬ.
-# upstream LDRP の src/epymarl/requirements.txt は `protobuf==3.6.1` で更に厳しくピン.
-protobuf<4
-# SMAC: epymarl の envs/__init__.py が `from smac.env import MultiAgentEnv` を
-# eager import するため必須. SC2 実行ファイルは不要 (基底クラスとしてのみ利用).
-# upstream LDRP の src/epymarl/requirements.txt も同じ git URL を指定.
-git+https://github.com/oxwhirl/smac.git
+# sacred:      epymarl の実験管理フレームワーク (main.py で必須)
+# einops:      PAC 系 learner/critic を learners/__init__.py が eager import するため
+#              qmix/iql/vdn でも必須 (modules/critics/pac_ac.py 等が einops を使う)
+# tensorboard: use_tensorboard=True (default.yaml 既定) のログ書き出しに必須.
+#              本リポの utils/logging.py は torch.utils.tensorboard.SummaryWriter を
+#              使うため tensorboard 本体が要る. 旧 tensorboard-logger は使わないので
+#              protobuf<4 のピンも不要 (numpy 2.x 環境で dry-run 解決した版に固定).
+# バージョンは ldrp env (numpy 2.0.2 / py3.9) で pip が解決した互換版に固定.
+sacred==0.8.7
+einops==0.8.2
+tensorboard==2.20.0
+# smac: envs/__init__.py が `from smac.env import MultiAgentEnv` を eager import する
+#       ため必須. SC2 実行ファイルは不要 (基底クラスとしてのみ利用).
+#       PyPI 版が無いので Safe-TSL-DBCT gpu と同じ commit に固定.
+git+https://github.com/oxwhirl/smac.git@d6aab33f76abc3849c50463a8592a84f59a5ef84

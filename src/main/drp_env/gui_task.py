@@ -1,13 +1,25 @@
 import numpy as np
-import tkinter as tk
-from tkinter import ttk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-import matplotlib
-matplotlib.use('tkagg')
+
+# GUI 依存 (tk / matplotlib tkagg) を遅延 import 化. headless サーバでも
+# `import drp_env` がコケないようにし, GUI を実際に使うときだけエラーにする.
+_GUI_IMPORT_ERROR = None
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    import matplotlib
+    matplotlib.use('tkagg')
+except Exception as _e:  # ImportError も RuntimeError (backend 不在) も拾う
+    _GUI_IMPORT_ERROR = _e
 
 class GUI_tasklist():
     def __init__(self):
+        if _GUI_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "GUI_tasklist は GUI 環境 (tkinter + matplotlib tkagg) が必要ですが, "
+                f"この環境では利用できません: {_GUI_IMPORT_ERROR}"
+            )
         self.root = tk.Tk()
         self.root.title("Simulation with Task Manager")
         self.init_gui()

@@ -1,9 +1,14 @@
 from envs import REGISTRY as env_REGISTRY
 from functools import partial
 from components.episode_buffer import EpisodeBatch
-from multiprocessing import Pipe, Process
+import multiprocessing
 import numpy as np
 import torch as th
+
+# fork されたサブプロセスでの CUDA 再初期化エラーを避けるため 'spawn' を使う
+_ctx = multiprocessing.get_context('spawn')
+Pipe = _ctx.Pipe
+Process = _ctx.Process
 
 
 # Based (very) heavily on SubprocVecEnv from OpenAI Baselines
@@ -188,7 +193,7 @@ class ParallelRunner:
         cur_returns = self.test_returns if test_mode else self.train_returns
         log_prefix = "test_" if test_mode else ""
         infos = [cur_stats] + final_env_infos
-        cur_stats.update({k: sum(d.get(k, 0) for d in infos) for k in set.union(*[set(d) for d in infos])})
+        cur_stats.update({k: sum(v for d in infos if isinstance(v := d.get(k), (int, float))) for k in set.union(*[set(d) for d in infos])})
         cur_stats["n_episodes"] = self.batch_size + cur_stats.get("n_episodes", 0)
         cur_stats["ep_length"] = sum(episode_lengths) + cur_stats.get("ep_length", 0)
 

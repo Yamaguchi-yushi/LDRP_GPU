@@ -18,7 +18,7 @@ import yaml
 
 from run import run
 
-SETTINGS['CAPTURE_MODE'] = "fd" # set to "no" if you want to see stdout/stderr in console
+SETTINGS['CAPTURE_MODE'] = "no" # "fd" はサブプロセス(env)の stdout(LaRe 初期化ログ等)を握りつぶす。"no" で全出力を表示
 logger = get_logger()
 
 ex = Experiment("pymarl")

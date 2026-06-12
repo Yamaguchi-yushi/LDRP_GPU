@@ -39,7 +39,7 @@ class DrpEnv(gym.Env):
 			lare_path_batch_size=256,
 			lare_path_lr=5e-4,
 			use_pretrained_lare_path=True,
-			pretrained_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
+			pretrained_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth",
 			use_finetuning_lare_path=False,
 			finetuning_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
 			lare_path_autosave=True,
@@ -915,7 +915,7 @@ class DrpEnv(gym.Env):
 			for i in range(self.agent_num):
 				pos_agenti = [self.obs[i][0],self.obs[i][1]]
 				if self.assigned_tasks[i] != []:
-					if str(pos_agenti)==str(self.pos[self.goal_array[i]]):
+					if [float(v) for v in pos_agenti] == [float(v) for v in self.pos[self.goal_array[i]]]:
 						if self.goal_array[i] == self.assigned_tasks[i][1]:
 							self.assigned_tasks[i] = [] # remove the task from assigned_tasks
 							self.task_completion += 1
@@ -976,7 +976,7 @@ class DrpEnv(gym.Env):
 			for i in range(self.agent_num):
 				pos_agenti = [self.obs[i][0],self.obs[i][1]]
 				if len(self.assigned_tasks[i])>0:
-					if str(pos_agenti)==str(self.pos[self.goal_array[i]]):
+					if [float(v) for v in pos_agenti] == [float(v) for v in self.pos[self.goal_array[i]]]:
 						#when agent i reach the pick node
 						if self.goal_array[i]==self.assigned_tasks[i][0]:
 							self.start_ori_array[i] = self.goal_array[i]
@@ -1081,7 +1081,7 @@ class DrpEnv(gym.Env):
 			if self.start_ori_array[i] == self.goal_array[i]:
 				r_i = 0
 			else:
-				if str(pos_agenti)==str(self.pos[self.goal_array[i]]): # at goal				
+				if [float(v) for v in pos_agenti] == [float(v) for v in self.pos[self.goal_array[i]]]: # at goal				
 					if len(self.assigned_tasks[i])>0 : #first time to reach goal 
 						r_i = self.r_goal
 						self.reach_account += 1
@@ -1096,7 +1096,7 @@ class DrpEnv(gym.Env):
 						r_i = self.r_move*self.speed
 
 		else:
-			if str(pos_agenti)==str(self.pos[self.goal_array[i]]): # at goal				
+			if [float(v) for v in pos_agenti] == [float(v) for v in self.pos[self.goal_array[i]]]: # at goal				
 				if pre_pos_agenti!=pos_agenti : #first time to reach goal 
 					r_i = self.r_goal
 					self.reach_account += 1

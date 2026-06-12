@@ -40,7 +40,7 @@ class PPOLearner:
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
         # Get the relevant quantities
-
+        batch = batch.to(self.args.device)
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :]
         terminated = batch["terminated"][:, :-1].float()

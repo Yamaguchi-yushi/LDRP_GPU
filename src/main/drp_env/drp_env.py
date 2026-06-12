@@ -25,8 +25,8 @@ class DrpEnv(gym.Env):
 			reward_list={"goal": 100, "collision": -10, "wait": -10, "move": -1},
 			task_flag=True,
 			task_list =None,
-			use_lare_path=True,
-			use_lare_path_training=True,
+			use_lare_path=False,
+			use_lare_path_training=False,
 			lare_path_factor_dim=10,
 			lare_path_decoder_hidden_dim=64,
 			lare_path_decoder_n_layers=3,
@@ -38,7 +38,7 @@ class DrpEnv(gym.Env):
 			lare_path_update_freq=128,
 			lare_path_batch_size=256,
 			lare_path_lr=5e-4,
-			use_pretrained_lare_path=True,
+			use_pretrained_lare_path=False,
 			pretrained_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth",
 			use_finetuning_lare_path=False,
 			finetuning_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
@@ -67,6 +67,7 @@ class DrpEnv(gym.Env):
 			# 学習頻度 (update_freq) とは独立. 0 にすると毎更新ごとに保存.
 			lare_path_save_freq_steps=500_000,
 			lare_task_save_freq_steps=500_000,
+			lare_device="auto",
 			# PBS 互換モード: True にすると待機分岐で current_goal を非 None に保つ
 			# (PBS の path 計画で必要). False にすると SafeEnv の保護が待機 agent
 			# にも効く. デフォルト False = 安全制御優先 (詳細は CLAUDE.md).
@@ -179,6 +180,7 @@ class DrpEnv(gym.Env):
 		# 保存間引きしきい値 (累積環境ステップ単位). LaRe-Path/Task の自動保存に適用.
 		self.lare_path_save_freq_steps = int(lare_path_save_freq_steps)
 		self.lare_task_save_freq_steps = int(lare_task_save_freq_steps)
+		self.lare_device = lare_device  # 内部用に保存. "auto" を解決して torch.device にするのは各モジュールの初期化時.
 
 		if self.use_lare_path:
 			self._init_lare_path(
@@ -193,6 +195,7 @@ class DrpEnv(gym.Env):
 				update_freq=lare_path_update_freq,
 				batch_size=lare_path_batch_size,
 				learning_rate=lare_path_lr,
+				lare_device=self.lare_device,
 			)
 		else:
 			print("⚪ [LaRe-Path] Disabled - using env reward (baseline)")
@@ -207,6 +210,7 @@ class DrpEnv(gym.Env):
 				update_freq=lare_task_update_freq,
 				batch_size=lare_task_batch_size,
 				learning_rate=lare_task_lr,
+				lare_device=self.lare_device,
 			)
 		else:
 			print("⚪ [LaRe-Task] Disabled - using env reward (baseline)")
@@ -397,7 +401,7 @@ class DrpEnv(gym.Env):
 
 	def _init_lare_path(self, factor_dim, decoder_hidden_dim, decoder_n_layers,
 						use_transformer, transformer_heads, transformer_depth,
-						buffer_capacity, min_buffer, update_freq, batch_size, learning_rate):
+						buffer_capacity, min_buffer, update_freq, batch_size, learning_rate, lare_device="auto"):
 		"""Initialize LaRe-Path module. Falls back silently to disabled mode on import failure."""
 		try:
 			# Resolve the LDRP repo root and add it to sys.path so `src.lare.*` imports work.
@@ -446,6 +450,7 @@ class DrpEnv(gym.Env):
 				frozen=cfg_frozen,
 				autosave_path=autosave,
 				save_freq_steps=self.lare_path_save_freq_steps,
+				device=lare_device,
 			)
 			self.lare_path_module = LaRePathModule(self, cfg)
 
@@ -503,7 +508,7 @@ class DrpEnv(gym.Env):
 
 	# ---------------- LaRe-Task initialisation / weight-loading ----------------
 	def _init_lare_task(self, factor_dim, decoder_hidden_dim, decoder_n_layers,
-						buffer_capacity, min_buffer, update_freq, batch_size, learning_rate):
+						buffer_capacity, min_buffer, update_freq, batch_size, learning_rate, lare_device="auto"):
 		try:
 			repo_root = self._lare_repo_root()
 			if repo_root not in sys.path:
@@ -539,6 +544,7 @@ class DrpEnv(gym.Env):
 				frozen=cfg_frozen,
 				autosave_path=autosave,
 				save_freq_steps=self.lare_task_save_freq_steps,
+				device=lare_device,
 			)
 
 			# Reuse LaRe-Path's graph_diameter when available (saves a Dijkstra all-pairs).

@@ -51,6 +51,7 @@ class LaReTaskConfig:
     # 保存間引きしきい値. 前回保存時の累積環境ステップから save_freq_steps 以上
     # 進んだ時だけ保存. 0 にすると毎更新ごとに保存.
     save_freq_steps: int = 500_000
+    device: str = "auto"  # "auto", "cpu", or "cuda"
 
 
 class LaReTaskModule:
@@ -59,7 +60,11 @@ class LaReTaskModule:
         self.cfg = config if config is not None else LaReTaskConfig()
         self.factor_dim = int(self.cfg.factor_dim)
         self.n_agents = int(env.agent_num)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if self.cfg.device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(self.cfg.device)
 
         self.graph_diameter = float(graph_diameter) if graph_diameter is not None else self._compute_graph_diameter()
 

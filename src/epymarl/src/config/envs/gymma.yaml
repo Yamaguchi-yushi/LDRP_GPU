@@ -5,6 +5,7 @@ env_args:
   time_limit: 500
   state_repre_flag: "onehot"  # new
   pretrained_wrapper: null
+  lare_device: "cpu"  # new
 
 test_greedy: True
 test_nepisode: 100
@@ -12,4 +13,4 @@ test_interval: 50000
 log_interval: 50000
 runner_log_interval: 10000
 learner_log_interval: 10000
-t_max: 150050000
+t_max: 300050000

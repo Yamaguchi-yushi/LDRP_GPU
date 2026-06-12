@@ -69,6 +69,7 @@ class LaRePathConfig:
     # ときだけ実際にファイルへ書き出す. デコーダ学習自体は update_freq 通り走る
     # ので、学習頻度 ≠ 保存頻度 を独立に制御できる. 0 にすると毎更新ごとに保存.
     save_freq_steps: int = 500_000
+    device: str = "auto"
 
 
 class LaRePathModule:
@@ -83,7 +84,10 @@ class LaRePathModule:
         self.n_agents = env.agent_num
         self.seq_length = self.cfg.seq_length
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.cfg.device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(self.cfg.device)
 
         self.decoder = PathRewardDecoder(
             factor_dim=self.factor_dim,

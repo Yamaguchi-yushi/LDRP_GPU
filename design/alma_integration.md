@@ -6,7 +6,7 @@
 - 導入先: [https://github.com/Yamaguchi-yushi/LDRP](https://github.com/Yamaguchi-yushi/LDRP) (本リポ)
 - 元論文: ALMA: Hierarchical Learning for Composite Multi-Agent Tasks (NeurIPS 2022, Iqbal et al.)
 - 著者実装: [https://github.com/shariqiqbal2810/ALMA](https://github.com/shariqiqbal2810/ALMA)
-- 関連: [lare_integration.md](lare_integration.md), [multi_task_agents.md](multi_task_agents.md), [../MANUAL.md](../MANUAL.md)
+- 関連: [lare_integration.md](lare_integration.md), [ldrp_extensions.md](ldrp_extensions.md), [../MANUAL.md](../MANUAL.md)
 
 ---
 
@@ -27,7 +27,7 @@
 13. [リスク・未決事項](#13-リスク未決事項)
 14. [軽量代替案 (フル ALMA 採用しない場合)](#14-軽量代替案-フル-alma-採用しない場合)
 
-> **複数タスク保持エージェントへの拡張**は別設計書 [multi_task_agents.md](multi_task_agents.md) を参照。
+> **複数タスク保持エージェントへの拡張**は別設計書 [ldrp_extensions.md](ldrp_extensions.md) §3 を参照。
 
 ---
 

@@ -111,7 +111,7 @@ class ParallelRunner:
 
             # Update the actions taken
             actions_chosen = {
-                "actions": actions.unsqueeze(1)
+                "actions": actions.to("cpu").unsqueeze(1)
             }
             self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 

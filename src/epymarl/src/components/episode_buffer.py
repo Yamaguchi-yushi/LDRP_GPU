@@ -83,6 +83,7 @@ class EpisodeBatch:
         for k, v in self.data.episode_data.items():
             self.data.episode_data[k] = v.to(device)
         self.device = device
+        return self
 
     def update(self, data, bs=slice(None), ts=slice(None), mark_filled=True):
         slices = self._parse_slices((bs, ts))

@@ -26,6 +26,9 @@ class BasicMAC:
     def forward(self, ep_batch, t, test_mode=False):
         agent_inputs = self._build_inputs(ep_batch, t)
         avail_actions = ep_batch["avail_actions"][:, t]
+        device = self.hidden_states.device
+        agent_inputs = agent_inputs.to(device)
+        avail_actions = avail_actions.to(device)
         agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
 
         # Softmax the agent outputs if they're policy logits

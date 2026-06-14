@@ -20,11 +20,11 @@ obs_individual_obs: False
 
 agent_output_type: "pi_logits"
 learner: "ppo_learner"
-entropy_coef: 0.01
-use_rnn: False
+entropy_coef: 0.05
+use_rnn: True
 standardise_returns: True  # default False
 standardise_rewards: False
-q_nstep: 5 # 1 corresponds to normal r + gammaV
+q_nstep: 50 # 1 corresponds to normal r + gammaV
 critic_type: "cv_critic"
 epochs: 10
 eps_clip: 0.2

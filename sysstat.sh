@@ -89,6 +89,12 @@ show() {
     cc=$(color_for "$cpuuse")
     printf '    使用率 %s%s %3s%%%s  %sコア %s / load(1,5,15分) %s%s\n' \
            "$cc" "$(bar "$cpuuse")" "$cpuuse" "$N" "$DIM" "$cores" "$load" "$N"
+    cpu_top=$(ps -eo pid,user:20,pcpu,rss,comm --sort=-%cpu 2>/dev/null | \
+        awk 'NR>1 && $3+0 >= 1.0 {printf "      PID %-7s  %5.1f%%CPU  %6.0f MiB  %s (%s)\n", $1, $3, $4/1024, $5, $2}' | head -6)
+    if [ -n "$cpu_top" ]; then
+        printf '    %sプロセス別 CPU:%s\n' "$DIM" "$N"
+        printf '%s\n' "$cpu_top"
+    fi
 
     # ---------- メモリ ----------
     printf '%s\n' "${B}■ メモリ${N}"
@@ -103,6 +109,12 @@ show() {
         spct=$(( sused * 100 / stot ))
         printf '    Swap   %s%s %3s%%%s  %s / %s MiB\n' \
                "$(color_for "$spct")" "$(bar "$spct")" "$spct" "$N" "$sused" "$stot"
+    fi
+    mem_top=$(ps -eo pid,user:20,pcpu,rss,comm --sort=-rss 2>/dev/null | \
+        awk 'NR>1 && $4+0 >= 102400 {printf "      PID %-7s  %6.0f MiB  %5.1f%%CPU  %s (%s)\n", $1, $4/1024, $3, $5, $2}' | head -6)
+    if [ -n "$mem_top" ]; then
+        printf '    %sプロセス別 RSS:%s\n' "$DIM" "$N"
+        printf '%s\n' "$mem_top"
     fi
 }
 

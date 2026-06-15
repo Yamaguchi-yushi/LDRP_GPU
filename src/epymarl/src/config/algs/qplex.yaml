@@ -1,0 +1,38 @@
+# --- QPLEX specific parameters ---
+
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 200000
+evaluation_epsilon: 0.0
+
+runner: "episode"
+
+buffer_size: 5000
+
+# target 更新 (>1: hard / <=1: soft tau). 本リポ q_learner と同じキー名
+target_update_interval_or_tau: 200
+
+obs_agent_id: False # default True
+obs_last_action: False # default True
+obs_individual_obs: False
+
+standardise_returns: False
+standardise_rewards: True
+
+agent_output_type: "q"
+learner: "dmaq_qatten_learner"
+double_q: True
+mixer: "dmaq"
+use_rnn: False # default True
+mixing_embed_dim: 32
+hypernet_embed: 64
+
+# QPLEX advantage hypernet (DMAQ_SI_Weight が参照)
+adv_hypernet_layers: 3
+adv_hypernet_embed: 64
+num_kernel: 10
+is_minus_one: True
+weighted_head: True
+
+name: "qplex"

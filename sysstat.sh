@@ -20,6 +20,23 @@ else
     B=; DIM=; G=; Y=; R=; C=; N=
 fi
 
+# --- tmux ペイン tty → セッション名 のマップ ---
+declare -A TMUX_MAP
+build_tmux_map() {
+    TMUX_MAP=()
+    local ptty psess
+    while read -r ptty psess; do
+        [ -n "$ptty" ] && TMUX_MAP["$ptty"]="$psess"
+    done < <(tmux list-panes -a -F '#{pane_tty} #{session_name}' 2>/dev/null)
+}
+# PID → tmux ラベル ("-" if tty 無し/tmux 外)
+pid_tmux() {
+    local tty
+    tty=$(ps -o tty= -p "$1" 2>/dev/null)
+    { [ -z "$tty" ] || [ "$tty" = "?" ]; } && { printf -- '-'; return; }
+    printf '%s' "${TMUX_MAP[/dev/$tty]:--}"
+}
+
 # 使用率(%)に応じた色: <60 緑 / <90 黄 / それ以上 赤
 color_for() {
     local v=${1%.*}
@@ -43,6 +60,7 @@ bar() {
 }
 
 show() {
+    build_tmux_map
     printf '%s\n' "${B}${C}===== システム状況 ($(date '+%Y-%m-%d %H:%M:%S')) =====${N}"
 
     # ---------- GPU ----------
@@ -71,7 +89,8 @@ show() {
                 pid=$(echo "$pid"|xargs); mem=$(echo "$mem"|xargs)
                 pname=$(ps -p "$pid" -o comm= 2>/dev/null)
                 puser=$(ps -p "$pid" -o user= 2>/dev/null)
-                printf '      PID %-7s %7s MiB  %s (%s)\n' "$pid" "$mem" "${pname:-?}" "${puser:-?}"
+                printf '      PID %-7s %7s MiB  %s (%s)  %s[%s]%s\n' \
+                       "$pid" "$mem" "${pname:-?}" "${puser:-?}" "$C" "$(pid_tmux "$pid")" "$N"
             done
         else
             printf '    %s(GPU 使用プロセスなし)%s\n' "$DIM" "$N"
@@ -90,10 +109,13 @@ show() {
     printf '    使用率 %s%s %3s%%%s  %sコア %s / load(1,5,15分) %s%s\n' \
            "$cc" "$(bar "$cpuuse")" "$cpuuse" "$N" "$DIM" "$cores" "$load" "$N"
     cpu_top=$(ps -eo pid,user:20,pcpu,rss,comm --sort=-%cpu 2>/dev/null | \
-        awk 'NR>1 && $3+0 >= 1.0 {printf "      PID %-7s  %5.1f%%CPU  %6.0f MiB  %s (%s)\n", $1, $3, $4/1024, $5, $2}' | head -6)
+        awk 'NR>1 && $3+0 >= 1.0 {printf "%s %s %.1f %.0f %s\n", $1, $2, $3, $4/1024, $5}' | head -6)
     if [ -n "$cpu_top" ]; then
         printf '    %sプロセス別 CPU:%s\n' "$DIM" "$N"
-        printf '%s\n' "$cpu_top"
+        while read -r pid user cpu mem comm; do
+            printf '      PID %-7s  %5s%%CPU  %6s MiB  %s (%s)  %s[%s]%s\n' \
+                   "$pid" "$cpu" "$mem" "$comm" "$user" "$C" "$(pid_tmux "$pid")" "$N"
+        done <<< "$cpu_top"
     fi
 
     # ---------- メモリ ----------
@@ -111,10 +133,13 @@ show() {
                "$(color_for "$spct")" "$(bar "$spct")" "$spct" "$N" "$sused" "$stot"
     fi
     mem_top=$(ps -eo pid,user:20,pcpu,rss,comm --sort=-rss 2>/dev/null | \
-        awk 'NR>1 && $4+0 >= 102400 {printf "      PID %-7s  %6.0f MiB  %5.1f%%CPU  %s (%s)\n", $1, $4/1024, $3, $5, $2}' | head -6)
+        awk 'NR>1 && $4+0 >= 102400 {printf "%s %s %.1f %.0f %s\n", $1, $2, $3, $4/1024, $5}' | head -6)
     if [ -n "$mem_top" ]; then
         printf '    %sプロセス別 RSS:%s\n' "$DIM" "$N"
-        printf '%s\n' "$mem_top"
+        while read -r pid user cpu mem comm; do
+            printf '      PID %-7s  %6s MiB  %5s%%CPU  %s (%s)  %s[%s]%s\n' \
+                   "$pid" "$mem" "$cpu" "$comm" "$user" "$C" "$(pid_tmux "$pid")" "$N"
+        done <<< "$mem_top"
     fi
 }
 

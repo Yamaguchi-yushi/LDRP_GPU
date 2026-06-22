@@ -9,6 +9,7 @@ agent_num: 4
 map_name: "map_8x5"
 task_assigner: "tp"
 path_planner: "qmix"
+method_tag: ""
 
 # --- 実行制御 ---
 time_limit: 1000

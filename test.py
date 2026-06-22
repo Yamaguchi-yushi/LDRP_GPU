@@ -14,7 +14,7 @@ if __name__ == "__main__":
     reward_list = {
         "goal": 100,
         "collision": -100,
-        "wait": -10.,
+        "wait": -10,
         "move": -1,
     }
 
@@ -23,11 +23,13 @@ if __name__ == "__main__":
     config = Namespace(**config_dict)
 
     if len(sys.argv) > 1:
-        #map,agent,path,task
+        #map,agent,path,task,[method_tag]
         config.map_name = sys.argv[1]
         config.agent_num = int(sys.argv[2])
         config.path_planner = sys.argv[3]
         config.task_assigner = sys.argv[4]
+        if len(sys.argv) > 5:
+            config.method_tag = sys.argv[5]
 
     env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
     #env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"

@@ -36,11 +36,13 @@ class MARLPolicy():
     def __init__(self, args):
         self.args = args
         self.path_planner = args.path_planner
+        self.method_tag = getattr(args, "method_tag", "") or ""
         self.runner = None
     
     def get_model_path(self, env):
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        filename = f"{env.map_name}_{env.agent_num}_{self.path_planner}.th"
+        suffix = f"_{self.method_tag}" if self.method_tag else ""
+        filename = f"{env.map_name}_{env.agent_num}_{self.path_planner}{suffix}.th"
         path = os.path.join(base_dir, "models", "safe", filename)
 
         return path

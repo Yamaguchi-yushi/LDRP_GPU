@@ -7,6 +7,7 @@ from .actor_critic_pac_dcg_learner import PACDCGLearner
 from .maddpg_learner import MADDPGLearner
 from .ppo_learner import PPOLearner
 from .dmaq_qatten_learner import DMAQ_qattenLearner
+from .mat_learner import MATLearner
 REGISTRY = {}
 
 REGISTRY["q_learner"] = QLearner
@@ -18,3 +19,4 @@ REGISTRY["ppo_learner"] = PPOLearner
 REGISTRY["pac_learner"] = PACActorCriticLearner
 REGISTRY["pac_dcg_learner"] = PACDCGLearner
 REGISTRY["dmaq_qatten_learner"] = DMAQ_qattenLearner
+REGISTRY["mat_learner"] = MATLearner

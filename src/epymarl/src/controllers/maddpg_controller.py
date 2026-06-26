@@ -62,7 +62,7 @@ class MADDPGMAC:
         # Only select actions for the selected batch elements in bs
         agent_outputs = self.forward(ep_batch, t_ep)
         chosen_actions = gumbel_softmax(agent_outputs, hard=True).argmax(dim=-1)
-        return chosen_actions
+        return chosen_actions, {}
 
     def target_actions(self, ep_batch, t_ep):
         agent_outputs = self.forward(ep_batch, t_ep)

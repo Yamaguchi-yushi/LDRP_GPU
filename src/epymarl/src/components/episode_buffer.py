@@ -83,6 +83,7 @@ class EpisodeBatch:
         for k, v in self.data.episode_data.items():
             self.data.episode_data[k] = v.to(device)
         self.device = device
+        return self
 
     def update(self, data, bs=slice(None), ts=slice(None), mark_filled=True):
         slices = self._parse_slices((bs, ts))
@@ -127,6 +128,12 @@ class EpisodeBatch:
                 return self.data.episode_data[item]
             elif item in self.data.transition_data:
                 return self.data.transition_data[item]
+            elif item == 'batch_size':
+                return self.batch_size
+            elif item == 'max_seq_length':
+                return self.max_seq_length
+            elif item == 'device':
+                return self.device
             else:
                 raise ValueError
         elif isinstance(item, tuple) and all([isinstance(it, str) for it in item]):

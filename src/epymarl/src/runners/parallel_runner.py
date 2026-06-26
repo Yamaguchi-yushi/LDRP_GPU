@@ -106,13 +106,17 @@ class ParallelRunner:
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch for each un-terminated env
-            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
+            actions, extra_returns = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, bs=envs_not_terminated, test_mode=test_mode)
             cpu_actions = actions.to("cpu").numpy()
 
             # Update the actions taken
             actions_chosen = {
                 "actions": actions.to("cpu").unsqueeze(1)
             }
+            if "log_probs" in self.args.extra_in_buffer:
+                actions_chosen["log_probs"] = extra_returns["log_probs"].unsqueeze(1)
+            if "values" in self.args.extra_in_buffer:
+                actions_chosen["values"] = extra_returns["values"].unsqueeze(1)
             self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 
             # Send actions to each env

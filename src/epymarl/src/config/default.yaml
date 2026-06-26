@@ -36,6 +36,7 @@ optim_alpha: 0.99 # RMSProp alpha
 optim_eps: 0.00001 # RMSProp epsilon
 grad_norm_clip: 10 # Reduce magnitude of gradients above this L2 norm
 add_value_last_step: True
+extra_in_buffer: []
 
 # --- Agent parameters ---
 agent: "rnn" # Default rnn agent

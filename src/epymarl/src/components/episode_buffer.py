@@ -121,6 +121,7 @@ class EpisodeBatch:
                     raise ValueError("Unsafe reshape of {} to {}".format(v.shape, dest.shape))
             else:
                 idx -= 1
+                
 
     def __getitem__(self, item):
         if isinstance(item, str):
@@ -128,6 +129,12 @@ class EpisodeBatch:
                 return self.data.episode_data[item]
             elif item in self.data.transition_data:
                 return self.data.transition_data[item]
+            elif item == 'batch_size':
+                return self.batch_size
+            elif item == 'max_seq_length':
+                return self.max_seq_length
+            elif item == 'device':
+                return self.device     
             else:
                 raise ValueError
         elif isinstance(item, tuple) and all([isinstance(it, str) for it in item]):

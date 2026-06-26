@@ -64,7 +64,7 @@ class EpisodeRunner:
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch of size 1
-            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
+            actions, _ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
 
             # LaRe-Path/Task の保存ファイル名 ({X.X}M) を t_env と一致させるため
             # train step のみ env に共有する. test 中は呼ばないので test step は除外される.
@@ -96,7 +96,7 @@ class EpisodeRunner:
         self.batch.update(last_data, ts=self.t)
 
         # Select actions in the last stored state
-        actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
+        actions, _ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
         self.batch.update({"actions": actions}, ts=self.t)
 
         cur_stats = self.test_stats if test_mode else self.train_stats

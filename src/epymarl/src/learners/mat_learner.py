@@ -340,3 +340,12 @@ class MATLearner:
 
     def cuda(self):
         self.mac.agent.cuda()
+
+    def save_models(self, path):
+        self.mac.save_models(path)
+        th.save(self.optimizer.state_dict(), "{}/opt.th".format(path))
+
+    def load_models(self, path):
+        self.mac.load_models(path)
+        self.optimizer.load_state_dict(
+            th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))

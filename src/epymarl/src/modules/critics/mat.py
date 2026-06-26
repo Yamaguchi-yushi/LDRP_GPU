@@ -20,7 +20,7 @@ class MATCritic(nn.Module):
     def forward(self,  batch, t=None):
         inputs, bs, max_t = self._build_inputs(batch, t=t)
         inputs = inputs.reshape(-1, self.n_agents, self.input_shape)
-
+        inputs = inputs.to(next(self.encoder.parameters()).device)
         v_loc = self.encoder(inputs)
 
         return v_loc

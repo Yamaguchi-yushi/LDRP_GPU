@@ -45,6 +45,9 @@ class MLPMATAgent(nn.Module):
     def get_actions(self, ep_batch, t, obs, available_actions=None, deterministic=False):
 
         batch_size = np.shape(obs)[0]
+        obs = obs.to(self.device)
+        if available_actions is not None:
+            available_actions = available_actions.to(self.device)
         v_loc = self.critic(ep_batch, t)
         output_action, output_action_log = self.discrete_autoregreesive_act(
             obs,

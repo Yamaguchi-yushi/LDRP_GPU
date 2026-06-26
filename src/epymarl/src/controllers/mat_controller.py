@@ -1,3 +1,4 @@
+import torch as th
 from .basic_controller import BasicMAC
 
 
@@ -112,6 +113,23 @@ class MATMAC(BasicMAC):
         entropy = entropy.mean()
 
         return values, action_log_probs, entropy
+
+    def _build_inputs(self, batch, t):
+        # EpisodeBatch (rollout) と dict の mini-batch (training) の両方で動く。
+        # batch.batch_size (属性) ではなく batch["batch_size"] (subscript) を使う。
+        bs = batch["batch_size"]
+        obs = batch["obs"][:, t]
+        device = obs.device
+        inputs = [obs]
+        if self.args.obs_last_action:
+            if t == 0:
+                inputs.append(th.zeros_like(batch["actions_onehot"][:, t]))
+            else:
+                inputs.append(batch["actions_onehot"][:, t - 1])
+        if self.args.obs_agent_id:
+            inputs.append(th.eye(self.n_agents, device=device).unsqueeze(0).expand(bs, -1, -1))
+        inputs = th.cat([x.reshape(bs * self.n_agents, -1) for x in inputs], dim=1)
+        return inputs
 
     def init_hidden(self, batch_size):
         """

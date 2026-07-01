@@ -18,11 +18,29 @@ for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
     #iql,aoba00,16050000,unsafe
     command = (
-        f'python src/epymarl/src/main.py --config=mappo --env-config=gymma '
+        f'python src/epymarl/src/main.py --config=mat_dec --env-config=gymma '
         f'with env_args.time_limit=500 '
-        f'env_args.key="drp_env:drp_safe-4agent_map_8x5-v2" '
+        f't_max=300050000 '
+        f'env_args.key="drp_env:drp_safe-7agent_map_aoba00-v2" '
         f'env_args.state_repre_flag="onehot_fov" '
+        f'env_args.use_lare_path=True '
+        f'env_args.use_lare_path_training=True '
+        f'env_args.use_pretrained_lare_path=True '
+        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint.pth" '
+        f'env_args.use_finetuning_lare_path=False '
+        f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
         )
+
+    # train.py の command(QPLEX を CPU で回す例)
+    # command = (
+    #     f'CUDA_VISIBLE_DEVICES="" '
+    #     f'python src/epymarl/src/main.py --config=qplex --env-config=gymma '
+    #     f'with env_args.time_limit=500 '
+    #     f'env_args.key="drp_env:drp_safe-4agent_map_8x5-v2" '
+    #     f'env_args.state_repre_flag="onehot_fov" '
+    #     )
+
+
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
     proc = subprocess.Popen(command, shell=True, env=env)

@@ -6,6 +6,12 @@ env_args:
   state_repre_flag: "onehot"  # new
   pretrained_wrapper: null
   lare_device: "cpu"  # new
+  use_lare_path: False
+  use_lare_path_training: False
+  use_pretrained_lare_path: False
+  pretrained_lare_path_model_name: "FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint"
+  use_finetuning_lare_path: False
+  finetuning_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth"
 
 test_greedy: True
 test_nepisode: 100
@@ -13,4 +19,4 @@ test_interval: 50000
 log_interval: 50000
 runner_log_interval: 10000
 learner_log_interval: 10000
-t_max: 300050000
+t_max: 500050000

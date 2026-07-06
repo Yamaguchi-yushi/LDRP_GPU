@@ -17,6 +17,7 @@
 
 - [ldrp_extensions.md](ldrp_extensions.md): LDRP 拡張 (高優先度: ピックアップ前タスク再配布 / 低優先度: 複数タスク保持 = VRP/TSP 系 tour 計画)
 - [env_maturity.md](env_maturity.md): 環境ソフトウェアとしての成熟度ギャップ (CAMAR/RHCR/LoRR 比較。評価プロトコル・回帰テスト・throughput 指標・大規模輻輳耐性など)
+- [dynamic_agent_count.md](dynamic_agent_count.md): タスク割当エージェントによる動的エージェント数制御 (Phase A: 実行時のみ増減 → Phase B: 増減も学習)
 
 ---
 

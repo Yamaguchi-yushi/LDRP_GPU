@@ -1,3 +1,6 @@
+# DMAQ SI-weight module (QPLEX duplex dueling).
+# Adapted from pymarlzooplus (AILabDsUnipi/pymarlzooplus),
+# originally from https://github.com/wjh720/QPLEX.
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F

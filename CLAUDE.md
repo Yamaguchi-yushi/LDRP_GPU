@@ -40,38 +40,17 @@ PC 版 (LDRP) で行った変更を GPU 版 (LDRP_GPU) に取り込む際は、*
 
 ---
 
-## 開発環境 (固定) — GPU 版 (2026-05-15〜)
+## 開発環境 (固定)
 
-- **Python 実行系**: `<miniforge>/envs/ldrp/bin/python` (Python **3.9**)
-  - 例: linlab GPU マシンでは `/home/linlab/miniforge3/envs/ldrp/bin/python`
-  - `./setup_env.sh` を 1 回実行すれば env 作成・依存インストール・editable install まで完了する
-- **主要パッケージ** (Safe-TSL-DBCT `gpu` ブランチに揃えてある):
-  - torch **2.7.0+cu128** / torchvision 0.22.0+cu128 / torchaudio 2.7.0+cu128
-  - numpy **2.0.2** (1.x ではない — 後述のコード互換に注意)
-  - gym は **PyPI 0.26.2 ではなく特定 commit の git 版** (`git+https://github.com/openai/gym.git@c755d5c35a...`)。numpy 2.x 対応のため
-  - networkx 3.2.1 / PyYAML 6.0.3 / matplotlib 3.9.4
-- **CUDA**: 開発機 (linlab GPU マシン) で **CUDA 12.8 利用可**。コードは `torch.cuda.is_available()` で分岐済み
-- **CPU フォールバック**: GPU が無い環境では `./setup_env.sh --cpu` で CPU wheel が入る
-- **Python 構文制約**: Python 3.10+ 専用構文 (`X | None` 等の PEP 604) は使わない。`Optional[X]` を使う
+**実行系**: `$LDRP_ENV/bin/python` (Python 3.9, `./setup_env.sh` で自動構築)
 
-### numpy 2.x 移行で入った互換パッチ (2026-05-15)
+**パッケージ** (Safe-TSL-DBCT `gpu` ブランチに揃える): torch 2.7.0+cu128 / numpy 2.0.2 / gym (git版) / CUDA 12.8（GPU 時）
 
-numpy 2.0 で `repr(np.float64(0.0))` が `0.0` → `np.float64(0.0)` に変わり、`str()` を介した座標比較が壊れる。LDRP では下記 3 ファイルを Safe-TSL-DBCT と同じ方針で修正済み:
-- `src/main/drp_env/EE_map.py` (`get_avail_action_fun`): `str()` 比較 → `float()` + list 比較
-- `src/main/drp_env/state_repre/wrapper/hrs_hot_file.py`: 同様
-- `src/main/drp_env/drp_env.py` (`_get_avail_agent_actions`): numpy 2.x は float index を許さないため、`avail_actions` を `int()` 化してから fancy index する
+**注意**：numpy 2.x は座標比較で `str()` 禁止 → `float()` + list 比較に変更済み（3ファイル修正）。新規コードも禁止。Python 3.10+ 構文（PEP 604）使用禁止。
 
-新規コードを書く際は **座標比較に `str()` を使わない**。`float()` 化した list で比較すること。
+**将来の実装**: [design/future_work.md](design/future_work.md) で管理。完了項目は削除（TODO 効力維持のため）。**future_work.md 限定**；他の設計書は実装済みも残す（履歴保存）。
 
-将来やりたい実装・未適用の修正は [design/future_work.md](design/future_work.md) に集約。
-
-- **実装が完了した項目は future_work.md から削除する** (future_work は「未適用の TODO」集約。実装済みを残すと未着手と完了が混在し TODO として機能しなくなる)。
-  - 1 項目に「実装済み部分」と「未着手の残課題」が混在する場合は、**実装済み部分だけ削り残課題は残す** (残課題の理解に必要な最小限の前提だけ 1〜2 行で残してよい)。
-  - この削除ルールは **future_work.md 限定**。他の設計書 (`lare_integration.md` 等) は全体設計を記述する文書なので、実装済みでも削除しない。
-
-検証は環境フラグを下げて短時間で:
-- `lare_*_min_buffer=1, lare_*_update_freq=1` (1 エピソードで学習発火)
-- `time_limit=8` 程度
+**短時間検証**: `lare_*_min_buffer=1, lare_*_update_freq=1, time_limit=8`
 
 ---
 
@@ -111,122 +90,131 @@ LDRP/
 
 ---
 
-## エントリポイントの役割 (混同しがちなので明示)
+## エントリポイント
 
-| スクリプト | 用途 | 入力 | 主な出力 |
-|---|---|---|---|
-| `train.py` | **学習** (方策パラメータの更新). epymarl サブプロセスで QMIX/IQL 等を学習 | epymarl の config + env_args | `src/epymarl/tmp_results/models/{N}_{map}_safe_{algo}/{step}/{map_name}_{N}_{algo}.th` |
-| `test.py` | **評価 (単一条件)**. 学習済み `.th` モデルを読み込んで `test_num` 回エピソード実行 | コマンドライン引数 (`map`, `agent_num`, `path_planner`, `task_assigner`) + `src/all_policy/models/safe/{map}_{N}_{algo}.th` | エピソード集計を標準出力 |
-| `run.py` | **評価 (複数条件のバッチ実行)**. map/agent/path/task の組み合わせ分 test.py を subprocess で並列実行 (最大 5 並列) | run.py 内のリスト (`map_name`, `agent_num`, `path_planner`, `task_assigner`) | 各組み合わせのログを `logs/{map}/safe/{map}_{N}_{path}_{task}.txt` に保存 |
-| `runner.py` | Runner クラス本体 (= 評価/学習ループの実装). 単独実行はしない | (test.py から渡される args/env) | (test.py 側で集計) |
+| スクリプト | 役割 |
+|---|---|
+| `train.py` | **学習**：epymarl で `.th` 保存 |
+| `test.py` | **評価単発**：引数で 1 条件実行 |
+| `run.py` | **評価バッチ**：リスト内の複数条件を並列実行 |
+| `runner.py` | クラス定義のみ（単独実行不可） |
 
-### 覚え方
-
-- **学習 = `train.py`** (epymarl サブプロセスで方策を学習し `.th` を保存)
-- **評価単発 = `test.py`** (コマンドライン引数で 1 条件指定して評価)
-- **評価バッチ = `run.py`** (リストで複数条件を回す。ログを `logs/` 配下にまとめる)
-- `runner.py` は「クラス定義」(`Runner`). 直接実行はしない
-
-### 学習後 → 評価への流れ
-
-```text
-[Step 1] train.py で学習
-  ↓ 完了後
-[Step 2] src/epymarl/tmp_results/models/.../{map}_{N}_{algo}.th を
-         src/all_policy/models/safe/{map}_{N}_{algo}.th に手動コピー
-  ↓
-[Step 3] 単発: test.py {map} {N} {algo} {task_assigner}
-         または
-         バッチ: run.py (内部で複数 test.py を起動、logs/ に出力)
-```
+**フロー**: `train.py` → `.th` を `src/all_policy/models/safe/` にコピー → `test.py` / `run.py`
 
 ---
 
-## 不変条件 (Invariants)
+## 不変条件
 
-これを破らない:
+- **baseline** (LaRe OFF): `use_lare_path=False, use_lare_task=False` のとき、LaRe 統合前と一致
+- **デフォルト値の真実**: [drp_env.py](src/main/drp_env/drp_env.py) `__init__` シグネチャ（現在: Path ON / Task OFF）
+- **独立性**: LaRe-Path / LaRe-Task は完全独立。4 モード両方で対称
+- **ファイル構成**:
+  - `src/lare/{path,task}/checkpoints/` → autosave（大量、`.gitignore`）
+  - `src/lare/{path,task}/models/` → 公開モデル（整理済み、git 追跡）
+  - 命名: `{Safe_}{ALGO}_{PATH|TASK}_{map}_{N}agents_{X.X}M_{checkpoint|final}.pth`
+- **新機能は新ディレクトリに分離** (既存ファイルは最小編集)
 
-- **`use_lare_path=False` かつ `use_lare_task=False` のとき、LDRP の挙動は LaRe 統合前と完全一致** (baseline 条件は固定)。
-  - デフォルト値の単一の真実は [src/main/drp_env/drp_env.py](src/main/drp_env/drp_env.py) の `DrpEnv.__init__` シグネチャ。`drp_safe-*` の register kwargs では LaRe フラグを上書きしない (= signature の値がそのまま `gym.make` のデフォルトになる)
-  - 現状の signature デフォルト: `use_lare_path=True` (= LaRe-Path ON), `use_lare_task=False` (= LaRe-Task OFF)。baseline で動かしたいときは env_args (train.py) / yaml (test.py) / `gym.make` kwargs で `use_lare_path=False` を明示する
-- LaRe-Path / LaRe-Task は **完全に独立**。同時 ON 可能。バッファ・最適化器・保存先まで全部別
-- 4 モード (off / scratch / pretrained / finetuning) は両システムで対称
-- 保存ファイル命名: `{Safe_}{ALGO}_{PATH|TASK}_{map}_{N}agents_{X.X}M_{checkpoint|final}.pth`
-  - `Safe_` は SafeEnv のときのみ。非Safe では先頭 `_` ごと省略
-- ディレクトリ構成 (固定. yaml で変更不要):
-  - `src/lare/path/checkpoints/` ← autosave 出力 (大量蓄積, **.gitignore**)
-  - `src/lare/path/models/` ← pretrained / finetuning ロード元 (整理済み, **git 公開**)
-  - Task 側 (`src/lare/task/`) も同じ構造
-  - 旧 `saved_models/` は load の後方互換用に解決パスに残るが新規利用は非推奨
-- **autosave 保存頻度**: 累積環境ステップ `lare_*_save_freq_steps` (デフォ 500_000 = 0.5M) ごとに 1 回。学習頻度 (`update_freq`) とは独立
-- 良いモデルが見つかったら `cp checkpoints/Safe_..._X.XM_checkpoint.pth models/<好きな名前>.pth` で `models/` にコピー → 次回 `pretrained_lare_*_model_path` でファイル名だけ指定すれば自動解決
-- 既存ファイルへの編集は最小限。新機能は新ディレクトリに分離
+### SafeEnv ↔ PBS トレードオフ
 
-### SafeEnv と PBS のトレードオフ (= `pbs_mode` フラグで切替可能)
+**問題**: 待機中の `current_goal` 代入が SafeEnv の衝突判定 (`if current_goal == None`) をバイパス。
 
-[src/main/drp_env/drp_env.py](src/main/drp_env/drp_env.py) の `step()` 内、「if action_i is current start node -> stop」分岐 (= 待機アクション) に `self.current_goal_prepare[i] = action_i` という代入がある。これは元々 **PBS path planner のために** 待機時も `current_goal` を None のままにしない目的で追加されたもの。
-
-ただし、この代入が常に実行されると **SafeEnv (`src/main/drp_env/wrapper/safe_marl.py`) のガード `if self.current_goal[i] == None:` が待機 agent に対して false になり、衝突回避ロジックがバイパスされてしまう**。結果として、待機中の agent と動いている agent の衝突を SafeEnv が防げなくなる。
-
-**現在の判断 (2026-05-19 〜)**: `pbs_mode` (bool) フラグで切替可能にしている。
-
-| `pbs_mode` | 待機分岐の動作 | 影響 |
-|---|---|---|
-| **False** (デフォルト) | 代入をスキップ → `current_goal` は None のまま | **SafeEnv が待機 agent も保護** ✓ MARL 系 (QMIX/IQL/VDN/MAA2C) で衝突減 |
-| **True** | 代入実行 → `current_goal = 待機ノード id` | **PBS の path 計画が正しく動く** ✓ ただし SafeEnv の保護は失う |
-
-`test.py` は `config.path_planner == "pbs"` のとき自動で `pbs_mode=True` を `gym.make()` に渡す ([test.py](test.py))。MARL 系では `False` (= デフォルト) のまま。
+**解決**: `pbs_mode` フラグで切替（[drp_env.py](src/main/drp_env/drp_env.py) の `step()` 内）
+- `False`（デフォルト）: SafeEnv 保護有 ← MARL 系向け
+- `True`: PBS 互換有 ← `test.py` が自動適用（`path_planner=="pbs"` 時）
 
 ---
 
 ## ユーザー嗜好
 
 - **応答は日本語で簡潔に**。冗長な接頭辞・末尾サマリは付けない
-- **ツール呼び出しの `description` (承認プロンプトに表示される説明文) は必ず日本語で書く**。
-  - `Bash` の `description`: 例 `"origin に push"`, `"git status を確認"`, `"ldrp 環境で MANUAL.md の構文チェック"`
-  - `Agent` の `description`: 何をする subagent 起動か日本語で
-  - `TodoWrite` の `content` / `activeForm`: タスクラベルも日本語
-  - **理由**: 承認画面で「何をしようとしているか」がユーザーに即座に伝わるようにするため
-- **コード変更は「Claude が直接ファイルを編集する」のではなく「方針 + 説明 + 完成コードを提示してユーザー自身が入力する」ワークフローを基本とする**。
-  - 目的: ユーザーが内容を理解した上でコードを取り込めるようにする (学習・レビューの併走)。
-  - 提示する内容: (1) 修正の意図と方針, (2) 挙動・互換性への影響, (3) 差し替える完全な関数 / ブロックを fenced code block で 1 つの応答にまとめる。
-  - Edit / Write ツールを直接走らせて良いのは下記のとき:
-    - ユーザーが明示的に「直接編集して」「ファイルを書き換えて」と指示したとき
-    - 設計書 (`design/`), `CLAUDE.md`, `MANUAL.md` 等のドキュメント類の編集
-    - ごく軽微なシンタックス修正 (typo・整形) で `Edit` の方が明らかに楽なとき
-  - Bash の grep/cat 等の読み取りや動作確認スクリプトは普通に使ってよい。あくまで「ソースファイルへの書込み」のデフォルトを「ユーザー入力」に倒すルール。
-- **コード/設定を変更したら、応答中で必ず以下をセットで書く**:
-  1. **修正の意図** (なぜこの変更が必要か)
-  2. **修正によって何がどう変わるか** (挙動・出力・互換性・既存ファイルへの影響)
-- **大きな変更を加えたら [MANUAL.md](MANUAL.md) の `更新履歴` セクションに追記する**。
-  MANUAL.md は **人間が実装を使うための文書** なので、**ユーザーから見える挙動変更** のみ記録する。
-  「大きな変更」とは:
-  - 新パッケージ/モジュールの追加 (= 実装が入った時点)
-  - 公開フラグ/設定キーの新設・削除・改名
-  - 保存ファイル命名規則やディレクトリ構成の変更
-  - デフォルト挙動の変更 (特に既存フラグ false 時の挙動)
-  - 破壊的変更 (既存モデル/スクリプトとの非互換)
+- **ツール承認文は日本語**（`description`）：何をするか即座に伝わるように
+## コード変更のワークフロー
 
-  以下は記録しない:
-  - 小さな変更 (リファクタ・コメント・typo)
-  - **設計書 (`DESIGN_*.md`) の追加・更新**: 実装前の計画文書は別ファイルとして独立に管理する。実装が完了して **挙動が変わったとき** に MANUAL.md に追記する
-  - 内部ツーリング (CLAUDE.md, subagent 等) の追加・更新
+ソースコード（src/ 配下）への変更は、**見直しやすさを最優先** にします。以下の判断フローに従う：
 
-  記録フォーマットは `MANUAL.md` 内のテンプレートを使う。
+### Step 1: 提示（ユーザーが入力）
+**対象**：LDRP のコア実装（env / RL / LaRe / epymarl）での機能追加・バグ修正
+
+**理由**：内容理解 + バグ防止。ユーザーがコード差分を確認してから取り込むほうが安全性が高い
+
+**やり方**：修正の意図 → 挙動変更の影響 → 差し替える完全な関数（fenced code block）を 1 つの応答で提示
+
+### Step 2: 直接編集（自動適用）
+以下のいずれかに当てはまる場合 **のみ** Edit/Write を使う：
+
+| 対象 | 例 | 根拠 |
+|---|---|---|
+| **ドキュメント編集** | CLAUDE.md / MANUAL.md / design/*.md | 内容即座に確認可能。ファイル外の動作に影響なし |
+| **構成ファイル** | yaml / json / config。内容変更が即コマンド検証可能 | 実行結果で即座に妥当性が判定できる |
+| **軽微修正** | typo / インデント / コメント修正。機能に影響なし | 差分が明白で誤解余地がない |
+| **ユーザー指示** | 「直接やってください」と明示された場合 | ユーザーの意図を優先 |
+
+**その他（Bash の読み込み等）**：grep/cat/find 等の読み取り、動作確認スクリプトは通常通り使用可。ソースコードへの書込みのデフォルトを「ユーザー入力」に倒すルール。
+
+---
+
+## 変更時の報告
+
+**コード/設定を変更したら、応答中で必ず以下をセットで書く**:
+1. **修正の意図** (なぜこの変更が必要か)
+2. **修正によって何がどう変わるか** (挙動・出力・互換性・既存ファイルへの影響)
+
+**大きな変更を加えたら [MANUAL.md](MANUAL.md) の `更新履歴` セクションに追記する**。
+MANUAL.md は **人間が実装を使うための文書** なので、**ユーザーから見える挙動変更** のみ記録する。
+
+「大きな変更」とは:
+- 新パッケージ/モジュールの追加 (= 実装が入った時点)
+- 公開フラグ/設定キーの新設・削除・改名
+- 保存ファイル命名規則やディレクトリ構成の変更
+- デフォルト挙動の変更 (特に既存フラグ false 時の挙動)
+- 破壊的変更 (既存モデル/スクリプトとの非互換)
+
+以下は記録しない:
+- 小さな変更 (リファクタ・コメント・typo)
+- **設計書 (`design_*.md`) の追加・更新**: 実装前の計画文書は別ファイルとして独立に管理する。実装が完了して **挙動が変わったとき** に MANUAL.md に追記する
+- 内部ツーリング (CLAUDE.md / subagent 等) の変更
+
+記録フォーマットは `MANUAL.md` 内のテンプレートを使う。
+
 - スコープを広げる前に確認質問する
 - 完了報告は1〜2行
 - ユーザーの指示なしに先回り判断しない (「冗長を削っておきました」のような勝手な拡張禁止)
 
 ---
 
-## 禁止事項
+## リスク操作の代替フロー
 
-- `git commit --amend` で履歴書き換え (常に新コミット)
-- `git push --force` (確認なし)
-- `pkill` 等プロセス強制終了 (事前提案・確認)
-- `.claude/settings.local.json` をコミットに含める
-- `--no-verify` でフックスキップ
-- 大きな未承認スコープ変更 (リファクタ含む)
+以下のような**強い影響を持つ操作**は、常に「状況報告→ユーザー確認→実行」の 2 段階にします：
+
+| やりたいこと | 避ける操作 | 代わりにこれ |
+|---|---|---|
+| **コミット修正が必要になった** | `git commit --amend` で履歴書き換え | 新しいコミットを作成。修正が必要ならユーザー確認してから `git reset --soft HEAD~1` で提案 |
+| **競合ファイルの削除** | `git rm -f` / 権力的 rebase | ファイル内容を確認 → stash で脇へ置く → ユーザーに状況報告 → 意向確認後に削除 |
+| **走ってるプロセス停止** | `pkill -9` で強制終了 | プロセス情報をユーザーに伝える → 停止ユーザーの意向確認 → `kill` で柔らかく → どうしても応答しなければ報告 |
+| **ディレクトリ削除** | `rm -rf` で即座に削除 | `mv` で別名に変更して脇へ置く → 内容確認後に削除を提案 |
+| **git push --force** | `--force-with-lease` なし | 状況説明 → 『push して良い』のユーザー確認を待つ |
+| **スキップ系フラグ使用** | `--no-verify` / `--no-gpg-sign` | フックが失敗した理由を特定 → 根本原因を修正 → 改めてコミット。フック回避は最後の手段 |
+| **大規模な未承認スコープ変更** | リファクタを勝手に混入 | ユーザーの要求スコープを確認 → 必要な変更のみ → 拡張提案は別途相談 |
+| **設定ファイルを追跡対象に** | `.claude/settings.local.json` をコミット | gitignore で除外。ユーザーローカルな設定は共有リポに入れない |
+
+**判断基準**：「その操作を取り消す手段がない / 手作業で復旧が困難」なら確認が必須。
+
+---
+
+## メモリシステム活用
+
+自動メモリ（`/home/linlab/.claude/projects/-home-linlab-yamaguchi-LDRP/memory/`）の判断基準：
+
+| 型 | 保存対象 | タイミング |
+|---|---|---|
+| `user` | ユーザーの嗜好・スキル・役割 | 初出時 |
+| `feedback` | 操作指示の修正・確認 | 判定後 |
+| `project` | 期限・施策・制約（絶対日時に変換） | ステータス変化時 |
+| `reference` | 外部リソース参照先 | 初出時 |
+
+**保存しない**: ファイル構成・git history・実装パターン・一時的タスク（コード/git から導出可能）
+
+**記録ルール**: future_work.md は完了項目削除 / 設計書は履歴保存 / MANUAL.md は挙動変更のみ
 
 ---
 

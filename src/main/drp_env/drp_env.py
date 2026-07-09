@@ -39,7 +39,7 @@ class DrpEnv(gym.Env):
 			lare_path_batch_size=256,
 			lare_path_lr=5e-4,
 			use_pretrained_lare_path=True,
-			pretrained_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
+			pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint",
 			use_finetuning_lare_path=False,
 			finetuning_lare_path_model_name="Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth",
 			lare_path_autosave=True,
@@ -764,7 +764,7 @@ class DrpEnv(gym.Env):
 		# 1) first judge action_i whether available, to output !!!obs_prepare & obs_onehot_prepare!!!
 		for i in range(self.agent_num):
 			action_i = joint_action[i]
-			is_unavailable_stop = (self.assigned_tasks[i] == [])  
+			is_unavailable_stop = self.is_tasklist and (self.assigned_tasks[i] == [])  
 			# 1) first judge action_i whether available, to output obs_prepare: 
 			# if unavailable ⇢ obs_prepare.append( self.obs_old[i])
 			#print("Avaible actions",self.get_avail_agent_actions(i, self.n_actions)[1])
@@ -996,8 +996,18 @@ class DrpEnv(gym.Env):
 							raise ValueError("Error in task execution")
 						
 				self.obs_prepare[i] = [self.obs[i][0], self.obs[i][1], self.start_ori_array[i], self.goal_array[i]]
-				self.obs_onehot[i][len(list(self.G.nodes())):len(list(self.G.nodes()))*2] = 0 # reset goal one-hot
-				self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
+				if self.pbs_mode:
+					# PBS 用: upstream 相当の完全再構築. obs_onehot 全体をゼロクリアし
+					# 現在位置 (current_start) と新しい goal の両方を 1 にセット.
+					# PBS の path 計画は current_start bit が正しく obs に載っている前提.
+					self.obs_onehot[i] = np.zeros((1, len(list(self.G.nodes()))*2))
+					self.obs_onehot[i][int(self.current_start[i])] = 1
+					self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
+				else:
+					# MARL 系: goal 部分のみ更新 (現行挙動). LaRe が学習してきた
+					# obs 分布と一致させるため current 位置 bit は更新しない.
+					self.obs_onehot[i][len(list(self.G.nodes())):len(list(self.G.nodes()))*2] = 0 # reset goal one-hot
+					self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
 
 			self.obs = tuple([np.array(i) for i in self.obs_prepare])
 

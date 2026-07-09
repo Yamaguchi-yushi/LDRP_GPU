@@ -201,18 +201,28 @@ class Runner():
         task_completion = [info["task_completion"] for info in self.info_buffer]
         full_completion = [info["task_completion"] for info in self.info_buffer if not info["collision"]]
         non_lock_completion = [info["task_completion"] for idx, info in enumerate(self.info_buffer) if tmp_list[idx]==False]
+        total = len(self.info_buffer)
+        collision_count = total - len(full_completion)
+        collision_rate = collision_count / total if total > 0 else 0.0
+        non_collision_mean = np.mean(full_completion) if full_completion else 0.0
 
-        #print(full_completion)
-        #print("衝突なし:",np.mean(full_completion),len(full_completion))
-        #print(non_lock_completion)
+        print("=== 集計結果 ===")
+        print(f"Total test episodes: {total}")
+        print(f"Average steps:       {np.mean(steps):.1f}")
+
+        print("--- タスク配送 ---")
+        print(f"Average task completion (全エピソード): {np.mean(task_completion):.2f}")
+        print(f"衝突なし平均配送             ({len(full_completion)} ep): {non_collision_mean:.2f}")
+        print(f"最高値: {np.max(task_completion)}")
+        print(f"最低値: {np.min(task_completion)}")
+
+        print("--- エピソード終了理由 ---")
+        print(f"衝突終了: {collision_count}/{total} ({collision_rate*100:.1f}%)")
+
+        print("--- 実行時間 ---")
+        print(f"合計:   {np.sum(times):.2f} 秒")
+        print(f"平均/ep: {np.mean(times):.2f} 秒")
         #print("ロックなし", np.mean(non_lock_completion), len(non_lock_completion))
-        print("Total test episodes:", len(self.info_buffer))
-        print("Average steps:", np.mean(steps))
-        print("Average task completion:", np.mean(task_completion))
-        print("最高値:",np.max(task_completion))
-        print("最低値:",np.min(task_completion))
-        print("実行時間:", np.sum(times), "秒")
-        print("平均実行時間:", np.mean(times), "秒")
 
         return
 

@@ -23,9 +23,15 @@ class OtherAgentsInfo:
 
 class PBS:
     def __init__(self, args):
-        self.env = gym.make("drp_env:drp-" + str(1) + "agent_" + args.map_name + "-v2", state_repre_flag = "onehot_fov")
+        self.env = gym.make("drp_env:drp-" + str(1) + "agent_" + args.map_name + "-v2",
+                             state_repre_flag = "onehot_fov",
+                             task_flag = False,
+                             use_lare_path = False,
+                             use_lare_task = False,
+                             pbs_mode = True,
+                             )
         self.num_agents = args.agent_num
-        self.time_limit = 100#args.time_limit
+        self.time_limit = getattr(args, "time_limit", 1000)
         self.schedule_actions = []
         self.goal_rec = []
         self.priority_rec = []

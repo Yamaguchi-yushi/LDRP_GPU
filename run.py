@@ -5,33 +5,35 @@ import sys
 
 map_name = [
     #"map_5x4",
-    "map_8x5",
-    #"map_aoba00",
+    #"map_8x5",
+    "map_aoba00",
     #"map_aoba01",
 ]
 
 agent_num = [
     #3,
-    4,
+    #4,
     #5,
+    7,
+    10,
 ]
 
 path_planner = [
     #"iql",
     #"qmix",
     #"vdn",
-    "mappo",
+    #"mappo",
     #"qplex",
     #"happo",
     #"mat",
-    #"matdec",
-    #"pbs",
+    #"mat_dec",
+    "pbs",
 ]
 
 method_tag = [
-    #"",
-    "safe",
-    "ours",
+    "",
+    #"safe",
+    #"ours",
 ]
 
 task_assigner = [
@@ -40,7 +42,7 @@ task_assigner = [
 ]
 #"""
 command = [
-    [sys.executable, "test.py", str(i), str(j), str(k), str(l), str(m)]
+    [sys.executable, "-u", "test.py", str(i), str(j), str(k), str(l), str(m)]
     for i in map_name
     for j in agent_num
     for k in path_planner

@@ -112,7 +112,7 @@ if self.task_Agent.task_assigner.update_ready():
 - 毎ステップ割当を決める必要はない。**割当に意味がある瞬間 (新タスク到着・完了・アイドル) だけ** `assign_task` が実際に決定する。
 - 現 PPO は runner から毎 step 呼ばれるが、内部で **「空き agent かつ 空き task があるときだけ」決定して `buffer.add_actions`** する ([ppo.py](../src/task_assign/task_policy/ppo.py) の `if any(len(task)==0 ...) and len_current_task > 0`)。
   → **実質すでにイベント駆動寄り**。これを明示的なイベント駆動として整理する。
-- [multi_task_agents.md](multi_task_agents.md) §3 のイベント駆動方針と一致する。
+- [ldrp_extensions.md](ldrp_extensions.md) §3.3-3.4 のイベント駆動方針と一致する。
   ([alma_integration.md](alma_integration.md) の `N_t` 固定周期とは異なり、**周期ではなくイベント**で駆動する。)
 
 #### ② 強化学習 = 複数ステップ後にまとめて学習

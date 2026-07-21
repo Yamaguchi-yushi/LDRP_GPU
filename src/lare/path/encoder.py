@@ -23,7 +23,7 @@ import numpy as np
 FACTOR_NUMBER = 10
 
 
-def evaluation_func(observation, eps=1e-6):
+def evaluation_func(observation, apsp, eps=1e-6):
     """Compute the 10 latent factors for a batch of LaRe-compatible observations.
 
     The observation layout (per row) matches `_get_lare_compatible_obs`:
@@ -35,14 +35,12 @@ def evaluation_func(observation, eps=1e-6):
     """
     B = observation.shape[0]
 
-    E = int(observation[0, -1])
     A = int(observation[0, -2])
     N = int(observation[0, -3])
     graph_diameter = float(observation[0, -4])
 
     size_others_curr = (A - 1) * N * 2
     size_nodes_flat = N * 2
-    size_edges_flat = E * 3
 
     idx = 0
     own_prev = observation[:, idx : idx + N]; idx += N
@@ -53,64 +51,25 @@ def evaluation_func(observation, eps=1e-6):
     collision_info = observation[:, idx : idx + 2]; idx += 2
     wait_count = observation[:, idx : idx + 1]; idx += 1
     nodes_flat = observation[:, idx : idx + size_nodes_flat]; idx += size_nodes_flat
-    edges_flat = observation[0, idx : idx + size_edges_flat]; idx += size_edges_flat
-
-    if E > 0 and len(edges_flat) >= E * 3:
-        edges_arr = edges_flat.reshape(E, 3)
-        edges = []
-        for a, b, w in edges_arr:
-            ai, bi = int(a), int(b)
-            if 0 <= ai < N and 0 <= bi < N:
-                edges.append((ai, bi, float(w)))
-    else:
-        edges = []
 
     nodes = nodes_flat.reshape(B, N, 2)
-
-    graph = {i: [] for i in range(N)}
-    for a, b, w in edges:
-        graph[a].append((b, w))
-        graph[b].append((a, w))
-
-    def dijkstra(start, goal_node):
-        if start == goal_node:
-            return 0.0
-        if start < 0 or start >= N or goal_node < 0 or goal_node >= N:
-            return graph_diameter
-        dist = {v: np.inf for v in range(N)}
-        dist[start] = 0.0
-        pq = [(0.0, start)]
-        while pq:
-            d, v = heapq.heappop(pq)
-            if v == goal_node:
-                return d
-            if d > dist[v]:
-                continue
-            for nv, w in graph[v]:
-                nd = d + w
-                if nd < dist[nv]:
-                    dist[nv] = nd
-                    heapq.heappush(pq, (nd, nv))
-        return graph_diameter if np.isinf(dist[goal_node]) else dist[goal_node]
 
     def estimate_partial_distance(pos_vec, goal_node):
         nz = np.where(pos_vec > 1e-8)[0]
         if len(nz) == 1:
-            return dijkstra(int(nz[0]), goal_node)
+            return float(apsp[nz[0], goal_node])
         if len(nz) == 2:
             i, j = int(nz[0]), int(nz[1])
             wi, wj = pos_vec[i], pos_vec[j]
             s = wi + wj + eps
             alpha = wj / s
-            Di = dijkstra(i, goal_node)
-            Dj = dijkstra(j, goal_node)
-            if np.isinf(Di) or np.isinf(Dj):
-                return min(Di, Dj) if not (np.isinf(Di) and np.isinf(Dj)) else graph_diameter
+            Di = apsp[i, goal_node]
+            Dj = apsp[j, goal_node]
             return (1 - alpha) * Di + alpha * Dj
         if len(nz) == 0:
             return graph_diameter
         pivot = int(np.argmax(pos_vec))
-        return dijkstra(pivot, goal_node)
+        return float(apsp[pivot, goal_node])
 
     agent_curr_pos = np.sum(own_curr[:, :, None] * nodes, axis=1)
 
@@ -189,17 +148,6 @@ def evaluation_func(observation, eps=1e-6):
     ]
 
 
-def precompute_edge_info(env):
-    """Flatten edges into [n1, n2, dist, n1, n2, dist, ...] in sorted order."""
-    edge_info = []
-    for n1, n2 in sorted(env.G.edges()):
-        p1 = env.pos[n1]
-        p2 = env.pos[n2]
-        d = float(np.linalg.norm(np.array(p1) - np.array(p2)))
-        edge_info.extend([int(n1), int(n2), d])
-    return np.array(edge_info, dtype=float)
-
-
 def compute_graph_diameter(env):
     """Diameter as the longest shortest-path distance between any two nodes."""
     n_nodes = len(env.G.nodes())
@@ -241,7 +189,7 @@ def get_node_coordinates_flat(env):
     return np.array(coords, dtype=float)
 
 
-def build_lare_obs_for_agent(env, agent_id, edge_info_cache, graph_diameter,
+def build_lare_obs_for_agent(env, agent_id, graph_diameter,
                              prev_onehot_position, current_colliding_pairs):
     """Build the LaRe-compatible observation row for a single agent.
 
@@ -301,7 +249,6 @@ def build_lare_obs_for_agent(env, agent_id, edge_info_cache, graph_diameter,
     wait_count = np.array([float(env.wait_count[agent_id])])
 
     nodes_flat = get_node_coordinates_flat(env)
-    edges_flat = edge_info_cache.flatten() if edge_info_cache is not None else np.array([])
     diameter = np.array([float(graph_diameter)])
     meta = np.array([int(n_nodes), int(agent_num), int(len(env.G.edges()))], dtype=float)
 
@@ -309,6 +256,6 @@ def build_lare_obs_for_agent(env, agent_id, edge_info_cache, graph_diameter,
         own_prev, own_curr, goal,
         others_curr_raw,
         collision_distance, collision_info, wait_count,
-        nodes_flat, edges_flat,
+        nodes_flat,
         diameter, meta,
     ])

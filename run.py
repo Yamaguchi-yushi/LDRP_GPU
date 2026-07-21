@@ -12,8 +12,10 @@ map_name = [
 
 agent_num = [
     #3,
-    4,
+    #4,
     #5,
+    7,
+    10,
 ]
 
 path_planner = [
@@ -24,8 +26,14 @@ path_planner = [
     #"qplex",
     #"happo",
     #"mat",
-    #"matdec",
+    #"mat_dec",
     #"pbs",
+]
+
+method_tag = [
+    "",
+    #"safe",
+    #"ours",
 ]
 
 method_tag = [
@@ -40,7 +48,7 @@ task_assigner = [
 ]
 #"""
 command = [
-    [sys.executable, "test.py", str(i), str(j), str(k), str(l), str(m)]
+    [sys.executable, "-u", "test.py", str(i), str(j), str(k), str(l), str(m)]
     for i in map_name
     for j in agent_num
     for k in path_planner

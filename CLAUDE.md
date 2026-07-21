@@ -63,7 +63,8 @@ LDRP/
 ├── design/                         # 設計書フォルダ
 │   ├── lare_integration.md         # LaRe 設計判断の元資料
 │   ├── alma_integration.md         # ALMA 統合計画
-│   ├── multi_task_agents.md        # 複数タスク保持エージェント拡張 (将来)
+│   ├── ldrp_extensions.md          # LDRP 拡張 (高:タスク再配布 / 低:複数タスク保持)
+│   ├── env_maturity.md             # 環境成熟度ギャップ (CAMAR/RHCR/LoRR 比較)
 │   └── future_work.md              # 将来実装メモ (TODO 集約)
 ├── GUIDE.md                        # LDRP 全体の概要
 ├── runner.py                       # Runner クラス: 評価ループ本体 (test.py から呼ばれる)

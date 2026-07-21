@@ -105,6 +105,11 @@ def run_sequential(args, logger):
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
     }
+    if "log_probs" in args.extra_in_buffer:
+        scheme["log_probs"] = {"vshape": (1,), "group": "agents"}
+    if "values" in args.extra_in_buffer:
+        scheme["values"] = {"vshape": (1,), "group": "agents"}
+
     groups = {"agents": args.n_agents}
     preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])}
 

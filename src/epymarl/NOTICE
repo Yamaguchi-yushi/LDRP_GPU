@@ -33,3 +33,18 @@ The following files have been added compared to the original PyMARL codebase:
 - src/modules/critics/mlp.py
 - src/pretrained/*
 
+The following files were added from pymarlzooplus (AILabDsUnipi/pymarlzooplus,
+Apache License 2.0), originally derived from https://github.com/wjh720/QPLEX:
+- src/learners/dmaq_qatten_learner.py
+- src/modules/mixers/dmaq_general.py
+- src/modules/mixers/dmaq_si_weight.py
+- src/config/algs/qplex.yaml
+
+The following files were added from pymarlzooplus (AILabDsUnipi/pymarlzooplus,
+Apache License 2.0), based on the Multi-Agent Transformer (MAT):
+- src/modules/agents/mlp_mat_agent.py
+- src/controllers/mat_controller.py
+- src/modules/critics/mat.py
+- src/learners/mat_learner.py
+- src/config/algs/mat_dec.yaml
+

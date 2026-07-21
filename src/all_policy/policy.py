@@ -53,12 +53,21 @@ class MARLPolicy():
         #obs = np.concatenate([obs, identity], axis=1)
 
         if self.runner is None:
-            self.runner = PolicyRunner(
-                model_path=self.get_model_path(env),
-                input_shape=len(obs[0]),
-                n_actions=env.n_actions,
-                agent_num=env.agent_num
-            )
+            if self.path_planner == "mat_dec":
+                from .mat_policy_runner import MatPolicyRunner
+                self.runner = MatPolicyRunner(
+                    model_path=self.get_model_path(env),
+                    input_shape=len(obs[0]),
+                    n_actions=env.n_actions,
+                    agent_num=env.agent_num
+                )
+            else:
+                self.runner = PolicyRunner(
+                    model_path=self.get_model_path(env),
+                    input_shape=len(obs[0]),
+                    n_actions=env.n_actions,
+                    agent_num=env.agent_num
+                )
         
         actions = []
         for agi in range(env.agent_num):

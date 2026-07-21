@@ -2,6 +2,7 @@
 __pycache__/
 .DS_Store
 src/epymarl/results/
+src/epymarl/tmp_results/
 logs/
 results/
 train_results/

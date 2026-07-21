@@ -11,13 +11,18 @@ from drp_env.EE_map import MapMake
 from drp_env.drp_env import DrpEnv
 
 class SafeEnv(DrpEnv):
+	def reset(self):
+		self.safety_intervention_count = 0
+		return super().reset()
 
 	def step(self, joint_action):
-
 		task_assign = None
 		if isinstance(joint_action, dict):
 			task_assign = joint_action.get("task", None)
 			joint_action = joint_action.get("pass", joint_action)
+
+		if not hasattr(self, "safety_intervention_count"):
+			self.safety_intervention_count = 0
 
 		i = 0
 		do = True
@@ -30,6 +35,8 @@ class SafeEnv(DrpEnv):
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
 						if j != i and joint_action[i] == joint_action[j]:
+							if joint_action[i] != self.current_start[i]:
+								self.safety_intervention_count += 1
 							joint_action[i] = self.current_start[i]
 							do = True #条件が変わる可能性があるため，もう一度ループを回す
 							break
@@ -39,11 +46,16 @@ class SafeEnv(DrpEnv):
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
 						if j != i and (joint_action[j] == self.current_start[i] and joint_action[i] == self.current_start[j]):
+							if joint_action[i] != self.current_start[i]:
+								self.safety_intervention_count += 1
 							joint_action[i] = self.current_start[i]
 							do = True
 							break
 
 		joint_action = {"pass": joint_action, "task": task_assign} if task_assign is not None else joint_action
 		obs, ri_array, self.terminated, info = super().step(joint_action)
+
+		if isinstance(info, dict):
+			info["safety_intervention_count"] = self.safety_intervention_count
 
 		return obs, ri_array, self.terminated, info

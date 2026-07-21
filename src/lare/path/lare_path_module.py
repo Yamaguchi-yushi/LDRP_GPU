@@ -25,14 +25,13 @@ from typing import Optional
 
 import numpy as np
 import torch
+import heapq
 from torch import nn
 
 from .encoder import (
     FACTOR_NUMBER,
     build_lare_obs_for_agent,
-    compute_graph_diameter,
     evaluation_func,
-    precompute_edge_info,
 )
 from .decoder import PathRewardDecoder
 from .transformer import TimeAgentTransformer
@@ -77,8 +76,7 @@ class LaRePathModule:
         self.env = env
         self.cfg = config if config is not None else LaRePathConfig()
 
-        self.edge_info_cache = precompute_edge_info(env)
-        self.graph_diameter = compute_graph_diameter(env)
+        self.apsp, self.graph_diameter = self.compute_apsp(env)
 
         self.factor_dim = self.cfg.factor_dim
         self.n_agents = env.agent_num
@@ -139,6 +137,45 @@ class LaRePathModule:
         self._evaluation_active = False
         self._evaluation_count = 0
 
+    def compute_apsp(self, env):
+        """All-pairs shortest-path distance table via Dijkstra from every node.
+
+        Returns an (N, N) array where apsp[start, goal] is the shortest-path
+        distance from node `start` to node `goal`. Unreachable pairs are filled
+        with the graph diameter (= the largest finite pairwise distance found),
+        matching `compute_graph_diameter`'s fallback convention.
+        """
+        n_nodes = len(env.G.nodes())
+        dist_matrix = np.full((n_nodes, n_nodes), np.inf, dtype=np.float32)
+
+        for i in range(n_nodes):
+            dist = {v: float('inf') for v in env.G.nodes()}
+            dist[i] = 0.0
+            pq = [(0.0, i)]
+            visited = set()
+            while pq:
+                d, v = heapq.heappop(pq)
+                if v in visited:
+                    continue
+                visited.add(v)
+                for nb in env.G.neighbors(v):
+                    p1, p2 = env.pos[v], env.pos[nb]
+                    w = float(np.linalg.norm(np.array(p1) - np.array(p2)))
+                    nd = d + w
+                    if nd < dist[nb]:
+                        dist[nb] = nd
+                        heapq.heappush(pq, (nd, nb))
+            for v, d in dist.items():
+                dist_matrix[i, v] = d
+             
+        finite = dist_matrix[np.isfinite(dist_matrix)]
+        graph_diameter = max(float(finite.max()), 1.0) if finite.size > 0 else 100.0
+        dist_matrix[np.isinf(dist_matrix)] = graph_diameter
+
+        return dist_matrix, graph_diameter
+
+
+
     def compute_factors(self, prev_onehot_position, current_colliding_pairs):
         """Compute the (n_agents, factor_dim) factor matrix for the current step.
 
@@ -148,12 +185,12 @@ class LaRePathModule:
         rows = []
         for i in range(self.n_agents):
             obs_row = build_lare_obs_for_agent(
-                self.env, i, self.edge_info_cache, self.graph_diameter,
+                self.env, i, self.graph_diameter,
                 prev_onehot_position, current_colliding_pairs,
             )
             rows.append(obs_row)
         batch_obs = np.stack(rows, axis=0)
-        factor_list = evaluation_func(batch_obs)
+        factor_list = evaluation_func(batch_obs, self.apsp)
         factor_arr = np.concatenate(factor_list, axis=-1).astype(np.float32)
         return factor_arr
 

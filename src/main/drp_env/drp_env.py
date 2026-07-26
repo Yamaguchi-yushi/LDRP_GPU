@@ -72,6 +72,7 @@ class DrpEnv(gym.Env):
 			# (PBS の path 計画で必要). False にすると SafeEnv の保護が待機 agent
 			# にも効く. デフォルト False = 安全制御優先 (詳細は CLAUDE.md).
 			pbs_mode=False,
+			allow_reassign_before_pickup=False,
 		  ):
 		self.agent_num = agent_num
 		self.n_agents = agent_num # for epymarl
@@ -133,6 +134,8 @@ class DrpEnv(gym.Env):
 		self.assigned_list=[]#未実行のタスクとエージェントの割り当て表
 		self.task_num = self.agent_num*2 # for tasklist, each agent can have 2 tasks at most
 		self.alltasks = task_list
+		self.allow_reassign_before_pickup = allow_reassign_before_pickup
+		self._reassign_event = False
 
 		if self.is_tasklist:
 			self.ee_env.task_flag_on()
@@ -398,6 +401,21 @@ class DrpEnv(gym.Env):
 			f"Path: {self._reward_mode_label('path')}   |   "
 			f"Task: {self._reward_mode_label('task')}"
 		)
+
+	def reset_prepick_assignments(self):
+		"""Wipe pre-pickup task assignments on an event so they can be re-matched.
+		Called by the runner before assign_task. No-op when the flag is OFF or no event fired.
+		Agents that have already picked up (en route to dropoff) and their tasks are preserved."""
+		if not self.allow_reassign_before_pickup:
+			return
+		if not self._reassign_event:
+			return
+		self._reassign_event = False
+		for j in range(len(self.assigned_list)):
+			self.assigned_list[j] = -1
+		for i in range(self.agent_num):
+			if self.assigned_tasks[i] != [] and self.goal_array[i] == self.assigned_tasks[i][0]:
+				self.assigned_tasks[i] = []
 
 	def _init_lare_path(self, factor_dim, decoder_hidden_dim, decoder_n_layers,
 						use_transformer, transformer_heads, transformer_depth,
@@ -672,6 +690,7 @@ class DrpEnv(gym.Env):
 			self.assigned_list=[]
 			#self.assigned_tasks[i] is a task assigned to agent i
 			self.assigned_tasks=[[] for _ in range(self.agent_num)]
+			self._reassign_event = False
 			# LaRe-Task: per-task creation step (parallel to current_tasklist).
 			self._lare_task_creation_steps = []
 			if self.alltasks is None:
@@ -772,7 +791,7 @@ class DrpEnv(gym.Env):
 		# 1) first judge action_i whether available, to output !!!obs_prepare & obs_onehot_prepare!!!
 		for i in range(self.agent_num):
 			action_i = joint_action[i]
-			is_unavailable_stop = (self.assigned_tasks[i] == [])  
+			is_unavailable_stop = self.is_tasklist and (self.assigned_tasks[i] == [])
 			# 1) first judge action_i whether available, to output obs_prepare: 
 			# if unavailable ⇢ obs_prepare.append( self.obs_old[i])
 			#print("Avaible actions",self.get_avail_agent_actions(i, self.n_actions)[1])
@@ -925,6 +944,8 @@ class DrpEnv(gym.Env):
 						if self.goal_array[i] == self.assigned_tasks[i][1]:
 							self.assigned_tasks[i] = [] # remove the task from assigned_tasks
 							self.task_completion += 1
+						elif self.goal_array[i] == self.assigned_tasks[i][0]:
+							self._reassign_event = True
 
 			# assign tasks to agents — capture pre-assignment state for LaRe-Task.
 			lare_task_decisions = []
@@ -1004,8 +1025,13 @@ class DrpEnv(gym.Env):
 							raise ValueError("Error in task execution")
 						
 				self.obs_prepare[i] = [self.obs[i][0], self.obs[i][1], self.start_ori_array[i], self.goal_array[i]]
-				self.obs_onehot[i][len(list(self.G.nodes())):len(list(self.G.nodes()))*2] = 0 # reset goal one-hot
-				self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
+				if self.pbs_mode:
+					self.obs_onehot[i] = np.zeros((1, len(list(self.G.nodes()))*2))
+					self.obs_onehot[i][int(self.current_start[i])] = 1
+					self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
+				else:
+					self.obs_onehot[i][len(list(self.G.nodes())):len(list(self.G.nodes()))*2] = 0 # reset goal one-hot
+					self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
 
 			self.obs = tuple([np.array(i) for i in self.obs_prepare])
 

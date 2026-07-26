@@ -23,13 +23,20 @@ if __name__ == "__main__":
     config = Namespace(**config_dict)
 
     if len(sys.argv) > 1:
-        #map,agent,path,task,[method_tag]
+        #map,agent,path,task,[method_tag],[mat_model_agent_num]
         config.map_name = sys.argv[1]
         config.agent_num = int(sys.argv[2])
         config.path_planner = sys.argv[3]
         config.task_assigner = sys.argv[4]
-        if len(sys.argv) > 5:
-            config.method_tag = sys.argv[5]
+        for tok in sys.argv[5:]:
+            if tok == "":
+                continue
+            if tok in ("base", "reassign"):
+                config.reassign_before_pickup = tok
+            elif tok.isdigit():
+                config.mat_model_agent_num = int(tok)
+            else:
+                config.method_tag = tok
 
     env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
     #env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
@@ -85,21 +92,25 @@ if __name__ == "__main__":
     # SafeEnv の保護を機能させる. 詳細は CLAUDE.md「SafeEnv と PBS のトレードオフ」.
     pbs_mode = (getattr(config, "path_planner", "") == "pbs")
 
-    env = gym.make(
-        env_name,
-        state_repre_flag="onehot_fov",
-        reward_list=reward_list,
-        time_limit=config.time_limit,
-        task_flag=True,
-        task_list=None,
-        pbs_mode=pbs_mode,
-        **lare_kwargs,
-    )
-    """
-    with open("./config/algo/" + config.algo + ".yaml", 'r') as file:
-        config_dict = yaml.safe_load(file)
-    config = Namespace(**config_dict)
-    """
-    runner = Runner(config, env, reward_list)
-    runner.run()
-    runner.finish()
+    model_tag = getattr(config, "reassign_before_pickup", "base")
+    for reassign_flag in (False, True):
+        print(f"\n########## model={model_tag}  allow_reassign_before_pickup={reassign_flag} ##########", flush=True)
+        env = gym.make(
+            env_name,
+            state_repre_flag="onehot_fov",
+            reward_list=reward_list,
+            time_limit=config.time_limit,
+            task_flag=True,
+            task_list=None,
+            pbs_mode=pbs_mode,
+            allow_reassign_before_pickup=reassign_flag,
+            **lare_kwargs,
+        )
+        """
+        with open("./config/algo/" + config.algo + ".yaml", 'r') as file:
+            config_dict = yaml.safe_load(file)
+        config = Namespace(**config_dict)
+        """
+        runner = Runner(config, env, reward_list)
+        runner.run()
+        runner.finish()

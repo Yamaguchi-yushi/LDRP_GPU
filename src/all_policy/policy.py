@@ -37,14 +37,19 @@ class MARLPolicy():
         self.args = args
         self.path_planner = args.path_planner
         self.method_tag = getattr(args, "method_tag", "") or ""
+        self.model_reassign_tag = getattr(args, "reassign_before_pickup", "base")
+        self.mat_model_agent_num = getattr(args, "mat_model_agent_num", None)
         self.runner = None
-    
+
     def get_model_path(self, env):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         suffix = f"_{self.method_tag}" if self.method_tag else ""
-        filename = f"{env.map_name}_{env.agent_num}_{self.path_planner}{suffix}.th"
+        if self.path_planner == "mat_dec" and self.mat_model_agent_num is not None:
+            model_n = self.mat_model_agent_num
+        else:
+            model_n = env.agent_num
+        filename = f"{env.map_name}_{model_n}_{self.path_planner}{suffix}_{self.model_reassign_tag}.th"
         path = os.path.join(base_dir, "models", "safe", filename)
-
         return path
     
     def policy(self, obs, env):

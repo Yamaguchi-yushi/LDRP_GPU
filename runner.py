@@ -97,6 +97,7 @@ class Runner():
             task_assign = self.task_manager.assign_task(self.env)
             joint_action = {"pass": agents_action, "task": task_assign}
             """
+            self.env.reset_prepick_assignments()
             joint_action = self.both_policy_manager.policy(obs_n, self.env)
 
             next_obs_n, rew_n, terminated_n, info = self.env.step(joint_action)

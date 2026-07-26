@@ -10,12 +10,15 @@ map_name: "map_8x5"
 task_assigner: "tp"
 path_planner: "qmix"
 method_tag: ""
+model_reassign_tag: "base"
+mat_model_agent_num: null
 
 # --- 実行制御 ---
 time_limit: 1000
 test_num: 1000
 # タスク割当の選択肢・結果を stdout に出力 (実際に何かを割当てたステップだけ)
 debug_task_assign: False
+allow_reassign_before_pickup: False  # True にすると pickup 前のタスクを再割当可能 (SafeEnv の保護は効く)
 # PPO タスク割当の学習打ち切りステップ数 (累積環境ステップ).
 # このステップを超えたら learning ループを抜けて test_num 回の推論ループへ移行.
 # -1 を指定すると src/epymarl/src/config/default.yaml の t_max と同じ値が使われる

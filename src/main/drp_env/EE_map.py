@@ -287,27 +287,36 @@ class MapMake():
 		self.is_task_flag = True
 	
 	# create one task
-	def create_task(self, timelimit):
+	def create_task(self, timelimit, rng=None):
+		r = rng if rng is not None else np.random
 		G_nodes_copy = copy.deepcopy(list(self.G.nodes()))
-		start_node = np.random.choice(G_nodes_copy)
+		start_node = r.choice(G_nodes_copy)
 		G_nodes_copy.remove(start_node)
-		goal_node = np.random.choice(G_nodes_copy)
+		goal_node = r.choice(G_nodes_copy)
 		deadline = timelimit+1 #未実装
 		return [start_node, goal_node, deadline]
 
 	# create all tasklist
-	def create_tasklist(self, timelimit, agent_num, task_density):
+	# mode: 'fixed' (毎ステップ1件), 'bernoulli' (確率task_density), 'mmpp' (マルコフ切替)
+	def create_tasklist(self, timelimit, agent_num, task_density, mode='fixed',
+					rng=None, p_high=0.8, p_low=0.1, switch_prob=0.01):
+		r = rng if rng is not None else np.random
 		tasklist=[]
+		state = 'sparse'  # MMPP 初期状態
 		for i in range(timelimit):
-			tasklist_by_step=[]
-			random_num = 1
-			for i in range(random_num): 	#random_num is a number greater than or equal to 0 determined
-											#with probability by agent_num and task_density
-				tasklist_by_step.append(self.create_task(timelimit))
-			tasklist.append(tasklist_by_step)
-			#Add one task per step as an initial implementation
+			if mode == 'fixed':
+				random_num = 1
+			elif mode == 'bernoulli':
+				random_num = 1 if r.random() < task_density else 0
+			elif mode == 'mmpp':
+				if r.random() < switch_prob:
+					state = 'dense' if state == 'sparse' else 'sparse'
+				p = p_high if state == 'dense' else p_low
+				random_num = 1 if r.random() < p else 0
+			else:
+				raise ValueError("Invalid mode. Choose from 'fixed', 'bernoulli', or 'mmpp'.")
+			tasklist.append([self.create_task(timelimit, rng=r) for _ in range(random_num)])
 
-		#print(tasklist)
 		return tasklist
 	
 	def get_path_length(self, start_node, goal_node):

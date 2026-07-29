@@ -73,6 +73,11 @@ class DrpEnv(gym.Env):
 			# にも効く. デフォルト False = 安全制御優先 (詳細は CLAUDE.md).
 			pbs_mode=False,
 			allow_reassign_before_pickup=False,
+			task_arrival="fixed",	# "fixed" / "bernoulli" / "mmpp"
+			task_density=0.3,
+			task_p_high=0.8,
+			task_p_low=0.1,
+			task_switch_prob=0.01,
 		  ):
 		self.agent_num = agent_num
 		self.n_agents = agent_num # for epymarl
@@ -132,10 +137,16 @@ class DrpEnv(gym.Env):
 		self.current_tasklist=[]
 		self.assigned_tasks=[]#エージェントが割り当てられたタスク(未ピックを含む)
 		self.assigned_list=[]#未実行のタスクとエージェントの割り当て表
-		self.task_num = self.agent_num*2 # for tasklist, each agent can have 2 tasks at most
+		self.task_num = 10 # for tasklist, each agent can have 2 tasks at most
 		self.alltasks = task_list
+		self._auto_tasks = (task_list is None)
 		self.allow_reassign_before_pickup = allow_reassign_before_pickup
 		self._reassign_event = False
+		self.task_arrival = task_arrival
+		self.task_density = task_density
+		self.task_p_high = task_p_high
+		self.task_p_low = task_p_low
+		self.task_switch_prob = task_switch_prob
 
 		if self.is_tasklist:
 			self.ee_env.task_flag_on()
@@ -693,8 +704,11 @@ class DrpEnv(gym.Env):
 			self._reassign_event = False
 			# LaRe-Task: per-task creation step (parallel to current_tasklist).
 			self._lare_task_creation_steps = []
-			if self.alltasks is None:
-				self.alltasks = self.ee_env.create_tasklist(self.time_limit, self.agent_num, 1)
+			if self._auto_tasks:
+				self.alltasks = self.ee_env.create_tasklist(
+					self.time_limit, self.agent_num, self.task_density,
+					mode=self.task_arrival, p_high=self.task_p_high,
+					p_low=self.task_p_low, switch_prob=self.task_switch_prob)
 
 		#initialize obs
 		self.obs = tuple(np.array([self.pos[self.start_ori_array[i]][0], self.pos[self.start_ori_array[i]][1], self.start_ori_array[i], self.goal_array[i]]) for i in range(self.agent_num))

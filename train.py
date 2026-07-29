@@ -45,6 +45,12 @@ for i in range(num_runs):
         f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
         f'env_args.use_finetuning_lare_path=False '
         f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
+        f'env_args.allow_reassign_before_pickup=False '
+        f'env_args.task_arrival="fixed" '
+        f'env_args.task_density=0.3 '
+        f'env_args.task_p_high=0.8 '
+        f'env_args.task_p_low=0.1 '
+        f'env_args.task_switch_prob=0.01 '
         )
 
 

@@ -12,6 +12,12 @@ env_args:
   pretrained_lare_path_model_name: "FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint"
   use_finetuning_lare_path: False
   finetuning_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth"
+  allow_reassign_before_pickup: False
+  task_arrival: "fixed"
+  task_density: 0.3
+  task_p_high: 0.8
+  task_p_low: 0.1
+  task_switch_prob: 0.01
 
 test_greedy: True
 test_nepisode: 100

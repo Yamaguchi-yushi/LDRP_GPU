@@ -631,7 +631,7 @@ class DrpEnv(gym.Env):
 				pi = [obs_prepare[i][0], obs_prepare[i][1]]
 				pj = [obs_prepare[j][0], obs_prepare[j][1]]
 				import math
-				if math.dist(pi, pj) < 5:
+				if math.dist(pi, pj) < self.colli_distan_value:
 					pairs.append([i, j])
 		return pairs
 
@@ -882,7 +882,7 @@ class DrpEnv(gym.Env):
 		
 		# 2) !!!obs_prepare & obs_onehot_prepare!!! を持って、
 		# second judge whether to !!! obs & obs_onehot !!! according to collision happen
-		collision_flag = self.ee_env.collision_detect(self.obs_prepare)
+		collision_flag = self.ee_env.collision_detect(self.obs_prepare, self.colli_distan_value)
 		# LaRe-Path: also compute the explicit list of colliding pairs for the encoder.
 		if self.use_lare_path and self.lare_path_module is not None:
 			self._lare_current_colliding_pairs = self._lare_compute_colliding_pairs(self.obs_prepare)

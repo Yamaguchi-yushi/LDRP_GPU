@@ -83,6 +83,12 @@ if __name__ == "__main__":
         "lare_task_autosave_path",
         "lare_task_save_dir",
         "lare_task_save_freq_steps",
+        # タスク到着プロセスのランダム化 (学習用) / エピソード単位 seed (評価用)
+        "randomize_task_arrival",
+        "mmpp_ratio",
+        "rand_p_min",
+        "rand_p_max",
+        "episode_seed_base",
     ]
     lare_kwargs = {k: getattr(config, k) for k in lare_path_keys if hasattr(config, k)}
 
@@ -95,6 +101,7 @@ if __name__ == "__main__":
     model_tag = getattr(config, "reassign_before_pickup", "base")
     for reassign_flag in (False, True):
         print(f"\n########## model={model_tag}  allow_reassign_before_pickup={reassign_flag} ##########", flush=True)
+        np.random.seed(0)  # シード値を固定
         env = gym.make(
             env_name,
             state_repre_flag="onehot_fov",

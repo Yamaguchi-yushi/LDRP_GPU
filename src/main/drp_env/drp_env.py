@@ -78,6 +78,17 @@ class DrpEnv(gym.Env):
 			task_p_high=0.8,
 			task_p_low=0.1,
 			task_switch_prob=0.01,
+			# --- 到着プロセスのエピソード毎ランダム化 (既定 False = 従来動作) ---
+			# True にすると reset() ごとに bernoulli(p ランダム) / mmpp を引き直す.
+			# 学習時に使う (1 方策を全シナリオで評価するため). 評価時は False.
+			randomize_task_arrival = False,
+			mmpp_ratio = 0.5,			# MMPP を引く確率 (残りが bernoulli)
+			rand_p_min = 0.01,			# bernoulli p の下限
+			rand_p_max = 0.10,			# bernoulli p の上限
+			# --- 評価用: エピソード k の乱数を (base + k) で固定 ---
+			# 条件間でタスク列・開始位置を完全に一致させ, ペア比較を可能にする.
+			# None = 従来動作 (グローバル np.random を継続使用).
+			episode_seed_base = None,
 		  ):
 		self.agent_num = agent_num
 		self.n_agents = agent_num # for epymarl
@@ -147,6 +158,13 @@ class DrpEnv(gym.Env):
 		self.task_p_high = task_p_high
 		self.task_p_low = task_p_low
 		self.task_switch_prob = task_switch_prob
+		# 到着プロセスのランダム化 (エピソード毎に引き直す. 学習時に使う)
+		self.randomize_task_arrival = bool(randomize_task_arrival)
+		self.mmpp_ratio = float(mmpp_ratio)
+		self.rand_p_min = float(rand_p_min)
+		self.rand_p_max = float(rand_p_max)
+		# 評価用のエピソード単位 seed (None なら従来動作)
+		self.episode_seed_base = episode_seed_base
 
 		if self.is_tasklist:
 			self.ee_env.task_flag_on()
@@ -681,8 +699,26 @@ class DrpEnv(gym.Env):
 			np.random.seed(int(seed))
 		return [seed]
 
+	def _sample_task_arrival(self):
+		"""到着プロセスをエピソード毎に引き直す (randomize_task_arrival=True のときのみ).
+
+		bernoulli : p ~ U(rand_p_min, rand_p_max) を毎エピソード引き直す.
+		mmpp      : task_p_high / task_p_low / task_switch_prob を上書きしない.
+		            env_args (train.py / yaml) で設定した値がそのまま使われる.
+		"""
+		if np.random.random() < self.mmpp_ratio:
+			self.task_arrival = "mmpp"
+		else:
+			self.task_arrival = "bernoulli"
+			self.task_density = float(np.random.uniform(self.rand_p_min, self.rand_p_max))
+
 	def reset(self):
-		# if goal and start are not assigned, randomly generate every episode    
+		# 評価時のペア比較用: エピソード index だけで乱数列を決める.
+		# episode_account の +1 は下部で行われるので, ここでは前エピソードまでの回数.
+		if self.episode_seed_base is not None:
+			np.random.seed(int(self.episode_seed_base) + int(self.episode_account))
+
+		# if goal and start are not assigned, randomly generate every episode
 		self.start_ori_array = copy.deepcopy(self.ee_env.input_start_ori_array)
 		self.goal_array = copy.deepcopy(self.ee_env.input_goal_array)
 		#print("self.start_ori_array", self.start_ori_array)
@@ -705,6 +741,8 @@ class DrpEnv(gym.Env):
 			# LaRe-Task: per-task creation step (parallel to current_tasklist).
 			self._lare_task_creation_steps = []
 			if self._auto_tasks:
+				if self.randomize_task_arrival:
+					self._sample_task_arrival()
 				self.alltasks = self.ee_env.create_tasklist(
 					self.time_limit, self.agent_num, self.task_density,
 					mode=self.task_arrival, p_high=self.task_p_high,
@@ -738,6 +776,20 @@ class DrpEnv(gym.Env):
 		# 稼働状況を可視化
 		self.busy_agent_steps = 0
 		self.deadhead_agent_steps = 0
+		# タスク到着，タスク停滞の監視
+		self.task_arrival_count = 0
+		self.task_dropped_count = 0
+		self.pending_len_sum = 0
+		self.pending_len_max = 0
+		self.saturated_steps = 0		# キューが上限だったステップ数
+		self.unassigned_len_sum = 0
+		# タスクの待ち時間 (発生 -> ピック / 発生 -> 配達完了)
+		self.pickup_wait_sum = 0		# Σ (ピック時刻 - 発生時刻)
+		self.pickup_count = 0
+		self.service_time_sum = 0		# Σ (配達完了時刻 - 発生時刻)
+		self.service_count = 0
+		# ピック時に発生時刻を退避する (current_tasklist から pop されて失われるため)
+		self._agent_task_creation = [None] * self.agent_num
 		#print('Environment reset obs: \n', self.obs)
 
 		obs = self.obs_manager.calc_obs()
@@ -985,6 +1037,9 @@ class DrpEnv(gym.Env):
 					self.assigned_list.append(-1) # -1 means unassigned
 					# LaRe-Task: track creation step parallel to current_tasklist.
 					self._lare_task_creation_steps.append(self.step_account)
+					self.task_arrival_count += 1
+				else:
+					self.task_dropped_count += 1
 
 			# remove the task from the list if it has been completed
 			for i in range(self.agent_num):
@@ -994,6 +1049,12 @@ class DrpEnv(gym.Env):
 						if self.goal_array[i] == self.assigned_tasks[i][1]:
 							self.assigned_tasks[i] = [] # remove the task from assigned_tasks
 							self.task_completion += 1
+							# 配送時間 (発生 -> 配達完了). ピック時に退避した発生時刻を使う.
+							_c = self._agent_task_creation[i]
+							if _c is not None:
+								self.service_time_sum += max(0, self.step_account - _c)
+								self.service_count += 1
+								self._agent_task_creation[i] = None
 						elif self.goal_array[i] == self.assigned_tasks[i][0]:
 							self._reassign_event = True
 
@@ -1063,6 +1124,12 @@ class DrpEnv(gym.Env):
 								self.current_tasklist.pop(idx)
 								self.assigned_list.pop(idx)
 								if 0 <= idx < len(self._lare_task_creation_steps):
+									# 待ち時間 (発生 -> ピック). 台数不足だと伸びる.
+									_creation = self._lare_task_creation_steps[idx]
+									self.pickup_wait_sum += max(0, self.step_account - _creation)
+									self.pickup_count += 1
+									# 配達完了までの計測用に発生時刻をエージェント側へ退避
+									self._agent_task_creation[i] = _creation
 									self._lare_task_creation_steps.pop(idx)
 							except ValueError:
 								print("ValueError: agent ", i, " 's assigned task is not in the current_tasklist")
@@ -1094,6 +1161,34 @@ class DrpEnv(gym.Env):
 			self.terminated = [True for _ in range(self.agent_num)]
 
 		info["distance_from_start"] = self.distance_from_start
+
+		if self.is_tasklist:
+			pending = len(self.current_tasklist)
+			unassigned = sum(1 for v in self.assigned_list if v == -1)
+			self.pending_len_sum += pending
+			self.pending_len_max = max(self.pending_len_max, pending)
+			if pending >= self.task_num:
+				self.saturated_steps += 1
+			self.unassigned_len_sum += unassigned
+			steps = max(1, self.step_account)
+
+			info["task_arrival"] = self.task_arrival_count
+			info["task_dropped"] = self.task_dropped_count
+			info["pending_len_avg"] = self.pending_len_sum / steps
+			info["pending_len_max"] = self.pending_len_max
+			info["unassigned_len_avg"] = self.unassigned_len_sum / steps
+			info["unassigned_len_final"] = unassigned
+			info["saturated"] = 1.0 if self.pending_len_max >= self.task_num else 0.0
+			info["saturated_ratio"] = self.saturated_steps / max(1, self.step_account)
+			info["pickup_wait_mean"] = self.pickup_wait_sum / max(1, self.pickup_count)
+			info["service_time_mean"] = self.service_time_sum / max(1, self.service_count)
+			info["arrival_is_mmpp"] = 1.0 if self.task_arrival == "mmpp" else 0.0
+			if self.task_arrival == "mmpp":
+				info["arrival_density"] = float((self.task_p_high + self.task_p_low) / 2.0)
+			elif self.task_arrival == "bernoulli":
+				info["arrival_density"] = float(self.task_density)
+			else:	# "fixed" は毎ステップ 1 件
+				info["arrival_density"] = 1.0
 
 		# LaRe-Path: compute factors, record the step, and (if trained + enabled) swap rewards.
 		if self.use_lare_path and self.lare_path_module is not None:

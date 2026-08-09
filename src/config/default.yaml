@@ -25,6 +25,20 @@ allow_reassign_before_pickup: False  # True にすると pickup 前のタスク�
 # (経路計画の MARL 学習ステップと揃える用途).
 running_steps: -1
 
+# --- タスク到着プロセスのランダム化 (学習時に使う) ---
+# True にするとエピソード毎に bernoulli(p ランダム) / mmpp を引き直す。
+# 1 つの方策を全シナリオで評価するために必要。評価時は False。
+randomize_task_arrival: False
+mmpp_ratio: 0.5          # MMPP を引く確率。残りが bernoulli
+rand_p_min: 0.01         # bernoulli p の下限
+rand_p_max: 0.10         # bernoulli p の上限
+
+# --- 評価用: エピソード単位の seed 固定 ---
+# 設定するとエピソード k の乱数が (base + k) だけで決まり、条件間でタスク列・
+# 開始位置が完全に一致する (ペア比較が可能になる)。null なら従来動作。
+# 学習時は多様性が失われるので null にすること。
+episode_seed_base: null
+
 # =============================================================================
 # LaRe-Path (System A: 経路計画用) - 利用設定
 # =============================================================================

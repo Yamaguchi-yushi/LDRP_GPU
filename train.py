@@ -10,18 +10,44 @@ command = [
 'python3 src/main.py --config=qmix --env-config=gymma with env_args.time_limit=500 env_args.key="drp_env:drp_safe-4agent_map_aoba00-v2" env_args.state_repre_flag="onehot_fov" > train_results/qmix_drp_safe-4agent_map_8x5-v2.txt 2>&1'
 ]
 
-num_runs = 1
+num_runs = 5
 maxpurocesses = 1
 running_processes = []
 
 for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
     #iql,aoba00,16050000,unsafe
+    command = (
+        f'python src/epymarl/src/main.py --config=mappo --env-config=gymma --beat-interval=3600 '
+        f'with env_args.time_limit=500 '
+        f't_max=30050000 '
+        f'env_args.key="drp_env:drp_safe-5agent_map_10x10-v2" '
+        f'env_args.state_repre_flag="onehot_fov" '
+        f'env_args.use_lare_path=False '
+        f'env_args.use_lare_path_training=True '
+        f'env_args.use_pretrained_lare_path=True '
+        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
+        f'env_args.use_finetuning_lare_path=False '
+        f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
+        f'env_args.allow_reassign_before_pickup=False '
+        f'env_args.task_arrival="bernoulli" '    # 'fixed' or 'bernoulli' or 'mmpp'
+        f'env_args.task_density=0.3 '
+        f'env_args.task_p_high=0.10 '
+        f'env_args.task_p_low=0.01 '
+        f'env_args.task_switch_prob=0.01 '
+        f'env_args.randomize_task_arrival=False '   # True にすると毎エピソード bernoulli/mmpp を引き直す
+        f'env_args.mmpp_ratio=0.5 '
+        f'env_args.rand_p_min=0.01 '
+        f'env_args.rand_p_max=0.10 '
+        )
+
+    # CPU バージョン (CUDA_VISIBLE_DEVICES="" で GPU を無効化)
     # command = (
+    #     f'CUDA_VISIBLE_DEVICES="" '
     #     f'python src/epymarl/src/main.py --config=qmix --env-config=gymma --beat-interval=3600 '
     #     f'with env_args.time_limit=500 '
-    #     f't_max=150050000 '
-    #     f'env_args.key="drp_env:drp_safe-10agent_map_aoba00-v2" '
+    #     f't_max=30050000 '
+    #     f'env_args.key="drp_env:drp_safe-10agent_map_shibuya-v2" '
     #     f'env_args.state_repre_flag="onehot_fov" '
     #     f'env_args.use_lare_path=False '
     #     f'env_args.use_lare_path_training=True '
@@ -29,29 +55,17 @@ for i in range(num_runs):
     #     f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
     #     f'env_args.use_finetuning_lare_path=False '
     #     f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
+    #     f'env_args.allow_reassign_before_pickup=False '
+    #     f'env_args.task_arrival="bernoulli" '    # 'fixed' or 'bernoulli' or 'mmpp'
+    #     f'env_args.task_density=0.3 '
+    #     f'env_args.task_p_high=0.10 '
+    #     f'env_args.task_p_low=0.01 '
+    #     f'env_args.task_switch_prob=0.01 '
+    #     f'env_args.randomize_task_arrival=False '   # True にすると毎エピソード bernoulli/mmpp を引き直す
+    #     f'env_args.mmpp_ratio=0.5 '
+    #     f'env_args.rand_p_min=0.01 '
+    #     f'env_args.rand_p_max=0.10 '
     #     )
-
-    # CPU バージョン (CUDA_VISIBLE_DEVICES="" で GPU を無効化)
-    command = (
-        f'CUDA_VISIBLE_DEVICES="" '
-        f'python src/epymarl/src/main.py --config=qmix --env-config=gymma --beat-interval=3600 '
-        f'with env_args.time_limit=500 '
-        f't_max=150050000 '
-        f'env_args.key="drp_env:drp_safe-10agent_map_aoba00-v2" '
-        f'env_args.state_repre_flag="onehot_fov" '
-        f'env_args.use_lare_path=True '
-        f'env_args.use_lare_path_training=True '
-        f'env_args.use_pretrained_lare_path=True '
-        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
-        f'env_args.use_finetuning_lare_path=False '
-        f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
-        f'env_args.allow_reassign_before_pickup=False '
-        f'env_args.task_arrival="fixed" '
-        f'env_args.task_density=0.3 '
-        f'env_args.task_p_high=0.8 '
-        f'env_args.task_p_low=0.1 '
-        f'env_args.task_switch_prob=0.01 '
-        )
 
 
     env = os.environ.copy()

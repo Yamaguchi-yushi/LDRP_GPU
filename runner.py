@@ -205,6 +205,12 @@ class Runner():
         busy = [info["busy_ratio"] for info in self.info_buffer]
         deadhead_per_task = [info["deadhead_steps_per_task"] for info in self.info_buffer]
         steps_per_task = [info["agent_steps_per_task"] for info in self.info_buffer]
+        arrival = [info.get("task_arrival", 0) for info in self.info_buffer]
+        dropped = [info.get("task_dropped", 0) for info in self.info_buffer]
+        pending_avg = [info.get("pending_len_avg", 0) for info in self.info_buffer]
+        pending_max = [info.get("pending_len_max", 0) for info in self.info_buffer]
+        unassigned_avg = [info.get("unassigned_len_avg", 0) for info in self.info_buffer]
+        unassigned_final = [info.get("unassigned_len_final", 0) for info in self.info_buffer]
         full_completion = [info["task_completion"] for info in self.info_buffer if not info["collision"]]
         non_lock_completion = [info["task_completion"] for idx, info in enumerate(self.info_buffer) if tmp_list[idx]==False]
         total = len(self.info_buffer)
@@ -229,6 +235,12 @@ class Runner():
         print(f"アイドル率:               {(1 - np.mean(busy))*100:.1f} %")
         print(f"1タスクあたり空走step:    {np.mean(deadhead_per_task):.2f}")
         print(f"1タスクあたり占有step:    {np.mean(steps_per_task):.2f}")
+
+        print("--- タスク到着 ---")
+        print(f"到着 (キュー投入):        {np.mean(arrival):.1f} 件")
+        print(f"取りこぼし (上限{self.env.task_num}件超): {np.mean(dropped):.1f} 件")
+        print(f"未ピック在庫 平均/ピーク: {np.mean(pending_avg):.2f} / {np.mean(pending_max):.2f}")
+        print(f"未割当 平均/終了時:       {np.mean(unassigned_avg):.2f} / {np.mean(unassigned_final):.2f}")
 
         print("--- エピソード終了理由 ---")
         print(f"衝突終了: {collision_count}/{total} ({collision_rate*100:.1f}%)")

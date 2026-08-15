@@ -40,7 +40,7 @@ class MARLPolicy():
         self.model_reassign_tag = getattr(args, "reassign_before_pickup", "base")
         self.mat_model_agent_num = getattr(args, "mat_model_agent_num", None)
         self.runner = None
-
+    
     def get_model_path(self, env):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         suffix = f"_{self.method_tag}" if self.method_tag else ""
@@ -81,4 +81,11 @@ class MARLPolicy():
             actions.append(action)
 
         return actions
+
+    def reset_hidden(self, ag_idx=None):
+        """
+        エピソード開始時 / エージェント再投入時に RNN のhidden state を戻す
+        """
+        if self.runner is not None and hasattr(self.runner, "reset_hidden"):
+            self.runner.reset_hidden(ag_idx)
     

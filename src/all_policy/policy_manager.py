@@ -12,3 +12,10 @@ class PolicyManager():
     def policy(self, obs, env):
         actions = self.path_planner.policy(obs, env)
         return actions
+
+    def reset_hidden(self, ag_idx=None):
+        """
+        エピソード開始時 / エージェント再投入時に RNN のhidden state を戻す
+        """
+        if hasattr(self.path_planner, "reset_hidden"):
+            self.path_planner.reset_hidden(ag_idx)

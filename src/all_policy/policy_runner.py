@@ -50,6 +50,15 @@ class PolicyRunner:
         print(f"[PolicyRunner] Loaded {model_path} | input_shape={input_shape} | "
                 f"ckpt_input_shape={ckpt_input_shape} | {pad_info} | use_rnn={ckpt_use_rnn}")
 
+    def reset_hidden(self, ag_idx=None):
+        """
+        RNNの隠れ状態をリセットする。ag_idx=Noneなら全エージェントの隠れ状態をリセットする。
+        """
+        if ag_idx is None:
+            self.hidden_states = [self.agent.init_hidden() for _ in range(self.agent_num)]
+        else:
+            self.hidden_states[ag_idx] = self.agent.init_hidden()
+
     def get_action(self, ag_idx, obs, avail_actions):
          # Pad the obs with agent_id one-hot encoding
         if self.input_diff > 0:

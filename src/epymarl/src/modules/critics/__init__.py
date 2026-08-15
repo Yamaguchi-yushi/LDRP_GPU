@@ -7,6 +7,7 @@ from .maddpg_ns import MADDPGCriticNS
 from .ac import ACCritic
 from .ac_ns import ACCriticNS
 from .mat import MATCritic
+from .mat_full import MATFullCritic
 
 
 REGISTRY = {}
@@ -20,7 +21,7 @@ REGISTRY["maddpg_critic_ns"] = MADDPGCriticNS
 REGISTRY["ac_critic"] = ACCritic
 REGISTRY["ac_critic_ns"] = ACCriticNS
 REGISTRY["mat_critic"] = MATCritic
-
+REGISTRY["mat_full_critic"] = MATFullCritic
 
 def register_pac_critics():
     """Lazy registration of PAC critics.

@@ -25,6 +25,17 @@ allow_reassign_before_pickup: False  # True にすると pickup 前のタスク�
 # (経路計画の MARL 学習ステップと揃える用途).
 running_steps: -1
 
+# --- PPO タスク割当学習オプション ---
+# True にすると test.py が PPO タスク割当の学習モードで起動する (task_assigner: ppo 必須)
+train_task_assigner: False
+save_ppo_task_model: True
+ppo_task_save_interval: 500000
+ppo_task_checkpoint_path: ""
+ppo_task_load_step: 0
+local_results_path: "results"
+seed: 0
+eval_seed: 0
+
 # --- タスク到着プロセスのランダム化 (学習時に使う) ---
 # True にするとエピソード毎に bernoulli(p ランダム) / mmpp を引き直す。
 # 1 つの方策を全シナリオで評価するために必要。評価時は False。

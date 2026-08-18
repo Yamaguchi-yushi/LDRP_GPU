@@ -18,15 +18,15 @@ for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
     #iql,aoba00,16050000,unsafe
     command = (
-        f'python src/epymarl/src/main.py --config=mappo --env-config=gymma --beat-interval=3600 '
+        f'python src/epymarl/src/main.py --config=mat --env-config=gymma --beat-interval=3600 '
         f'with env_args.time_limit=500 '
-        f't_max=30050000 '
-        f'env_args.key="drp_env:drp_safe-5agent_map_10x10-v2" '
+        f't_max=150050000 '
+        f'env_args.key="drp_env:drp_safe-10agent_map_aoba00-v2" '
         f'env_args.state_repre_flag="onehot_fov" '
         f'env_args.use_lare_path=False '
         f'env_args.use_lare_path_training=True '
         f'env_args.use_pretrained_lare_path=True '
-        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
+        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint.pth" '
         f'env_args.use_finetuning_lare_path=False '
         f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
         f'env_args.allow_reassign_before_pickup=False '
@@ -35,10 +35,15 @@ for i in range(num_runs):
         f'env_args.task_p_high=0.10 '
         f'env_args.task_p_low=0.01 '
         f'env_args.task_switch_prob=0.01 '
-        f'env_args.randomize_task_arrival=False '   # True にすると毎エピソード bernoulli/mmpp を引き直す
+        f'env_args.randomize_task_arrival=True '   # True にすると毎エピソード bernoulli/mmpp を引き直す
         f'env_args.mmpp_ratio=0.5 '
         f'env_args.rand_p_min=0.01 '
         f'env_args.rand_p_max=0.10 '
+        # --- 動的フリートサイジング (既定 False = 全台稼働の従来動作) -------
+        f'env_args.use_dynamic_agents=False '
+        f'env_args.randomize_initial_active=False '
+        f'env_args.min_active_agents=2 '
+        f'env_args.max_active_agents=5 '
         )
 
     # CPU バージョン (CUDA_VISIBLE_DEVICES="" で GPU を無効化)
@@ -46,8 +51,8 @@ for i in range(num_runs):
     #     f'CUDA_VISIBLE_DEVICES="" '
     #     f'python src/epymarl/src/main.py --config=qmix --env-config=gymma --beat-interval=3600 '
     #     f'with env_args.time_limit=500 '
-    #     f't_max=30050000 '
-    #     f'env_args.key="drp_env:drp_safe-10agent_map_shibuya-v2" '
+    #     f't_max=100050000 '
+    #     f'env_args.key="drp_env:drp_safe-7agent_map_aoba00-v2" '
     #     f'env_args.state_repre_flag="onehot_fov" '
     #     f'env_args.use_lare_path=False '
     #     f'env_args.use_lare_path_training=True '
@@ -61,10 +66,15 @@ for i in range(num_runs):
     #     f'env_args.task_p_high=0.10 '
     #     f'env_args.task_p_low=0.01 '
     #     f'env_args.task_switch_prob=0.01 '
-    #     f'env_args.randomize_task_arrival=False '   # True にすると毎エピソード bernoulli/mmpp を引き直す
+    #     f'env_args.randomize_task_arrival=True '   # True にすると毎エピソード bernoulli/mmpp を引き直す
     #     f'env_args.mmpp_ratio=0.5 '
     #     f'env_args.rand_p_min=0.01 '
     #     f'env_args.rand_p_max=0.10 '
+    #     # --- 動的フリートサイジング (既定 False = 全台稼働の従来動作) ---
+    #     f'env_args.use_dynamic_agents=False '
+    #     f'env_args.randomize_initial_active=False '
+    #     f'env_args.min_active_agents=2 '
+    #     f'env_args.max_active_agents=5 '
     #     )
 
 

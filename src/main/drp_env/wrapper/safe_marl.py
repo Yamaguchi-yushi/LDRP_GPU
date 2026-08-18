@@ -30,26 +30,32 @@ class SafeEnv(DrpEnv):
 		while do:
 			do = False
 			for i in range(self.agent_num):
+				if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
+					continue
 				#act8，他のエージェントと向かう先が同じ場合
 				#自分がノード上にいる時
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
+						if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
+							continue
 						if j != i and joint_action[i] == joint_action[j]:
 							if joint_action[i] != self.current_start[i]:
 								self.safety_intervention_count += 1
-							joint_action[i] = self.current_start[i]
-							do = True #条件が変わる可能性があるため，もう一度ループを回す
+								joint_action[i] = self.current_start[i]
+								do = True #条件が変わる可能性があるため，もう一度ループを回す
 							break
 
 				#act9，正面衝突
 				#自分がノード上にいる時
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
+						if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
+							continue
 						if j != i and (joint_action[j] == self.current_start[i] and joint_action[i] == self.current_start[j]):
 							if joint_action[i] != self.current_start[i]:
 								self.safety_intervention_count += 1
-							joint_action[i] = self.current_start[i]
-							do = True
+								joint_action[i] = self.current_start[i]
+								do = True
 							break
 
 		joint_action = {"pass": joint_action, "task": task_assign} if task_assign is not None else joint_action

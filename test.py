@@ -7,6 +7,7 @@ import sys
 import numpy as np
 from argparse import Namespace
 import argparse
+import torch
 from runner import Runner
 
 
@@ -40,6 +41,7 @@ if __name__ == "__main__":
 
     env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
     #env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
+    config.env_name = env_name
 
     # Optionally forward LaRe-Path params from config (no-op when use_lare_path=false).
     lare_path_keys = [
@@ -92,6 +94,15 @@ if __name__ == "__main__":
     ]
     lare_kwargs = {k: getattr(config, k) for k in lare_path_keys if hasattr(config, k)}
 
+    dynamic_agent_keys = [
+        "use_dynamic_agents",
+        "randomize_initial_active",
+        "min_active_agents",
+        "max_active_agents",
+        "initial_active_num",
+    ]
+    dynamic_agent_kwargs = {k: getattr(config, k) for k in dynamic_agent_keys if hasattr(config, k)}
+
     # path_planner が PBS のときだけ pbs_mode=True にする.
     # PBS は待機 agent の予定も path 計画に反映するため current_goal を非 None に
     # 保つ必要があるが、それ以外 (QMIX/IQL/VDN/MAA2C) では None のままにして
@@ -99,9 +110,14 @@ if __name__ == "__main__":
     pbs_mode = (getattr(config, "path_planner", "") == "pbs")
 
     model_tag = getattr(config, "reassign_before_pickup", "base")
-    for reassign_flag in (False, True):
+    training = bool(getattr(config, "train_task_assigner", False))
+    if training and config.task_assigner != "ppo":
+        raise ValueError("train_task_assigner is True but task_assigner is not 'ppo'.")
+
+    for reassign_flag in (False,):
         print(f"\n########## model={model_tag}  allow_reassign_before_pickup={reassign_flag} ##########", flush=True)
-        np.random.seed(0)  # シード値を固定
+        np.random.seed(config.seed if training else config.eval_seed)
+        torch.manual_seed(config.seed)
         env = gym.make(
             env_name,
             state_repre_flag="onehot_fov",
@@ -112,12 +128,13 @@ if __name__ == "__main__":
             pbs_mode=pbs_mode,
             allow_reassign_before_pickup=reassign_flag,
             **lare_kwargs,
+            **dynamic_agent_kwargs,
         )
         """
         with open("./config/algo/" + config.algo + ".yaml", 'r') as file:
             config_dict = yaml.safe_load(file)
         config = Namespace(**config_dict)
         """
-        runner = Runner(config, env, reward_list)
+        runner = Runner(config, env, reward_list, training=training)
         runner.run()
         runner.finish()

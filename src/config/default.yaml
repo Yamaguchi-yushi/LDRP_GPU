@@ -50,6 +50,13 @@ rand_p_max: 0.10         # bernoulli p の上限
 # 学習時は多様性が失われるので null にすること。
 episode_seed_base: null
 
+# --- エージェント数の動的変化 ---
+use_dynamic_agents: False
+randomize_initial_active: False
+min_active_agents: 2
+max_active_agents: null
+initial_active_num: null
+
 # =============================================================================
 # LaRe-Path (System A: 経路計画用) - 利用設定
 # =============================================================================

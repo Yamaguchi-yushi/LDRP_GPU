@@ -14,6 +14,9 @@ class TP():
 
         for i in range(env.agent_num):
             best_task = -1
+            if getattr(env, "use_dynamic_agents", False) and (not env.active[i] or env.pending_off[i]):
+                task_assign.append(best_task)
+                continue
             if assigned_tasks[i] == [] and len(current_tasklist) > 0:
                 shortest_path_length = float('inf')
 

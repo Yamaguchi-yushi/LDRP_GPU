@@ -27,6 +27,11 @@ env_args:
   rand_p_max: 0.10         # bernoulli p の上限
   # 評価用のエピソード単位 seed。学習では null のままにする。
   episode_seed_base: null
+  use_dynamic_agents: False
+  randomize_initial_active: False
+  min_active_agents: 2
+  max_active_agents: null
+  initial_active_num: null
 
 test_greedy: True
 test_nepisode: 100

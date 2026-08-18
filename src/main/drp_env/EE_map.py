@@ -108,6 +108,8 @@ class MapMake():
 		csv_edges_source.remove(csv_edges_source[0])#remove title row
 		#About nodes
 		csv_nodes_number = [int(i[0]) for i in csv_nodes_source]
+		self.station_nodes = [int(row[0]) for row in csv_nodes_source
+						if len(row) > 4 and str(row[4]).strip() == "1"]
 		csv_nodes_pos = dict()
 		for node in csv_nodes_source:
 			#csv_nodes_pos[int(node[0])]=[ float(node[1]),float(node[2]) ]
@@ -272,12 +274,16 @@ class MapMake():
 
 		return action_set
 
-	def collision_detect(self, obs_prepare, colli_distan=5):
+	def collision_detect(self, obs_prepare, colli_distan=5, active=None):
 		collision_flag = 0
 		for i in range(self.agent_num-1):
+			if active is not None and not active[i]:
+				continue
 			pos_i = [obs_prepare[i][0], obs_prepare[i][1]]
 			#print("pos_i",i,pos_i)
 			for j in range(i+1, self.agent_num):
+				if active is not None and not active[j]:
+					continue
 				pos_j = [obs_prepare[j][0], obs_prepare[j][1]]
 				#print("pos_j",j,pos_j)
 				distance_ij = math.dist(pos_i, pos_j)

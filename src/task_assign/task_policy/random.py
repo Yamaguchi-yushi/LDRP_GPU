@@ -16,6 +16,9 @@ class Random():
 
         task_idx = 0
         for i in range(env.agent_num):
+            if getattr(env, "use_dynamic_agents", False) and (not env.active[i] or env.pending_off[i]):
+                task_assign.append(-1)
+                continue
             if assigned_tasks[i] == [] and len(current_tasklist)-task_idx > 0 :
                 while task_idx < len(current_tasklist):
                     if assigned_list[task_idx] == -1:

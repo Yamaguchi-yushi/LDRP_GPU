@@ -73,11 +73,16 @@ class DrpEnv(gym.Env):
 			# にも効く. デフォルト False = 安全制御優先 (詳細は CLAUDE.md).
 			pbs_mode=False,
 			allow_reassign_before_pickup=False,
-			task_arrival="fixed",	# "fixed" / "bernoulli" / "mmpp"
-			task_density=0.3,
-			task_p_high=0.8,
-			task_p_low=0.1,
-			task_switch_prob=0.01,
+			use_dynamic_agents = False,
+			randomize_initial_active = False,
+			min_active_agents = 1,
+			max_active_agents = None,
+			initial_active_num = None,
+			task_arrival = "fixed",	# "fixed" / "bernoulli" / "mmpp"
+			task_density = 0.3,
+			task_p_high = 0.8,
+			task_p_low = 0.1,
+			task_switch_prob = 0.01,
 			# --- 到着プロセスのエピソード毎ランダム化 (既定 False = 従来動作) ---
 			# True にすると reset() ごとに bernoulli(p ランダム) / mmpp を引き直す.
 			# 学習時に使う (1 方策を全シナリオで評価するため). 評価時は False.
@@ -158,6 +163,14 @@ class DrpEnv(gym.Env):
 		self.task_p_high = task_p_high
 		self.task_p_low = task_p_low
 		self.task_switch_prob = task_switch_prob
+		self.use_dynamic_agents = bool(use_dynamic_agents)
+		self.randomize_initial_active = bool(randomize_initial_active)
+		self.min_active_agents = int(min_active_agents)
+		self.max_active_agents = max_active_agents
+		self.initial_active_num = initial_active_num
+		self.station_nodes = list(getattr(self.ee_env, "station_nodes", []))
+		self.active = [True] * self.agent_num		    # エージェントがアクティブ状態ならTrue
+		self.pending_off = [False] * self.agent_num   	# ステーションノードに戻るエージェントはTrue
 		# 到着プロセスのランダム化 (エピソード毎に引き直す. 学習時に使う)
 		self.randomize_task_arrival = bool(randomize_task_arrival)
 		self.mmpp_ratio = float(mmpp_ratio)
@@ -645,7 +658,11 @@ class DrpEnv(gym.Env):
 		"""Mirror MARL4DRP.get_collision_agents() — returns list of pairs [[i, j], ...]."""
 		pairs = []
 		for i in range(self.agent_num - 1):
+			if self.use_dynamic_agents and not self.active[i]:
+				continue
 			for j in range(i + 1, self.agent_num):
+				if self.use_dynamic_agents and not self.active[j]:
+					continue
 				pi = [obs_prepare[i][0], obs_prepare[i][1]]
 				pj = [obs_prepare[j][0], obs_prepare[j][1]]
 				import math
@@ -669,6 +686,11 @@ class DrpEnv(gym.Env):
 		return self.s
 
 	def _get_avail_agent_actions(self, agent_id, n_actions):
+		if self.use_dynamic_agents and not self.active[agent_id]:
+			node = int(self.current_start[agent_id])
+			avail_actions_one_hot = np.zeros(n_actions)
+			avail_actions_one_hot[node] = 1
+			return avail_actions_one_hot, [node]
 		avail_actions = self.ee_env.get_avail_action_fun(self.obs[agent_id], self.current_start[agent_id], self.current_goal[agent_id], self.goal_array[agent_id])
 		avail_actions_one_hot = np.zeros(n_actions)
 		if avail_actions[0] is None:
@@ -749,6 +771,31 @@ class DrpEnv(gym.Env):
 					p_low=self.task_p_low, switch_prob=self.task_switch_prob)
 
 		#initialize obs
+		self.active = [True] * self.agent_num
+		self.pending_off = [False] * self.agent_num
+		if self.use_dynamic_agents:
+			assert self.is_tasklist, "tasklist must be True when use_dynamic_agents is True"
+			assert self.station_nodes, f"There is not station node in {self.map_name} when use_dynamic_agents is True"
+			if self.randomize_initial_active:
+				# ランダムに初期稼働台数を決める (station_nodes にいる agent は非稼働扱い)
+				# ただし station_nodes にいる agent は非稼働扱いなので, station_nodes の数だけ
+				# 稼働台数が減ることに注意.
+				lo = max(1, min(self.agent_num, int(self.min_active_agents)))
+				hi = self.agent_num if self.max_active_agents is None else max(lo, min(self.agent_num, int(self.max_active_agents)))
+				n_active = int(np.random.randint(lo, hi + 1))
+				inactive_idx = np.random.choice(
+					self.agent_num, self.agent_num - n_active, replace=False)
+			else:
+				n_active = self.agent_num if self.initial_active_num is None \
+					else max(0, min(self.agent_num, int(self.initial_active_num)))
+				inactive_idx = range(n_active, self.agent_num)
+			for i in inactive_idx:
+				i = int(i)
+				self.active[i] = False
+				st = self.station_nodes[i % len(self.station_nodes)]
+				self.start_ori_array[i] = st
+				self.goal_array[i] = st
+				
 		self.obs = tuple(np.array([self.pos[self.start_ori_array[i]][0], self.pos[self.start_ori_array[i]][1], self.start_ori_array[i], self.goal_array[i]]) for i in range(self.agent_num))
 		self.obs_current_chache = copy.deepcopy(self.obs)# used for calculating reward
 		#initialize obs_one-hot
@@ -796,6 +843,17 @@ class DrpEnv(gym.Env):
 
 		return obs
 
+	def _nearest_station(self, i):
+		"""Return the nearest station node to agent i's current position."""
+		if len(self.station_nodes) == 1:
+			return self.station_nodes[0]
+		best, shortest = self.station_nodes[0], float("inf")
+		for st in self.station_nodes:
+			d = self.get_path_length(self.current_start[i], st)
+			if d is not None and d < shortest:
+				best, shortest = st, d
+		return best
+
 
 	def _default_task_assign_tp(self):
 		"""Built-in nearest-pending-task assigner used when the caller does not
@@ -809,6 +867,8 @@ class DrpEnv(gym.Env):
 		assigned_local = list(self.assigned_list)
 		task_assign = [-1] * self.agent_num
 		for i in range(self.agent_num):
+			if self.use_dynamic_agents and (not self.active[i] or self.pending_off[i]):
+				continue
 			if self.assigned_tasks[i] == [] and self.current_tasklist:
 				shortest = float("inf")
 				best = -1
@@ -964,7 +1024,8 @@ class DrpEnv(gym.Env):
 		
 		# 2) !!!obs_prepare & obs_onehot_prepare!!! を持って、
 		# second judge whether to !!! obs & obs_onehot !!! according to collision happen
-		collision_flag = self.ee_env.collision_detect(self.obs_prepare, self.colli_distan_value)
+		collision_flag = self.ee_env.collision_detect(self.obs_prepare, self.colli_distan_value, 
+												active=self.active if self.use_dynamic_agents else None)
 		# LaRe-Path: also compute the explicit list of colliding pairs for the encoder.
 		if self.use_lare_path and self.lare_path_module is not None:
 			self._lare_current_colliding_pairs = self._lare_compute_colliding_pairs(self.obs_prepare)
@@ -1058,10 +1119,26 @@ class DrpEnv(gym.Env):
 						elif self.goal_array[i] == self.assigned_tasks[i][0]:
 							self._reassign_event = True
 
+			if self.use_dynamic_agents:
+				for i in range(self.agent_num):
+					if task_assign[i] == -2:
+						if self.active[i] and self.assigned_tasks[i] == [] and not self.pending_off[i]:
+							self.goal_array[i] = self._nearest_station(i)
+							self.pending_off[i] = True
+						task_assign[i] = -1
+
 			# assign tasks to agents — capture pre-assignment state for LaRe-Task.
 			lare_task_decisions = []
+			spawned_this_step = 0
 			for i in range(self.agent_num):
 				if (self.assigned_tasks[i] == [] or i in self.assigned_list) and task_assign[i] != -1:
+					if self.use_dynamic_agents and not self.active[i]:
+						if spawned_this_step >= 1:
+							continue
+						self.active[i] = True
+						spawned_this_step += 1
+					if self.use_dynamic_agents and self.pending_off[i]:
+						self.pending_off[i] = False
 					r = task_assign[i]
 					task_r = self.current_tasklist[r]
 					was_idle = (self.assigned_tasks[i] == [])
@@ -1151,6 +1228,16 @@ class DrpEnv(gym.Env):
 					self.obs_onehot[i][int(self.goal_array[i])+len(list(self.G.nodes()))] = 1
 
 			self.obs = tuple([np.array(i) for i in self.obs_prepare])
+
+			if self.use_dynamic_agents:
+				for i in range(self.agent_num):
+					if self.pending_off[i] and self.active[i]:
+						pos_agenti = [self.obs[i][0], self.obs[i][1]]
+
+						if [float(v) for v in pos_agenti] == [float(v) for v in self.pos[self.goal_array[i]]]:
+							self.active[i] = False
+							self.pending_off[i] = False
+							self.start_ori_array[i] = self.goal_array[i] # reward = 0
 
 		obs = self.obs_manager.calc_obs()
 

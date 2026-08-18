@@ -282,7 +282,8 @@ class PPOAgent():
             #task持ちのエージェント
             mask = torch.zeros_like(policy)
             for k in range(agent_num):
-                if len(assigned_tasklist[k]) > 0:
+                if len(assigned_tasklist[k]) > 0 or (
+                    getattr(env, "use_dynamic_agents", False) and (not env.active[k] or env.pending_off[k])):
                     mask[task_num * k:task_num * (k + 1)] = 1
             #task数が少ないとき
             for j in range(env.task_num):

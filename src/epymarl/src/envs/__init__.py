@@ -104,7 +104,10 @@ class _GymmaWrapper(MultiAgentEnv):
 
     def step(self, actions):
         """ Returns reward, terminated, info """
-        actions = [int(a) for a in actions]
+        if isinstance(actions, dict):
+            actions = {"pass": [int(a) for a in actions["pass"]], "task": list(actions["task"])}
+        else:
+            actions = [int(a) for a in actions]
         self._obs, reward, done, self._info = self._env.step(actions)
         self._obs = [
             np.pad(
@@ -141,6 +144,9 @@ class _GymmaWrapper(MultiAgentEnv):
 
     def get_state(self):
         return np.concatenate(self._obs, axis=0).astype(np.float32)
+
+    def get_task_state(self):
+        return self._env.get_task_state()
 
     def get_state_size(self):
         """ Returns the shape of the state"""

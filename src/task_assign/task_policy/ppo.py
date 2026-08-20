@@ -253,8 +253,19 @@ class PPOAgent():
 
         return stats
 
-
     def assign_task(self, env):
+        return self._assign(env, env_idx=0, step_idx=env.step_account,
+                            test_mode=self.test_mode)
+
+    def assign_task_from_state(self, task_state, env_idx, step_idx, test_mode):
+        from types import SimpleNamespace
+        if task_state is None:
+            return [-1] * self.args.agent_num
+        return self._assign(SimpleNamespace(**task_state), env_idx=env_idx, step_idx=step_idx,
+                            test_mode=test_mode)
+    
+
+    def _assign(self, env, env_idx, step_idx, test_mode):
         current_tasklist = copy.deepcopy(env.current_tasklist)  
         assigned_tasklist = copy.deepcopy(env.assigned_tasks)
         assigned_list = copy.deepcopy(env.assigned_list)
@@ -301,7 +312,7 @@ class PPOAgent():
             policy = policy.masked_fill(mask.bool(), float('-inf'))
             policy = F.softmax(policy, dim=-1)
 
-            if self.test_mode:# 実行用
+            if test_mode:# 実行用
                 action = policy.argmax().item()
             else:# 学習用
                 dist = Categorical(policy)
@@ -312,7 +323,8 @@ class PPOAgent():
 
                 # mask を渡して update() 側で同じ分布を再構成できるようにする
                 self.buffer.add_actions(
-                    env.step_account, state, action, log_prob, entropy, value, mask
+                    step_idx, state, action, log_prob, entropy, value, mask,
+                    env_idx=env_idx
                 )
         
             #actionをみてtask_assignを決定
@@ -363,8 +375,8 @@ class PPOAgent():
         # 全 env 合計のサンプル数で判定する
         return self.buffer.n_samples() >= self.buffer.buffer_size
 
-    def buffer_add_rewards(self, reward, done):
-        self.buffer.add_rewards(reward, done)
+    def buffer_add_rewards(self, reward, done, env_idx=0):
+        self.buffer.add_rewards(reward, done, env_idx=env_idx)
 
     def buffer_reset(self):
         self.buffer.reset_buffer()

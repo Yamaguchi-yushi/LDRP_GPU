@@ -82,6 +82,11 @@ def evaluate_sequential(args, runner):
 
 
 def run_sequential(args, logger):
+    if getattr(args, "train_task_assigner", False) and args.runner != "parallel":
+        logger.console_logger.info(
+            f"[joint] runner='{args.runner}' -> change to parallel for task assigner training"
+            f"(batch_size_run={args.batch_size_run})")
+        args.runner = "parallel"
 
     # Init runner so we can get env info
     runner = r_REGISTRY[args.runner](args=args, logger=logger)
@@ -135,6 +140,26 @@ def run_sequential(args, logger):
 
     # Learner
     learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+    if getattr(args, "train_task_assigner", False):
+        from types import SimpleNamespace as SN
+        import sys as _sys
+        import yaml as _yaml
+
+        _ldrp_root = dirname(dirname(dirname(dirname(abspath(__file__)))))
+        if _ldrp_root not in _sys.path:
+            _sys.path.append(_ldrp_root)
+        with open(os.path.join(_ldrp_root, "src", "config", "default.yaml")) as f:
+            _ta = _yaml.safe_load(f)
+        _ta.update({"agent_num": args.n_agents,
+                    "node_num": env_info["n_actions"],
+                    "task_num": args.task_num,
+                    "n_envs": runner.batch_size,
+                    "path_planner": args.name})
+        from src.task_assign.task_policy.ppo import PPOAgent
+        runner.task_assigner = PPOAgent(SN(**_ta))
+        runner.task_assigner.set_test_mode(False)
+        logger.console_logger.info(
+            f"[joint] task assigner enabled (n_envs={runner.batch_size})")
 
     if args.use_cuda:
         learner.cuda()
@@ -165,6 +190,9 @@ def run_sequential(args, logger):
             timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
 
         model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        if os.path.exists(os.path.join(model_path, "path", "agent.th")):
+            model_path = os.path.join(model_path, "path")
 
         logger.console_logger.info("Loading model from {}".format(model_path))
         learner.load_models(model_path)
@@ -207,6 +235,11 @@ def run_sequential(args, logger):
 
             learner.train(episode_sample, runner.t_env, episode)
 
+            if getattr(args, "train_task_assigner", False):
+                # task_assignerの学習
+                runner.task_assigner.process_end_episode()
+                if runner.task_assigner.update_ready():
+                    runner.task_assigner.update()
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
@@ -235,12 +268,15 @@ def run_sequential(args, logger):
                 args.local_results_path, "models", args.unique_token, str(runner.t_env)
             )
             # "results/models/{}".format(unique_token)
-            os.makedirs(save_path, exist_ok=True)
+            os.makedirs(os.path.join(save_path, "path"), exist_ok=True)
             logger.console_logger.info("Saving models to {}".format(save_path))
 
             # learner should handle saving/loading -- delegate actor save/load to mac,
             # use appropriate filenames to do critics, optimizer states
-            learner.save_models(save_path)
+            learner.save_models(os.path.join(save_path, "path"))
+            if getattr(args, "train_task_assigner", False):
+                runner.task_assigner.set_total_steps(runner.t_env)
+                runner.task_assigner.save_models(os.path.join(save_path, "task"))
 
         episode += args.batch_size_run
 

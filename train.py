@@ -10,7 +10,7 @@ command = [
 'python3 src/main.py --config=qmix --env-config=gymma with env_args.time_limit=500 env_args.key="drp_env:drp_safe-4agent_map_aoba00-v2" env_args.state_repre_flag="onehot_fov" > train_results/qmix_drp_safe-4agent_map_8x5-v2.txt 2>&1'
 ]
 
-num_runs = 5
+num_runs = 1
 maxpurocesses = 1
 running_processes = []
 
@@ -18,15 +18,15 @@ for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
     #iql,aoba00,16050000,unsafe
     command = (
-        f'python src/epymarl/src/main.py --config=mat --env-config=gymma --beat-interval=3600 '
+        f'python src/epymarl/src/main.py --config=mappo --env-config=gymma --beat-interval=3600 '
         f'with env_args.time_limit=500 '
-        f't_max=150050000 '
-        f'env_args.key="drp_env:drp_safe-10agent_map_aoba00-v2" '
+        f't_max=20050000 '
+        f'env_args.key="drp_env:drp_safe-5agent_map_8x5-v2" '
         f'env_args.state_repre_flag="onehot_fov" '
-        f'env_args.use_lare_path=False '
+        f'env_args.use_lare_path=True '
         f'env_args.use_lare_path_training=True '
         f'env_args.use_pretrained_lare_path=True '
-        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint.pth" '
+        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_8x5_3agents_5.0M_checkpoint.pth" '
         f'env_args.use_finetuning_lare_path=False '
         f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
         f'env_args.allow_reassign_before_pickup=False '
@@ -44,6 +44,8 @@ for i in range(num_runs):
         f'env_args.randomize_initial_active=False '
         f'env_args.min_active_agents=2 '
         f'env_args.max_active_agents=5 '
+        # 同時学習 (True で PPO タスク割当器を経路方策と同時に学習)
+        f'train_task_assigner=False '
         )
 
     # CPU バージョン (CUDA_VISIBLE_DEVICES="" で GPU を無効化)
@@ -54,10 +56,10 @@ for i in range(num_runs):
     #     f't_max=100050000 '
     #     f'env_args.key="drp_env:drp_safe-7agent_map_aoba00-v2" '
     #     f'env_args.state_repre_flag="onehot_fov" '
-    #     f'env_args.use_lare_path=False '
+    #     f'env_args.use_lare_path=True '
     #     f'env_args.use_lare_path_training=True '
     #     f'env_args.use_pretrained_lare_path=True '
-    #     f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba01_2agents_5.0M_checkpoint.pth" '
+    #     f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint.pth" '
     #     f'env_args.use_finetuning_lare_path=False '
     #     f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
     #     f'env_args.allow_reassign_before_pickup=False '
@@ -75,6 +77,8 @@ for i in range(num_runs):
     #     f'env_args.randomize_initial_active=False '
     #     f'env_args.min_active_agents=2 '
     #     f'env_args.max_active_agents=5 '
+    #     # 同時学習 (True で PPO タスク割当器を経路方策と同時に学習)
+    #     f'train_task_assigner=False '
     #     )
 
 

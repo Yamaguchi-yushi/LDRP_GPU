@@ -49,12 +49,16 @@ class ParallelRunner:
 
         self.log_train_stats_t = -100000
 
-    def setup(self, scheme, groups, preprocess, mac):
+        self.task_assigner = None
+        self.task_states = [None] * self.batch_size
+
+    def setup(self, scheme, groups, preprocess, mac, task_assigner=None):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
                                  preprocess=preprocess, device="cpu")
         self.mac = mac
         self.scheme = scheme
         self.groups = groups
+        self.task_assigner = task_assigner
         self.preprocess = preprocess
 
     def get_env_info(self):
@@ -80,8 +84,9 @@ class ParallelRunner:
             "obs": []
         }
         # Get the obs, state and avail_actions back
-        for parent_conn in self.parent_conns:
+        for idx, parent_conn in enumerate(self.parent_conns):
             data = parent_conn.recv()
+            self.task_states[idx] = data.get("task_state")
             pre_transition_data["state"].append(data["state"])
             pre_transition_data["avail_actions"].append(data["avail_actions"])
             pre_transition_data["obs"].append(data["obs"])
@@ -120,11 +125,22 @@ class ParallelRunner:
             self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 
             # Send actions to each env
+            task_assigns = {}
+            if self.task_assigner is not None:
+                for idx in envs_not_terminated:
+                    task_assigns[idx] = self.task_assigner.assign_task_from_state(
+                        self.task_states[idx], env_idx=idx, step_idx=self.t,
+                        test_mode=test_mode)
+
             action_idx = 0
             for idx, parent_conn in enumerate(self.parent_conns):
                 if idx in envs_not_terminated: # We produced actions for this env
                     if not terminated[idx]: # Only send the actions to the env if it hasn't terminated
-                        parent_conn.send(("step", cpu_actions[action_idx]))
+                        if self.task_assigner is not None:
+                            parent_conn.send(("step", {"pass": cpu_actions[action_idx],
+                                                       "task": task_assigns[idx]}))
+                        else:
+                            parent_conn.send(("step", cpu_actions[action_idx]))
                     action_idx += 1 # actions is not a list over every env
                     if idx == 0 and test_mode and self.args.render:
                         parent_conn.send(("render", None))
@@ -151,8 +167,14 @@ class ParallelRunner:
             for idx, parent_conn in enumerate(self.parent_conns):
                 if not terminated[idx]:
                     data = parent_conn.recv()
+                    self.task_states[idx] = data.get("task_state")
                     # Remaining data for this current timestep
                     post_transition_data["reward"].append((data["reward"],))
+
+                    if self.task_assigner is not None and not test_mode:
+                        r = data["info"].get("lare_task_proxy_reward", data["reward"]) \
+                            if data["info"].get("lare_task_is_trained", False) else data["reward"]
+                        self.task_assigner.buffer_add_rewards(r, data["terminated"], env_idx=idx)
 
                     episode_returns[idx] += data["reward"]
                     episode_lengths[idx] += 1
@@ -246,14 +268,16 @@ def env_worker(remote, env_fn):
                 # Rest of the data for the current timestep
                 "reward": reward,
                 "terminated": terminated,
-                "info": env_info
+                "info": env_info,
+                "task_state": env.get_task_state() if hasattr(env, "get_task_state") else None
             })
         elif cmd == "reset":
             env.reset()
             remote.send({
                 "state": env.get_state(),
                 "avail_actions": env.get_avail_actions(),
-                "obs": env.get_obs()
+                "obs": env.get_obs(),
+                "task_state": env.get_task_state() if hasattr(env, "get_task_state") else None
             })
         elif cmd == "close":
             env.close()

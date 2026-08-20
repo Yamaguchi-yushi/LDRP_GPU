@@ -681,6 +681,21 @@ class DrpEnv(gym.Env):
 
 	def get_obs(self):
 		return self.obs
+	
+	def get_task_state(self):
+		return {
+			"current_tasklist": copy.deepcopy(self.current_tasklist),
+			"assigned_tasks": copy.deepcopy(self.assigned_tasks),
+			"assigned_list": copy.deepcopy(self.assigned_list),
+			"obs_onehot": copy.deepcopy(self.obs_onehot),
+			"n_agents": self.n_agents,
+			"task_num": self.task_num,
+			"n_nodes": self.n_nodes,
+			"step_account": self.step_account,
+			"use_dynamic_agents": self.use_dynamic_agents,
+			"active": list(self.active),
+			"pending_off": list(self.pending_off),
+		}
 
 	def get_state(self): # unused
 		return self.s

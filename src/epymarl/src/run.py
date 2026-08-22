@@ -239,6 +239,10 @@ def run_sequential(args, logger):
                 # task_assignerの学習
                 runner.task_assigner.process_end_episode()
                 if runner.task_assigner.update_ready():
+                    ta_stats = runner.task_assigner.update()
+                    if isinstance(ta_stats, dict):
+                        for k, v in ta_stats.items():
+                            logger.log_stat(f"task_ppo/{k}", v, runner.t_env)
                     runner.task_assigner.update()
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)

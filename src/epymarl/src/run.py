@@ -242,8 +242,7 @@ def run_sequential(args, logger):
                     ta_stats = runner.task_assigner.update()
                     if isinstance(ta_stats, dict):
                         for k, v in ta_stats.items():
-                            logger.log_stat(f"task_ppo/{k}", v, runner.t_env)
-                    runner.task_assigner.update()
+                            logger.log_stat(f"task/{k}", v, runner.t_env)
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
         if (runner.t_env - last_test_T) / args.test_interval >= 1.0:

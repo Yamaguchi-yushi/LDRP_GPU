@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 import time
 import sys
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 import yaml
 
@@ -66,9 +68,32 @@ class Runner():
         args.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
         self.info_buffer = deque(maxlen=self.test_num)
-        self.path_planner = PolicyManager(self.args)
-        self.task_manager = TaskManager(self.args.task_assigner, self.args)
+        self.model_seed = int(getattr(args, "model_seed", 0) or 0)
         self.both_policy_manager = Policy(self.args)
+        # 実際に行動を決めるのは both_policy_manager 配下のインスタンス。
+        # ここで別途 new すると「行動する側」と「学習する側」が別物になり,
+        # 学習用の buffer に経験が一切入らない (set_test_mode も届かない) ため,
+        # 同じインスタンスを参照する
+        self.path_planner = self.both_policy_manager.path_planner
+        self.task_manager = self.both_policy_manager.task_manager
+
+        self.writer = None
+        if self.training:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = os.path.join("tmp_results", "task_ppo", f"{args.map_name}_{args.agent_num}_{args.path_planner}_{stamp}")
+            self.writer = SummaryWriter(log_dir=log_dir)
+            print(f"[Runner] TensorBoard log_dir: {log_dir}")
+
+    def _condition_id(self):
+        a = self.args
+        tag = f"_{a.method_tag}" if getattr(a, "method_tag", "") else ""
+        reassign = getattr(a, "reassign_before_pickup", "base")
+        env_tag = "safe" if getattr(a, "use__safe_env", True) else "unsafe"
+        env_re = "_envreassign" if getattr(a, "allow_reassign_before_pickup", False) else ""
+        train_n = getattr(a, "mat_model_agent_num", None) if a.path_planner == "mat_dec" else None
+        train = f"_train{train_n}" if train_n else ""
+        return (f"{a.map_name}/{a.agent_num}agent/"
+                f"{env_tag}_{a.path_planner}{tag}_{reassign}_{a.task_assigner}{train}{env_re}")
 
     def get_avail_actions(self):
         avail_actions = []
@@ -81,6 +106,7 @@ class Runner():
     def run_episode(self):
 
         obs_n = self.env.reset()
+        self.path_planner.reset_hidden()
         done = False
         episode_score = 0
         env_step = 0
@@ -152,30 +178,55 @@ class Runner():
     def run(self):
 
         step_tmp = 0
+        stats = None
+        assigner = self.task_manager.task_assigner
+
         #強化学習用
         if self.training:
-            self.task_manager.task_assigner.set_test_mode(False)
+            assigner.set_test_mode(False)
             while self.current_step < self.max_step:
                 episode_score, env_step, info = self.run_episode()
                 self.info_buffer.append(info)
                 self.current_step += env_step
                 step_tmp += env_step
 
-                self.task_manager.task_assigner.process_end_episode()
+                assigner.process_end_episode()
 
                 #training
-                
-                if self.task_manager.task_assigner.update_ready():
-                    a_loss, c_loss, e_loss = self.task_manager.task_assigner.update()
-                
+                if assigner.update_ready():
+                    stats = assigner.update()
+                    if self.writer is not None:
+                        for k, v in stats.items():
+                            self.writer.add_scalar(f"task/{k}", v, self.current_step)
+
+                if hasattr(assigner, "maybe_save_models"):
+                    assigner.maybe_save_models(self.current_step)
+
+                if self.writer is not None:
+                    for key in ("task_completion", "task_completion_per_agent", "busy_ratio",
+                                "deadhead_steps_per_task", "unassigned_len_avg", "step"):
+                        if key in info:
+                            self.writer.add_scalar(f"env/{key}", float(info[key]), self.current_step)
+
                 #log
                 if step_tmp > self.check_interval:
                     print("Current step:", self.current_step)
-                    print("a_loss:", a_loss.numpy(), "\nc_loss:", c_loss.numpy(), "\ne_loss:", e_loss.numpy())
+                    if stats is None:
+                        print("No update yet.")
+                    else:
+                        print("  " + "  ".join(f"{k}={v:.4f}" for k, v in stats.items()))
                     print("Average task completion:", np.mean([info["task_completion"] for info in self.info_buffer]))
                     step_tmp = 0
-                
 
+            if hasattr(assigner, "save_models"):
+                assigner.set_total_steps(self.current_step)
+                assigner.save_models(
+                    os.path.join(assigner._run_dir(), str(self.current_step), "task"))
+
+            # 学習用の確率サンプリングを解除してから評価ループへ。
+            # これが無いと学習後の評価が Categorical.sample() のまま走り,
+            # 評価値が本来の方策性能より不当に悪化する
+            assigner.set_test_mode(True)
             self.test_mode = True
 
 
@@ -253,5 +304,7 @@ class Runner():
         return
 
     def finish(self):
+        if self.writer is not None:
+            self.writer.close()
         self.env.close()
 

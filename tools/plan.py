@@ -26,6 +26,10 @@ MAP_HINT_RE = re.compile(r"<!--\s*map:\s*([A-Za-z0-9_]+)\s*-->", re.I)
 # 章の前に置かれた裸のマップ名 (メモでは "aoba00" / "8x5" とだけ書かれている)
 BARE_MAP_RE = re.compile(r"^\s*(?:map_)?([A-Za-z0-9][A-Za-z0-9_]{0,19})\s*$")
 ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*")
+
+# 1 条件あたりの seed 数。表の行数がこれより少なくても、この数まで枠を用意する
+# (「5 seed で学習する」という運用に合わせる)
+DEFAULT_SEEDS = 5
 # 区切り行 "| --- | --- |". ハイフンを必須にしないと、空欄だけの行
 # "|  |  |  |" まで区切りと誤判定して「未実行の枠」が消える
 SEP_RE = re.compile(r"^\|[\s:|-]*-[\s:|-]*\|$")
@@ -66,6 +70,14 @@ def norm_assign(text):
     if t in ("", "TP", "-"):
         return ""
     return t                                     # "PPO" など
+
+
+def norm_flag(text):
+    """T/F の列を bool に。空欄は「指定なし」= None (問わない)."""
+    t = str(text or "").strip().upper()
+    if t in ("", "-"):
+        return None
+    return t in ("T", "TRUE", "YES", "1")
 
 
 def norm_reassign(text):
@@ -156,6 +168,7 @@ def parse_plan(path):
                        "task_arrival": get("task arrival") or None,
                        "task_assign": norm_assign(get("task assign")),
                        "reassign": norm_reassign(reas_raw),
+                       "dynamic": norm_flag(get("dynamic")),
                        "seeds": [], "source_line": lineno}
                 conds.append(cur)
             elif cur is not None:
@@ -167,7 +180,10 @@ def parse_plan(path):
                                      "reassign": norm_reassign(reas_raw)})
 
     for c in conds:
-        c["want"] = len(c["seeds"]) or 5
+        # 表の行数が枠数。ただし 5 seed 運用なので、少なければ 5 まで埋める
+        c["want"] = max(len(c["seeds"]), DEFAULT_SEEDS)
+        while len(c["seeds"]) < c["want"]:
+            c["seeds"].append({"seed": None, "machine": None, "reassign": None})
     return conds
 
 
@@ -201,8 +217,10 @@ def matches(cond, d):
         return False
     if cond["task_assign"] != (d.get("task_assign") or ""):
         return False
-    # reassign は「指定なし (None)」なら問わない。seed 単位で違う表があるため
+    # reassign / dynamic は「指定なし (None)」なら問わない
     if cond["reassign"] is not None and cond["reassign"] != bool(d.get("reassign")):
+        return False
+    if cond.get("dynamic") is not None and cond["dynamic"] != bool(d.get("dynamic_agents")):
         return False
     return True
 

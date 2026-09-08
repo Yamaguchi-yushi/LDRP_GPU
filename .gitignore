@@ -31,3 +31,6 @@ tools/.notion_token
 # tools/: 接続先と実験計画は各自のローカルに置く (見本を .example として公開)
 tools/collect_config.yaml
 tools/plan.md
+
+# plan.md のバックアップ
+tools/plan.md.bak

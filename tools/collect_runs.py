@@ -1223,6 +1223,7 @@ def dashboard_data(rows, batches, errors):
             "setting": d.get("setting"), "lare_mode": d.get("lare_mode"),
             "method_tag": d.get("method_tag"), "task_arrival": d.get("task_arrival"),
             "task_assign": d.get("task_assign"), "reassign": d.get("reassign"),
+            "dynamic_agents": d.get("dynamic_agents"),
             "state": d.get("state"),
             "progress": d.get("progress"), "t_last": d.get("t_last"),
             "duration": d.get("duration"),

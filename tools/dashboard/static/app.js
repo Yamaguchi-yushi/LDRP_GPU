@@ -166,24 +166,35 @@ function renderTrain() {
       head = c.label;
       html += `<h3>${esc(head)}</h3><div class="wrap"><table class="cond">
         <tr><th>seed</th><th>machine</th><th>setting</th><th>algorithm</th>
-            <th>task arrival</th><th>task assign</th><th>reassign</th><th>状態</th></tr>`;
+            <th>task arrival</th><th>task assign</th><th>dynamic</th><th>状態</th></tr>`;
     }
     const want = c.want || WANT_DEFAULT;
     const done = c.slots.filter(s => s.run && s.run.state === "done"
                                      && !s.run.odd_params).length;
-    const odd = c.slots.filter(s => s.run && s.run.odd_params).length;
-    const tmax = c.slots.find(s => s.run && s.run.t_max_ok === false);
-    const reas = c.reassign == null ? "" : (c.reassign ? "T" : "F");
+    // 5 seed そろっていれば、失敗した run は出さない (メモにも書かない運用に合わせる)。
+    // 何件隠したかは条件行に出すので、黙って消えるわけではない
+    const filled = done >= want;
+    let slots = c.slots, hidden = 0;
+    if (filled) {
+      const before = slots.length;
+      slots = slots.filter(s => s.run && !s.run.odd_params
+                                && (s.run.state === "done" || s.run.state === "running"));
+      hidden = before - slots.length;
+    }
+    const odd = filled ? 0 : c.slots.filter(s => s.run && s.run.odd_params).length;
+    const tmax = slots.find(s => s.run && s.run.t_max_ok === false);
+    const dyn = c.dynamic == null ? "" : (c.dynamic ? "T" : "F");
 
     html += `<tr class="condrow"><td></td><td></td>
       <td>${esc(c.setting)}</td><td>${esc(ALGO(c.algo))}</td>
       <td>${esc(c.task_arrival)}</td><td>${esc(c.task_assign || "TP")}</td>
-      <td>${esc(reas)}</td>
-      <td class="${done >= want ? "" : "wrn"}">${done}/${want} done${
+      <td>${esc(dyn)}</td>
+      <td class="${filled ? "c-ok" : "wrn"}">${done}/${want} done${
         odd ? ` <span class="wrn">⚠要再実行 ${odd}</span>` : ""}${
-        tmax ? ` <span class="wrn">⚠t_max</span>` : ""}</td></tr>`;
+        tmax ? ` <span class="wrn">⚠t_max</span>` : ""}${
+        hidden ? ` <span class="mut">(失敗 ${hidden} 件を非表示)</span>` : ""}</td></tr>`;
 
-    c.slots.forEach(sl => {
+    slots.forEach(sl => {
       const r = sl.run;
       let st;
       if (!r) st = `<span class="mut">未実行</span>`;
@@ -201,7 +212,7 @@ function renderTrain() {
              + ` <span class="mut">${steps} で停止</span>`;
         if (r.odd_params) st += ` <span class="wrn">params✗</span>`;
       }
-      const sr = sl.reassign == null ? "" : (sl.reassign ? "T" : "F");
+      const sr = "";
       html += `<tr><td class="${sl.unplanned_seed ? "wrn" : (r ? "" : "mut")}">${
           esc(sl.seed || "—")}${sl.unplanned_seed ? " *" : ""}</td>
         <td class="mut">${esc((r && r.machine) || sl.machine || "")}</td>

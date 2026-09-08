@@ -65,11 +65,14 @@ class State(object):
         return CR.load_config(path) if os.path.exists(path) else {}
 
     # --- 計画 -----------------------------------------------------------
-    def plan_view(self, rows):
+    def plan_view(self, rows, shaped):
         """**表は計画から作る**。実績はそこに埋めていく.
 
         計画に無い run は conditions 表には出さない (実行中セクションには出る)。
         こうすると「あと何を回せばよいか」が表そのものになる。
+
+        slots に入れる run は **dashboard_data() が整形したもの** (shaped)。
+        derive() の生レコードを入れると odd_params などが欠けて画面側が壊れる。
         """
         path = os.path.expanduser(self.args.plan)
         if not os.path.exists(path):
@@ -93,8 +96,9 @@ class State(object):
                 sd = str(sl["seed"]) if sl["seed"] else None
                 run = None
                 if sd and by_seed.get(sd):
-                    run = by_seed[sd].pop(0)
-                    used.add(run["uid"])
+                    d = by_seed[sd].pop(0)
+                    used.add(d["uid"])
+                    run = shaped.get(d["uid"])
                 slots.append({"seed": sd, "machine": sl.get("machine"),
                               "reassign": sl.get("reassign"), "run": run})
             # 計画に無い seed で回っているもの (捨てずに「計画外の seed」として出す)
@@ -103,12 +107,13 @@ class State(object):
                 for d in ds:
                     used.add(d["uid"])
                     extra.append({"seed": sd, "machine": d.get("machine"),
-                                  "run": d, "unplanned_seed": True})
+                                  "run": shaped.get(d["uid"]), "unplanned_seed": True})
             out.append({
                 "label": PLAN.label(c), "map": c["map"], "agents": c["agents"],
                 "t_max_m": c["t_max_m"], "setting": c["setting"],
                 "algo": c["algo"], "task_arrival": c["task_arrival"],
                 "task_assign": c["task_assign"], "reassign": c["reassign"],
+                "dynamic": c.get("dynamic"),
                 "want": c["want"], "slots": slots + extra,
             })
         # マップ名 -> 台数 -> t_max の順に並べる
@@ -127,9 +132,10 @@ class State(object):
         min_steps = conf.get("min_steps", 1e6)
         if min_steps:
             rows = [d for d in rows if (d.get("t_max") or 0) >= min_steps]
-        plan, used = self.plan_view(rows)
         with self.lock:
             data = CR.dashboard_data(rows, self.batches, self.errors)
+            shaped = dict((r["uid"], r) for r in data["runs"])
+            plan, used = self.plan_view(rows, shaped)
             for r in data["runs"]:
                 r["in_plan"] = r["uid"] in used
             data["plan"] = plan

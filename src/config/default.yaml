@@ -16,6 +16,9 @@ mat_model_agent_num: null
 # --- 実行制御 ---
 time_limit: 1000
 test_num: 1000
+model_seed: 0
+save_eval_json: True
+use_safe_env: True
 # タスク割当の選択肢・結果を stdout に出力 (実際に何かを割当てたステップだけ)
 debug_task_assign: False
 allow_reassign_before_pickup: False  # True にすると pickup 前のタスクを再割当可能 (SafeEnv の保護は効く)
@@ -48,7 +51,7 @@ rand_p_max: 0.10         # bernoulli p の上限
 # 設定するとエピソード k の乱数が (base + k) だけで決まり、条件間でタスク列・
 # 開始位置が完全に一致する (ペア比較が可能になる)。null なら従来動作。
 # 学習時は多様性が失われるので null にすること。
-episode_seed_base: null
+episode_seed_base: 0
 
 # --- エージェント数の動的変化 ---
 use_dynamic_agents: False
@@ -56,6 +59,9 @@ randomize_initial_active: False
 min_active_agents: 2
 max_active_agents: null
 initial_active_num: null
+# station ノードを pickup/dropoff から除外するか。
+# null = use_dynamic_agents に連動 (動的なら除外)。
+# 動的と固定を DiD でペア比較する評価では、両条件に True を明示してタスク列を揃える。
 exclude_station_from_tasks: null
 
 # =============================================================================

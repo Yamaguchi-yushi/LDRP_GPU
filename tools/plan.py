@@ -16,12 +16,16 @@ Notion で管理している表を**そのまま貼り付けられる**形式に
 **書かなければ「どのマップでも一致」**として扱う (推測しない)。
 """
 
+import glob
+import os
 import re
 import sys
 
+# 末尾の注記 "(旧)" "(保留)" は無視する。これを許さないと見出しとして認識されず、
+# 直前の章に条件行が吸い込まれて別の章の条件として数えられてしまう
 HEAD_RE = re.compile(
     r"^\s{0,3}#{1,6}\s+(?P<n>\d+)\s*agent\s*(?P<map>[A-Za-z0-9_]*?)\s*"
-    r"(?P<t>[\d.]+)\s*M\s*$", re.I)
+    r"(?P<t>[\d.]+)\s*M\s*(?:[（(][^)）]*[)）]\s*)?$", re.I)
 MAP_HINT_RE = re.compile(r"<!--\s*map:\s*([A-Za-z0-9_]+)\s*-->", re.I)
 # 章の前に置かれた裸のマップ名 (メモでは "aoba00" / "8x5" とだけ書かれている)
 BARE_MAP_RE = re.compile(r"^\s*(?:map_)?([A-Za-z0-9][A-Za-z0-9_]{0,19})\s*$")
@@ -187,6 +191,67 @@ def parse_plan(path):
     return conds
 
 
+# ---------------------------------------------------------------------------
+# 複数の計画ファイル (plan_AAMAS.md / plan_ablation.md / ...)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PLAN_GLOB = "tools/plans/*.md"
+LEGACY_PLAN = "tools/plan.md"
+
+
+def plan_name_of(path):
+    """ファイル名から計画名を作る.
+
+    plan_AAMAS.md -> AAMAS / ablation.md -> ablation / plan.md -> plan
+    """
+    base = os.path.basename(path)
+    if base.lower().endswith(".md"):
+        base = base[:-3]
+    if base.lower().startswith("plan_"):
+        base = base[5:]
+    return base or "plan"
+
+
+def find_plans(spec=None):
+    """計画ファイルを列挙する.
+
+    spec は glob 文字列・パスのリスト・None のいずれか。None のときは
+    tools/plans/*.md を見て、無ければ従来の tools/plan.md にフォールバックする
+    (1 枚運用のままでも壊れないようにするため)。
+    """
+    if spec is None:
+        spec = [DEFAULT_PLAN_GLOB]
+    elif isinstance(spec, str):
+        spec = [spec]
+    found = []
+    for pat in spec:
+        pat = os.path.expanduser(pat)
+        hits = sorted(glob.glob(pat)) if glob.has_magic(pat) else (
+            [pat] if os.path.exists(pat) else [])
+        for h in hits:
+            if h not in found:
+                found.append(h)
+    if not found and os.path.exists(LEGACY_PLAN):
+        found = [LEGACY_PLAN]
+    return found
+
+
+def parse_plans(paths):
+    """複数の計画を読み、各条件に plan / plan_file を付けて 1 本のリストで返す.
+
+    **1 つの run が複数の計画に一致してよい** (baseline は AAMAS でも
+    アブレーションでも使う)。排他にはしない。
+    """
+    out = []
+    for path in paths:
+        name = plan_name_of(path)
+        for c in parse_plan(path):
+            c["plan"] = name
+            c["plan_file"] = path
+            out.append(c)
+    return out
+
+
 def cond_key(agents, map_name, t_max_m, algo, setting, arrival, assign, reassign):
     """計画と実績を突き合わせるキー. map が None の計画はマップを問わない."""
     return (agents, map_name, round(float(t_max_m)), algo or None,
@@ -226,17 +291,23 @@ def matches(cond, d):
 
 
 def label(cond):
-    parts = ["%dagent" % cond["agents"]]
+    """見出し文字列. **マップ -> 台数 -> t_max** の順 (ソート順と揃える).
+
+    台数を先に置くと "5agent" と "10agent" で桁がずれ、マップ名の開始位置が
+    行ごとに動いて読みにくい。マップを先頭に固定して列を揃える。
+    """
+    parts = []
     if cond["map"]:
         parts.append(cond["map"])
+    parts.append("%dagent" % cond["agents"])
     parts.append("%gM" % cond["t_max_m"])
     return " ".join(parts)
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "tools/plan.md"
-    conds = parse_plan(path)
-    print("%s: %d 条件" % (path, len(conds)))
+    paths = sys.argv[1:] or find_plans()
+    conds = parse_plans(paths)
+    print("%s: %d 条件" % (", ".join(paths), len(conds)))
     for c in conds:
         seeds = [s["seed"] for s in c["seeds"] if s["seed"]]
         print("  %-26s %-24s %-8s %-16s assign=%-4s reas=%s  seed %d/%d"

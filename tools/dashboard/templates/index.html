@@ -24,6 +24,7 @@
 <!-- ── 学習の進捗 ───────────────────────────────────────────── -->
 <section id="pane-train">
   <div class="bar filters">
+    <span><label>計画</label><select id="t-plan"></select></span>
     <span><label>machine</label><select id="t-machine"></select></span>
     <span><label>map</label><select id="t-map"></select></span>
     <span><label>N</label><select id="t-agents"></select></span>
@@ -34,6 +35,8 @@
     </select></span>
     <span class="right mut" id="t-counts"></span>
   </div>
+
+  <div id="t-stale"></div>
 
   <h2>machines</h2>
   <div class="wrap"><table id="t-mach"></table></div>

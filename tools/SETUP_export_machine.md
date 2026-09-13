@@ -121,8 +121,7 @@ LDRP_runs/黒/
 ├── runs.jsonl        全 run のレコード (1 run 1 行)
 └── models/
     └── {algo}_{map}_{N}agents_seed{S}_step{T}/
-        ├── path/agent.th      評価に使う方策 (RNNAgent の state_dict)
-        └── path/mixer.th      QMIX の mixer (学習用)
+        └── path/agent.th      評価に使う方策 (RNNAgent の state_dict)
 ```
 
 | 項目 | 内容 |
@@ -130,9 +129,14 @@ LDRP_runs/黒/
 | 対象の run | `~/LDRP/src/epymarl/{results,tmp_results}/sacred` 配下すべて |
 | モデルを出す run | **`done` (完遂) のみ**。`failed` / `stalled` は出さない |
 | モデルのステップ | **最終 checkpoint のみ**。途中のものは出さない |
-| 除外するファイル | `opt.th` / `agent_opt.th` / `critic_opt.th` (optimizer state。評価に不要でサイズが数倍) |
+| 除外するファイル | `opt.th` / `agent_opt.th` / `critic_opt.th` (optimizer state) と `mixer.th`。どれも評価には使わない |
 | 再送 | **しない**。すでに共有フォルダにあるものは飛ばす (初回だけ転送) |
-| 容量の目安 | モデル 1 件 平均 0.71MB。実測 39 件で 31.3MB |
+| 容量の目安 | モデル 1 件 平均 0.12MB。実測 39 件で 4.8MB |
+
+`mixer.th` は QMIX の学習を再開するときにしか使わず、評価側は読まない。
+それでいて `agent.th` の 15 倍あり (平均 1.24MB 対 80KB)、以前は共有フォルダの
+93% を占めていたので既定で外した。元のマシンには残っているので、再開したく
+なったら `--fetch-mixer` を付けて送り直せる。
 
 `runs.jsonl` には各 run の `config.json` が**全文**入る (86 キー)。
 `lr` / `gamma` / `batch_size` / `mixer` / LaRe のフラグなどが白側で見える。

@@ -65,6 +65,7 @@ $("tab-eval").onclick = () => setTab("eval");
 async function loadTrain() {
   TRAIN = await api("/api/train");
   const runs = TRAIN.runs || [];
+  fillSelect($("t-plan"), uniq(TRAIN.plan || [], "plan"));
   fillSelect($("t-machine"), uniq(runs, "machine"));
   fillSelect($("t-map"), uniq(runs, "map"));
   fillSelect($("t-agents"), uniq(runs, "agents"));
@@ -93,6 +94,34 @@ function trainRows() {
     (!g("t-state") || r.state === g("t-state")));
 }
 
+// 開いたままにしておく差分パネル。innerHTML を作り直しても消えないよう、
+// 条件そのものから作ったキーで覚える (index だと絞り込みでずれる)
+// 収集経路の内部名をそのまま出すと "drop" が「落ちている」と読めてしまうので、
+// 画面には日本語を出す (値そのものは API のまま)
+const VIA = { local: "このPC", ssh: "SSH", drop: "共有フォルダ" };
+
+const OPEN_DIFF = new Set();
+const condKey = c => [c.plan, c.label, c.setting, c.algo,
+                      c.task_assign || "TP", c.dynamic ? 1 : 0].join("|");
+
+// クリックは委譲で受ける。表は再描画のたびに作り直されるので個別の onclick は付けない
+document.addEventListener("click", ev => {
+  const b = ev.target.closest && ev.target.closest("[data-diff]");
+  if (!b) return;
+  // data-diff は **描画ごとの通し番号**。条件名をそのまま入れると空白や "|" が
+  // 混ざってセレクタのエスケープが要るので、番号で引いて実体はそこから読む
+  const n = b.getAttribute("data-diff");
+  const row = document.querySelector('tr.diffrow[data-n="' + n + '"]');
+  if (!row) return;
+  const show = row.hidden;
+  row.hidden = !show;
+  const k = row.getAttribute("data-key");
+  if (show) { OPEN_DIFF.add(k); row.scrollIntoView({ block: "nearest" }); }
+  else OPEN_DIFF.delete(k);
+  document.querySelectorAll('[data-diff="' + n + '"]')
+    .forEach(el => el.setAttribute("aria-expanded", show ? "true" : "false"));
+});
+
 function renderTrain() {
   if (!TRAIN) return;
   const R = trainRows();
@@ -109,19 +138,52 @@ function renderTrain() {
     else if (r.state === "done") m.done++;
     else if (["stalled", "failed", "short"].includes(r.state)) m.bad++;
   });
+  // 「情報がいつのものか」を machine 表の主役にする。これが無いと
+  // 「そのマシンが黙っている」ことに気づけず、古い情報を現状だと誤読する
   $("t-mach").innerHTML =
-    "<tr><th>machine</th><th>実行中</th><th>予約待ち</th><th>完了</th>"
-    + "<th>異常</th><th>次の完了</th></tr>"
+    // 「予約待ち」列は train.py が予約ファイルを書かないと埋まらないので出さない
+    // (design/run_collector.md §12.3 が入ったら戻す)
+    "<tr><th>machine</th><th>いつの情報か</th><th>実行中</th>"
+    + "<th>完了</th><th>モデル回収</th><th>異常</th><th>次の完了</th></tr>"
     + (Object.keys(byM).sort().map(k => {
       const m = byM[k], b = (TRAIN.machines || {})[k];
-      const res = b ? `+${b.reserved}${b.unknown ? "?" : ""} <span class="mut">(train.py x${b.batches})</span>` : "-";
-      return `<tr><td>${esc(k)}</td><td class="num">${m.run}</td>
-        <td>${res}</td><td class="num">${m.done}</td>
+      let fresh = `<span class="mut">-</span>`;
+      if (b && b.data_age_sec != null) {
+        const via = VIA[b.via] || b.via || "";
+        // 「いつもの間隔」を併記する。3h という固定値より、
+        // 「通常 60 分なのに 123 分」の方が異常だと分かりやすい
+        const cad = b.interval_sec
+          ? `通常 ${dur(b.interval_sec)} 間隔` : (via || "");
+        const v = cad ? ` <span class="mut">(${esc(cad)}${
+          via && b.interval_sec ? " / " + esc(via) : ""})</span>` : "";
+        fresh = b.stale_data
+          ? `<span class="err">${dur(b.data_age_sec)} 前</span>${v}`
+          : `<span class="mut">${dur(b.data_age_sec)} 前${v}</span>`;
+      }
+      // 「完了した run のうち何本のモデルを手元に持っているか」
+      const nd = (b && b.done) || 0, ns = (b && b.saved) || 0;
+      const got = nd ? `<span class="${ns >= nd ? "c-ok" : "wrn"}">${ns}/${nd}</span>`
+                     : `<span class="mut">-</span>`;
+      return `<tr><td>${esc(k)}</td><td>${fresh}</td><td class="num">${m.run}</td>
+        <td class="num">${m.done}</td><td class="num">${got}</td>
         <td class="num ${m.bad ? "err" : "mut"}">${m.bad}</td>
         <td class="mut">${when(m.eta)}</td></tr>`;
-    }).join("") || `<tr><td class="mut" colspan="6">なし</td></tr>`);
+    }).join("") || `<tr><td class="mut" colspan="7">なし</td></tr>`);
 
-  // running now
+  // 情報が古いホストがあれば見出しで知らせる (run の状態と混ぜない)
+  const quiet = Object.entries(TRAIN.machines || {}).filter(([, b]) => b.stale_data);
+  $("t-stale").innerHTML = quiet.map(([k, b]) => {
+    const norm = b.interval_sec
+      ? `通常は ${dur(b.interval_sec)} 間隔で届きます。` : "";
+    return `<div class="err">⚠ ${esc(k)} から ${dur(b.data_age_sec)} 情報が届いていません。`
+      + `${norm}表示は最後に見えた時点のもので、いま動いているかは不明です`
+      + `<span class="mut"> — そのマシンがスリープ / 停止しているか、`
+      + `iCloud の同期が止まっている可能性があります</span></div>`;
+  }).join("");
+
+  // running now。observed_at 基準にしたので "running" は
+  // **最後に観測できた時点で走っていた** という意味になる。
+  // 情報が古い場合はそのことを行に添える (止まったとは断定しない)
   const run = R.filter(r => r.state === "running")
     .sort((a, b) => (a.eta || "9") < (b.eta || "9") ? -1 : 1);
   $("t-run").innerHTML =
@@ -134,7 +196,8 @@ function renderTrain() {
         <td class="num">${dur(r.remaining_sec)}</td><td>${when(r.eta)}</td>
         <td>${esc(r.machine)}</td>
         <td>${r.agents}ag ${esc(r.map)} ${esc(r.algo)} ${esc(r.setting)}</td>
-        <td class="mut">${esc(r.seed)}${r.in_plan ? "" : ' <span class="wrn">計画外</span>'}</td>
+        <td class="mut">${esc(r.seed)}${r.in_plan ? "" : ' <span class="wrn">計画外</span>'}${
+          r.stale_data ? ` <span class="wrn" title="このホストからの情報が古い">情報 ${dur(r.data_age_sec)} 前</span>` : ""}</td>
         <td class="mut">${esc(r.duration)}</td></tr>`).join("")
       : `<tr><td class="mut" colspan="8">なし</td></tr>`);
 
@@ -144,6 +207,7 @@ function renderTrain() {
   const ALGO = a => String(a || "").toUpperCase();
   const g = id => $(id).value;
   const plan = (TRAIN.plan || []).filter(c =>
+    (!g("t-plan") || c.plan === g("t-plan")) &&
     (!g("t-map") || c.map === g("t-map")) &&
     (!g("t-agents") || String(c.agents) === g("t-agents")) &&
     (!g("t-algo") || c.algo === g("t-algo")) &&
@@ -159,12 +223,23 @@ function renderTrain() {
     html += `<div class="mut">計画外の run: ${nOut} 件 `
           + `<span class="mut">(表には出しません。running / machines には出ます)</span></div>`;
 
-  let head = null;
+  let head = null, planHead = null, diffN = 0;
+  const multi = new Set(plan.map(c => c.plan)).size > 1;
   plan.forEach(c => {
+    // 複数の計画を読んでいるときだけ計画名の見出しを出す (1 枚運用では邪魔になる)
+    if (multi && c.plan !== planHead) {
+      if (head !== null) { html += `</table></div>`; head = null; }
+      planHead = c.plan;
+      html += `<h2 class="planhead">${esc(c.plan)}</h2>`;
+    }
     if (c.label !== head) {
       if (head !== null) html += `</table></div>`;
       head = c.label;
-      html += `<h3>${esc(head)}</h3><div class="wrap"><table class="cond">
+      // マップ / 台数 / t_max を別々の span にして列を揃える (label は行の同一判定用)
+      html += `<h3><span class="g-map">${esc(c.map || "")}</span>`
+            + `<span class="g-n">${c.agents} agent</span>`
+            + `<span class="g-t">${c.t_max_m}M</span></h3>`
+            + `<div class="wrap"><table class="cond">
         <tr><th>seed</th><th>machine</th><th>setting</th><th>algorithm</th>
             <th>task arrival</th><th>task assign</th><th>dynamic</th><th>状態</th></tr>`;
     }
@@ -185,6 +260,19 @@ function renderTrain() {
     const tmax = slots.find(s => s.run && s.run.t_max_ok === false);
     const dyn = c.dynamic == null ? "" : (c.dynamic ? "T" : "F");
 
+    // 差分があるときだけ押せるボタンを出す。押すと下の隠し行が開く。
+    // **5 seed そろっている条件では出さない**。揃っていれば余分な run は使わないので、
+    // パラメータが割れていても直す必要がない (失敗行を隠すのと同じ運用)
+    const hasDiff = !filled && !!(c.param_diff && c.param_diff.length);
+    const dkey = condKey(c);
+    const dn = hasDiff ? ++diffN : 0;
+    const opened = OPEN_DIFF.has(dkey);
+    const diffBtn = hasDiff
+      ? ` <button type="button" class="diffbtn" data-diff="${dn}"`
+        + ` aria-expanded="${opened ? "true" : "false"}"`
+        + ` title="どのパラメータが違うか出す">違いを見る (${c.param_diff.length})</button>`
+      : "";
+
     html += `<tr class="condrow"><td></td><td></td>
       <td>${esc(c.setting)}</td><td>${esc(ALGO(c.algo))}</td>
       <td>${esc(c.task_arrival)}</td><td>${esc(c.task_assign || "TP")}</td>
@@ -192,7 +280,29 @@ function renderTrain() {
       <td class="${filled ? "c-ok" : "wrn"}">${done}/${want} done${
         odd ? ` <span class="wrn">⚠要再実行 ${odd}</span>` : ""}${
         tmax ? ` <span class="wrn">⚠t_max</span>` : ""}${
-        hidden ? ` <span class="mut">(失敗 ${hidden} 件を非表示)</span>` : ""}</td></tr>`;
+        hidden ? ` <span class="mut">(失敗 ${hidden} 件を非表示)</span>` : ""}${
+        diffBtn}</td></tr>`;
+
+    // パラメータが割れている条件は、どのキーがどう違うかを隠し行に持つ。
+    // ハッシュだけ出しても「何を直して回し直すか」が分からない
+    if (hasDiff) {
+      const hs = c.param_hashes || [];
+      html += `<tr class="diffrow" data-n="${dn}" data-key="${esc(dkey)}"${
+        opened ? "" : " hidden"}>
+        <td colspan="8">
+        <div class="wrn">パラメータが ${hs.length} 通りに割れています `
+        + `(${c.param_diff.length} キー)</div>
+        <table class="pdiff"><tr><th>key</th>`
+        + hs.map(h => `<th>${esc(h.hash)}<br><span class="mut">`
+                    + `${h.seeds.length} seed</span></th>`).join("")
+        + `</tr>`
+        + c.param_diff.map(d => `<tr><td>${esc(d.key)}</td>`
+            + d.vals.map(v => `<td>${esc(v)}</td>`).join("") + `</tr>`).join("")
+        + `</table>
+        <div class="mut">seed: `
+        + hs.map(h => `${esc(h.hash)} = ${h.seeds.map(esc).join(", ")}`).join(" / ")
+        + `</div></td></tr>`;
+    }
 
     slots.forEach(sl => {
       const r = sl.run;
@@ -201,16 +311,38 @@ function renderTrain() {
       else {
         const pct = ((r.progress || 0) * 100).toFixed(0);
         const steps = `${M(r.t_last)}M / ${M(r.t_max)}M`;
+        // 「何ステップまで行ったか」の隣に「いつ終わったか」を必ず出す。
+        // 終了時刻が無いと、同じ条件の seed が何日にまたがって回ったか分からない
+        const fin = r.stop_at
+          ? ` <span class="fin" title="${esc(r.stop_at)}">${when(r.stop_at)} 完了</span>` : "";
+        const stopped = r.stop_at
+          ? ` <span class="fin" title="${esc(r.stop_at)}">${when(r.stop_at)}</span>` : "";
+        // モデルを手元に持っているか。done なのに無いものを見つけられるようにする
+        let got = "";
+        if (r.state === "done") {
+          if (r.saved && r.saved.length)
+            got = ` <span class="c-ok" title="保管済み: ${esc(r.saved.join(", "))}">`
+                + `📦${r.saved.length > 1 ? " " + r.saved.join("+") : ""}</span>`;
+          else if (!r.has_model)
+            got = ` <span class="mut" title="この run にはモデルファイルが残っていません">モデル無し</span>`;
+          else
+            got = ` <span class="wrn" title="取りに行けば回収できます">未回収</span>`;
+        }
         if (r.state === "done")
-          st = `<span class="c-ok">✔ done</span> <span class="mut">${M(r.t_max)}M</span>`;
+          st = `<span class="c-ok">✔ done</span> <span class="mut">${M(r.t_max)}M</span>${fin}${got}`;
         else if (r.state === "running")
           st = `<span class="pb"><i style="width:${pct}%"></i></span> ${pct}%`
              + ` <span class="steps">${steps}</span>`
-             + ` <span class="mut">残り ${dur(r.remaining_sec)} → ${when(r.eta)}</span>`;
+             + ` <span class="mut">残り ${dur(r.remaining_sec)} → ${when(r.eta)} 終了予定</span>`;
         else
           st = `<span class="err">✖ ${esc(r.state)}</span>`
-             + ` <span class="mut">${steps} で停止</span>`;
-        if (r.odd_params) st += ` <span class="wrn">params✗</span>`;
+             + ` <span class="mut">${steps} で停止</span>${stopped}`;
+        // params✗ の横から直接開けるようにする (条件行まで目を動かさずに済む)
+        if (r.odd_params)
+          st += ` <span class="wrn">params✗</span>${hasDiff
+            ? ` <button type="button" class="diffbtn" data-diff="${dn}"`
+              + ` aria-expanded="${OPEN_DIFF.has(dkey) ? "true" : "false"}"`
+              + ` title="どのパラメータが違うか出す">違いを見る</button>` : ""}`;
       }
       const sr = "";
       html += `<tr><td class="${sl.unplanned_seed ? "wrn" : (r ? "" : "mut")}">${

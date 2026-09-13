@@ -17,11 +17,13 @@
 from __future__ import print_function
 
 import argparse
+import collections
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
@@ -158,7 +160,10 @@ HASH_EXCLUDE_TOP = frozenset((
     "repeat_id", "evaluate", "render", "save_replay", "use_tensorboard",
     "use_cuda", "save_model", "save_model_interval",
 ))
-HASH_EXCLUDE_ENV = frozenset(("seed",))
+# lare_device は cpu / cuda の実行環境であって実験条件ではない。
+# GPU 機と Mac で同じ条件を回すと必ず割れるので外す
+HASH_EXCLUDE_ENV = frozenset(("seed", "lare_device"))
+
 
 # 「有効化フラグが off のとき無視されるキー」. 消し忘れが残っていても
 # 同一条件と判定できるようにする (実際に use_lare_path=False の run に
@@ -209,6 +214,53 @@ def param_fields(cfg_full, env_full):
 HASH_IGNORE_FIELDS = frozenset((
     "cfg.task_num",        # env が self.task_num = 10 を固定で持つ (drp_env.py ~168 行)
 ))
+
+
+def param_diff(rows):
+    """同じ条件のはずの run 群で **値が割れているキーだけ** を抜き出す.
+
+    返り値: [(key, {param_hash: 値}), ...] をキー名順に。
+    param_fields() を通すので、ハッシュの判定と必ず一致する
+    (別々に正規化すると「ハッシュは同じなのに差分が出る」ことが起きる)。
+    """
+    by_hash = {}
+    seeds = {}
+    for r in rows:
+        h = r.get("param_hash")
+        seeds.setdefault(h, []).append(str(r.get("seed")))
+        if h not in by_hash:
+            by_hash[h] = param_fields(r.get("cfg"), r.get("env"))
+    keys = set()
+    for f in by_hash.values():
+        keys |= set(f)
+    out = []
+    for k in sorted(keys - set(HASH_IGNORE_FIELDS)):
+        vals = dict((h, f.get(k)) for h, f in by_hash.items())
+        uniq = set(json.dumps(v, sort_keys=True, default=str) for v in vals.values())
+        if len(uniq) > 1:
+            out.append((k, vals))
+    return out, seeds
+
+
+def fmt_param_diff(rows, limit=8, indent="    "):
+    """param_diff を人が読める行のリストにする."""
+    diffs, seeds = param_diff(rows)
+    if not diffs:
+        return []
+    order = sorted(seeds, key=lambda h: (-len(seeds[h]), str(h)))
+    lines = [indent + "%-26s %s" % ("(key)", "  ".join(
+        "%s[%d]" % (h, len(seeds[h])) for h in order))]
+    for k, vals in diffs[:limit]:
+        cells = []
+        for h in order:
+            v = vals.get(h)
+            t = "-" if v is None else str(v)
+            cells.append(t if len(t) <= 22 else t[:19] + "...")
+        lines.append(indent + "%-26s %s" % (k, "  ".join(cells)))
+    if len(diffs) > limit:
+        lines.append(indent + "... 他 %d キー (--diff-params で全部出す)"
+                     % (len(diffs) - limit))
+    return lines
 
 
 def param_hash(cfg_full, env_full):
@@ -523,23 +575,34 @@ def cmd_scan(args):
 # ===========================================================================
 
 def parse_dt(s):
-    """sacred の時刻は naive UTC。aware な datetime に変換する."""
+    """時刻文字列を aware な UTC の datetime にする.
+
+    受ける形は 2 通り:
+      - sacred が書く naive UTC   "2026-09-08T07:05:15.123456"
+      - こちらが書く aware な UTC "2026-09-08T07:05:15+00:00"
+
+    後者は s[:26] で切ると "+00:00" が残って strptime が落ちるので、
+    先に fromisoformat を試す (秒が割り切れる時刻は .%f が付かず 25 文字になる)。
+    """
     if not s:
         return None
+    from datetime import timezone
     s = str(s).replace("Z", "")
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(s[:26], fmt)
-            break
-        except ValueError:
-            continue
-    else:
-        return None
+    dt = None
     try:
-        from datetime import timezone
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(s[:26], fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
-    except ImportError:
-        return dt
+    return dt.astimezone(timezone.utc)
 
 
 def now_utc():
@@ -617,7 +680,13 @@ def _num(v):
             return None
 
 
-def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None):
+# 観測からこれだけ経ったら「情報が古い」と印を付ける (既定 3 時間)。
+# drop は 1 時間ごとのエクスポート + iCloud 同期なので、2 回落としたら気づけるあたり
+DATA_STALE_SEC = 3 * 3600
+
+
+def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
+           data_stale_sec=DATA_STALE_SEC):
     """スキャン結果から Notion 列に対応する派生フィールドを作る."""
     cfg, env = rec.get("cfg") or {}, rec.get("env") or {}
     d = dict(rec)
@@ -682,6 +751,20 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None):
     beat = parse_dt(rec.get("heartbeat"))
     d["start_dt"], d["stop_dt"], d["beat_dt"] = start, stop, beat
 
+    # そのホストを最後に観測できた時刻。
+    # observed_at が無いのは observed_at 導入前に書かれたキャッシュ。
+    # そこで "今" を入れると **鮮度 0 時間** に化けて「届いていない」を隠すので、
+    # 状態判定だけ従来どおり now にフォールバックし、鮮度は **不明 (None)** にする
+    obs = parse_dt(rec.get("observed_at"))
+    d["observed_dt"] = obs
+    d["observed_via"] = rec.get("observed_via")
+    # 情報そのものの古さ。**run の状態とは別の軸**として持つ。
+    # これを state に混ぜると「止まった」と「届いていない」が区別できなくなる
+    d["data_age_sec"] = (None if obs is None
+                         else max(0.0, (now_utc() - obs).total_seconds()))
+    if obs is None:
+        obs = now_utc()
+
     status = (rec.get("sacred_status") or "").upper()
     # epymarl は `while t_env <= t_max` を抜けた直後に "Finished Training" を出す
     # (src/epymarl/src/run.py). t_env のログは log_interval 毎にしか出ないので、
@@ -702,10 +785,18 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None):
         d["state"] = "failed"
     elif status == "RUNNING":
         last = beat or stop or start
-        stale = (last is None) or (now_utc() - last > timedelta(minutes=stale_minutes))
+        # **観測時刻**を基準にする。"今" と比べると、drop ホストのエクスポートが
+        # 遅れたぶんだけ heartbeat が古く見え、走っている run が stalled に化ける
+        stale = (last is None) or (obs - last > timedelta(minutes=stale_minutes))
         d["state"] = "stalled" if stale else "running"
     else:
         d["state"] = "unknown"
+
+    # 観測が古いホストの run は「そう見えているだけ」かもしれない、と印を付ける。
+    # state は変えない (集計やモデル公開のゲートに波及させないため)
+    d["stale_data"] = bool(d["state"] in ("running", "stalled")
+                           and d["data_age_sec"] is not None
+                           and d["data_age_sec"] > data_stale_sec)
 
     if method_tag_map is None:
         tag_map = DEFAULT_METHOD_TAG_BY_LARE_MODE
@@ -824,7 +915,7 @@ def _collect_ssh_run(host, py, remote_args, timeout, verbose, multiplex):
     cmd = ["ssh", "-o", "BatchMode=yes"]
     for opt in host.get("ssh_options") or []:
         cmd += ["-o", opt]
-    cmd += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 10))]
+    cmd += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 8))]
     cmd += multiplex_options(multiplex)
     if host.get("port"):
         cmd += ["-p", str(host["port"])]
@@ -876,6 +967,15 @@ def collect_drop(host, drop_root, stale_hours=24):
     if not os.path.exists(path):
         return [], "no runs.jsonl in %s (has that machine run --export yet?)" % d
 
+    # iCloud は「ストレージを最適化」で実体を退避する (ls -lO が dataless)。
+    # 読めば自動で落ちてくるが、時間がかかったり失敗したりするので、
+    # 先に明示的にダウンロードを要求しておく。brctl が無い環境では何もしない
+    try:
+        subprocess.call(["brctl", "download", path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
     recs = []
     with open(path, "r") as f:
         for line in f:
@@ -885,7 +985,13 @@ def collect_drop(host, drop_root, stale_hours=24):
                     recs.append(json.loads(line))
                 except ValueError:
                     pass
-    age_h = (now_utc().timestamp() - os.path.getmtime(path)) / 3600.0
+    mtime = os.path.getmtime(path)
+    # 書き出された時刻をそのまま観測時刻にする。相手が --export した瞬間の
+    # スナップショットなので、それ以降の経過は「情報が届いていない」であって
+    # 「run が止まった」ではない
+    from datetime import timezone
+    stamp_observed(recs, datetime.fromtimestamp(mtime, timezone.utc), "drop")
+    age_h = (now_utc().timestamp() - mtime) / 3600.0
     if stale_hours and age_h > stale_hours:
         sys.stderr.write("[warn] %s: drop data is %.1f h old (that machine may have "
                          "stopped exporting, or the folder is not syncing)\n"
@@ -894,7 +1000,7 @@ def collect_drop(host, drop_root, stale_hours=24):
 
 
 def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
-                max_mb=2000.0, dry_run=False):
+                max_mb=2000.0, dry_run=False, with_mixer=False):
     """自分の run 一覧とモデルを共有フォルダへ書き出す (--export).
 
     共有フォルダは iCloud Drive / Dropbox / NFS / USB など何でもよい。
@@ -905,12 +1011,15 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
     models_root = os.path.join(drop_dir, "models")
     copied, total = 0, 0.0
 
+    # --- 1 巡目: 何をコピーするか決めるだけ (まだ書かない) -------------------
+    # export_dir は runs.jsonl に載せる必要があるので、ここで確定させる
+    todo = []
     for rec in records:
         d = by_uid.get(rec.get("uid"))
         model = rec.get("model")
         if d is None or not model:
             continue
-        files = select_model_files(model, what, with_optimizer)
+        files = select_model_files(model, what, with_optimizer, with_mixer)
         if not files:
             continue
         dest_name = model_dest_name(d)
@@ -924,17 +1033,13 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
             continue
         total += size_mb
         copied += 1
-        if dry_run:
-            continue
-        for rel, sub, _size in files:
-            src = os.path.join(rec.get("repo") or ".", rel)
-            dst = os.path.join(out_dir, sub)
-            try:
-                os.makedirs(os.path.dirname(dst))
-            except OSError:
-                pass
-            shutil.copy2(src, dst)
+        todo.append((rec, out_dir, files))
 
+    # --- 進捗ファイルを **先に** 書く ---------------------------------------
+    # 440KB の runs.jsonl を 90MB のモデル転送の後ろに置くと、iCloud の
+    # アップロードが詰まったときに進捗だけ先に届けられない。実測で
+    # 「黒の進捗が 3 時間遅れる」原因になっていたのでこの順序にする。
+    # モデルのコピーが途中で失敗しても、進捗は必ず最新になる
     if not dry_run:
         try:
             os.makedirs(drop_dir)
@@ -946,22 +1051,96 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
                 f.write(json.dumps(rec, ensure_ascii=True, default=str) + "\n")
         os.replace(tmp, os.path.join(drop_dir, "runs.jsonl"))
 
+    # --- 2 巡目: モデルを運ぶ (時間がかかってよい) --------------------------
+    moved = 0
+    if not dry_run:
+        for rec, out_dir, files in todo:
+            try:
+                for rel, sub, _size in files:
+                    src = os.path.join(rec.get("repo") or ".", rel)
+                    dst = os.path.join(out_dir, sub)
+                    try:
+                        os.makedirs(os.path.dirname(dst))
+                    except OSError:
+                        pass
+                    shutil.copy2(src, dst)
+                moved += 1
+            except (OSError, IOError) as e:
+                # 1 件失敗しても残りは運ぶ。次回の --export で拾い直される
+                sys.stderr.write("[export] skipped %s: %s\n"
+                                 % (os.path.basename(out_dir), e))
+
     sys.stderr.write("[export] %d run(s), %d model dir(s) newly copied (%.1f MB) -> %s%s\n"
-                     % (len(records), copied, total, drop_dir,
-                        " (dry run)" if dry_run else ""))
+                     % (len(records), moved if not dry_run else copied,
+                        total, drop_dir, " (dry run)" if dry_run else ""))
     return copied
 
 
-def collect(hosts, tail_bytes, timeout, verbose=False, drop_root=None):
+def stamp_observed(recs, when, source):
+    """レコードに **そのホストを観測できた時刻** を刻む.
+
+    状態判定の基準をここに揃える。"今" で判定すると、drop ホストの
+    エクスポートが遅れたぶんだけ heartbeat が古く見え、健全に走っている run が
+    stalled に化ける (実測: エクスポート間隔 60 分に対ししきい値 90 分で余裕 30 分)。
+    観測時刻で判定すれば、情報が届かなくなっても**最後に見えた時点の判定で凍る**。
+
+    リモート側のスクリプトは触らない。drop はファイルの mtime、ssh/local は
+    収集した瞬間を白側で刻むので、黒や M2 が旧版のままでも動く。
+    """
+    iso = when.isoformat()
+    for r in recs:
+        r["observed_at"] = iso
+        r["observed_via"] = source
+    return recs
+
+
+# 到達できなかった ssh ホストを、しばらく試さないでおくための覚え書き。
+# VPN を切っている間は毎回 connect_timeout 秒ずつ待たされるので、
+# 1 度失敗したら次はしばらく飛ばす (プロセス内でだけ効く)
+_SSH_BACKOFF = {}
+SSH_BACKOFF_SEC = 600
+
+
+def collect(hosts, tail_bytes, timeout, verbose=False, drop_root=None,
+            skip_unchanged=None):
+    """各ホストから run を集める.
+
+    skip_unchanged: {label: mtime} を渡すと、共有フォルダの runs.jsonl が
+    その時刻から変わっていないホストを読み飛ばす (stat だけで済む)。
+    相手は 1 時間おきにしか書かないので、毎回読み直す意味がない。
+    """
     all_recs, errors = [], []
+    now = time.time()
     for host in hosts:
         label = host["label"]
         if host.get("drop"):
+            if skip_unchanged is not None:
+                d = drop_dir_for(host, drop_root)
+                f = os.path.join(d, "runs.jsonl") if d else None
+                try:
+                    mt = os.path.getmtime(f) if f else None
+                except OSError:
+                    mt = None
+                if mt is not None and skip_unchanged.get(label) == mt:
+                    continue                  # 前回から変わっていない
+                if mt is not None:
+                    skip_unchanged[label] = mt
             recs, err = collect_drop(host, drop_root)
         elif host.get("ssh") in (None, "", "local"):
             recs, err = collect_local(host, tail_bytes)
+            stamp_observed(recs, now_utc(), "local")
         else:
+            until = _SSH_BACKOFF.get(label, 0)
+            if until > now:
+                errors.append((label, "skipped for %d more s (last attempt failed)"
+                               % int(until - now)))
+                continue
             recs, err = collect_ssh(host, tail_bytes, timeout, verbose)
+            stamp_observed(recs, now_utc(), "ssh")
+            if err and not recs:
+                _SSH_BACKOFF[label] = now + SSH_BACKOFF_SEC
+            else:
+                _SSH_BACKOFF.pop(label, None)
         if err:
             errors.append((label, err))
             sys.stderr.write("[warn] %s: %s\n" % (label, err))
@@ -1210,9 +1389,27 @@ def dash_params(d):
     return out
 
 
-def dashboard_data(rows, batches, errors):
-    """HTML に埋め込む JSON を組み立てる."""
+def overdue_sec(interval_sec):
+    """このホストが「遅れている」と言ってよい経過時間.
+
+    いつもの間隔の 2 倍。ただし短すぎると同期のゆらぎで誤検知するので
+    下限 20 分、上限は従来の固定しきい値 (3 時間) を超えないようにする。
+    間隔がまだ分からないホストは従来どおり 3 時間。
+    """
+    if not interval_sec:
+        return DATA_STALE_SEC
+    return max(1200.0, min(float(interval_sec) * 2.0, DATA_STALE_SEC))
+
+
+def dashboard_data(rows, batches, errors, saved=None, cadence=None):
+    """HTML に埋め込む JSON を組み立てる.
+
+    saved = load_saved_models() の結果。渡すと各 run に
+    「モデルを手元に回収済みか」が付く。
+    """
     odd = set(d["uid"] for d in odd_param_runs(rows))
+    saved = saved or {}
+    cadence = cadence or {}
     runs = []
     for d in rows:
         runs.append({
@@ -1230,14 +1427,58 @@ def dashboard_data(rows, batches, errors):
             "eta": d["eta"].isoformat() if d.get("eta") else None,
             "remaining_sec": d.get("remaining_sec"),
             "last_seen": d["last_seen"].isoformat() if d.get("last_seen") else None,
+            # 実際に終わった / 止まった時刻。last_seen は heartbeat 優先なので、
+            # 「いつ完了したか」を出すには stop_time そのものが要る
+            "stop_at": d["stop_dt"].isoformat() if d.get("stop_dt") else None,
+            "start_at": d["start_dt"].isoformat() if d.get("start_dt") else None,
             "param_hash": d.get("param_hash"), "odd_params": d["uid"] in odd,
             "t_max_ok": d.get("t_max_ok"), "t_max_expected": d.get("t_max_expected"),
             "run_dir": d.get("run_dir"), "params": dash_params(d),
+            "stale_data": d.get("stale_data"),
+            "data_age_sec": d.get("data_age_sec"),
+            "observed_via": d.get("observed_via"),
+            # モデルを手元 (保管リポジトリ) に回収できているか。
+            # done なのに saved が空なら、まだ取ってきていない
+            "saved": sorted(saved.get(d["uid"], {})),
+            "has_model": bool(d.get("model")),
         })
     mach = {}
+
+    def _m(label):
+        return mach.setdefault(label, {"batches": 0, "reserved": 0,
+                                       "unknown": False, "observed_at": None,
+                                       "data_age_sec": None, "via": None,
+                                       "runs": 0, "running": 0, "stale_data": False,
+                                       "done": 0, "saved": 0})
+
+    # ホストごとの **情報の鮮度**。run の状態とは別軸で持ち、画面の先頭に出す。
+    # これが無いと「そのマシンが黙っている」ことに気づけない (実測: M2 が
+    # 5 日エクスポートしていないのに、画面上は run が stalled と出るだけだった)
+    for d in rows:
+        m = _m(d.get("machine"))
+        m["runs"] += 1
+        if d.get("state") == "running":
+            m["running"] += 1
+        if d.get("state") == "done":
+            m["done"] = m.get("done", 0) + 1
+            if saved.get(d["uid"]):
+                m["saved"] = m.get("saved", 0) + 1
+        age = d.get("data_age_sec")
+        if age is not None and (m["data_age_sec"] is None or age < m["data_age_sec"]):
+            m["data_age_sec"] = age
+            m["observed_at"] = (d["observed_dt"].isoformat()
+                                if d.get("observed_dt") else None)
+            m["via"] = d.get("observed_via")
+    for label, m in mach.items():
+        cad = cadence.get(label) or {}
+        m["interval_sec"] = cad.get("interval_sec")
+        m["interval_n"] = cad.get("n") or 0
+        m["overdue_sec"] = overdue_sec(m["interval_sec"])
+        m["stale_data"] = bool(m["data_age_sec"] is not None
+                               and m["data_age_sec"] > m["overdue_sec"])
+
     for b in batches or []:
-        m = mach.setdefault(b.get("machine"), {"batches": 0, "reserved": 0,
-                                               "unknown": False})
+        m = _m(b.get("machine"))
         m["batches"] += 1
         if b.get("total") is None:
             m["unknown"] = True
@@ -1421,7 +1662,7 @@ def render_dashboard(rows, batches, errors):
         dashboard_data(rows, batches, errors), ensure_ascii=False, default=str))
 
 
-def render_summary(rows):
+def render_summary(rows, diff_limit=8):
     from collections import Counter, defaultdict
     by_cond = defaultdict(list)
     for d in rows:
@@ -1451,6 +1692,9 @@ def render_summary(rows):
                          + "  ".join("%s(%d)" % (h, len(v))
                                      for h, v in sorted(by_hash.items(),
                                                         key=lambda kv: -len(kv[1]))))
+            # ハッシュだけ出しても何を直せばよいか分からないので、
+            # **割れているキーと値** をそのまま並べる
+            lines.extend(fmt_param_diff(rs, limit=diff_limit))
     return "\n".join(lines)
 
 
@@ -1465,12 +1709,20 @@ def _rel_under_step(model, rel):
     return rel[len(head):] if rel.startswith(head) else os.path.basename(rel)
 
 
-def select_model_files(model, what="path", with_optimizer=False):
+def select_model_files(model, what="path", with_optimizer=False,
+                       with_mixer=False):
     """回収するファイルを絞る.
 
     epymarl の新しい保存形は <step>/path/{agent,mixer,opt}.th と <step>/task/*.th。
     古い保存形は <step>/ 直下に .th が並ぶので、path/ が無ければ全部を対象にする。
+    既定は "all" = 経路方策と PPO タスク割当方策の両方
+    (TP / FIFO の run には task/ が無いので自然に経路だけになる)。
     opt.th / agent_opt.th / critic_opt.th (optimizer state) は評価に要らないので既定で外す。
+
+    mixer.th も既定で外す。QMIX の学習を再開するときにしか使わず、評価側
+    (src/all_policy / test.py / runner.py) はどこからも読まない。それでいて
+    agent.th の 15 倍あり (実測 平均 1.24MB 対 80KB)、共有フォルダの 93% を
+    占めていた。再開したくなったら元のマシンに残っている。
     """
     picked = []
     has_path = any(_rel_under_step(model, r).startswith("path/") for r, _ in model["files"])
@@ -1479,6 +1731,8 @@ def select_model_files(model, what="path", with_optimizer=False):
         if what == "path" and has_path and not sub.startswith("path/"):
             continue
         if not with_optimizer and os.path.basename(sub).endswith("opt.th"):
+            continue
+        if not with_mixer and os.path.basename(sub) == "mixer.th":
             continue
         picked.append((rel, sub, size))
     return picked
@@ -1490,16 +1744,206 @@ def model_dest_name(d):
         (d.get("model") or {}).get("step"))
 
 
-def eval_model_filename(d):
-    """評価側 (src/all_policy/policy.py の model_stem) が探すファイル名を組み立てる。
+def eval_model_stem(d):
+    """評価側 (src/all_policy/policy.py の model_stem) と同じ stem を組み立てる。
 
-    stem = {map}_{model_n}_{path_planner}[_{method_tag}]_{reassign_tag}
-    reassign_tag は学習時に決まる軸ではないので常に "base"
-    (reassign 側のモデルが要るときは手で名前を変える)。
+    stem = {map}_{N}_{path_planner}[_{method_tag}][_{task_assign}][_dyn]_{reassign_tag}
+
+    軸の選び方: 実験計画の 84 条件が **重複なく 84 通りの名前になる最小の組**。
+      map / N / planner / method_tag      36 通り (衝突 36)
+      + task_assign                       72 通り (衝突 12)
+      + dynamic                           84 通り (衝突 0)  <- これ
+    入れない軸と理由:
+      task_arrival  計画内は "bernoulli, mmpp" の 1 種しかない
+      reassign      今回の計画から除外。枠 (_base) は残してある
+      LaRe 系列     map + N が系列を一意に決めるので method_tag で足りる
+                    (計画外の系列は manifest.jsonl 側で判別する)
+      t_max         map + N から決まる
+
+    TP かつ dynamic 無しのときは何も足さないので、**既存のファイル名と互換**。
     """
-    tag = "_%s" % d["method_tag"] if d.get("method_tag") else ""
-    return "%s_%s_%s%s_base_seed%s.th" % (d.get("map"), d.get("agents"),
-                                          d.get("algo"), tag, d.get("seed"))
+    parts = ["%s_%s_%s" % (d.get("map"), d.get("agents"), d.get("algo"))]
+    if d.get("method_tag"):
+        parts.append(d["method_tag"])
+    assign = (d.get("task_assign") or "").strip()
+    if assign and assign.upper() != "TP":       # TP は既定なので付けない
+        parts.append(assign.lower())
+    if d.get("dynamic_agents"):
+        parts.append("dyn")
+    parts.append("base")                        # reassign_tag
+    return "_".join(parts)
+
+
+def eval_model_filename(d, seed_index=None):
+    """評価側がそのまま読めるファイル名。
+
+    末尾の seed は **学習時の生 seed ではなく 0 始まりの通し番号**。
+    policy.py の resolve_model_path(stem, model_seed=0) が
+    "{stem}_seed{model_seed}.th" を探し、model_seed の既定が 0 だから。
+    生 seed (9 桁) を入れると test.py に --model-seed 113162076 と
+    打つことになり噛み合わない。生 seed は manifest.jsonl に残す。
+    """
+    n = d.get("seed") if seed_index is None else seed_index
+    return "%s_seed%s.th" % (eval_model_stem(d), n)
+
+
+def assign_seed_indexes(planned, repo_dir=None):
+    """回収対象に stem ごとの通し番号を割り当てて {stem: {生 seed: 番号}} を返す.
+
+    既に manifest に載っているものはその番号を引き継ぐ。新規は **学習を開始した順**
+    に 0,1,2,... と振るので、表に並べた順とファイル名の番号が一致する。
+    """
+    table = load_seed_index(repo_dir) if repo_dir else {}
+    fresh = [t for t in planned if t[0].get("state") == "done"]
+    fresh.sort(key=lambda t: (str(t[0].get("start_time") or ""), str(t[0].get("seed"))))
+    for d, _o, _f in fresh:
+        tab = table.setdefault(eval_model_stem(d), {})
+        key = str(d.get("seed"))
+        if key not in tab:
+            # len ではなく max+1。間が抜けても既存の番号と衝突しない
+            tab[key] = max(tab.values()) + 1 if tab else 0
+    return table
+
+
+SEEN_PATH = "tools/.host_seen.json"
+SEEN_KEEP = 40
+
+
+def record_host_seen(rows, path=SEEN_PATH, hosts=None):
+    """ホストごとの観測時刻を積み、**いつもの更新間隔** を出す.
+
+    固定の 3 時間しきい値だと、1 時間おきに出しているホストの
+    「1 回落とした」を 3 時間気づけない。実測の間隔を覚えておけば
+    その 2 倍で気づける (15 分間隔に変えたホストは 30 分で気づく)。
+
+    返り値: {label: {"interval_sec": 中央値 or None, "n": サンプル数}}
+    """
+    path = os.path.expanduser(path)
+    hist = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                hist = json.load(f) or {}
+        except (OSError, ValueError):
+            hist = {}
+
+    for d in rows:
+        obs = d.get("observed_dt")
+        label = d.get("machine")
+        if not obs or not label:
+            continue
+        seen = hist.setdefault(str(label), [])
+        iso = obs.isoformat()
+        if seen and seen[-1] == iso:
+            continue                      # 同じスナップショットは 1 回だけ
+        if iso not in seen:
+            seen.append(iso)
+            seen.sort()
+            del seen[:-SEEN_KEEP]
+
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(hist, f, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+    # 設定に書いてあれば実測より優先する。学習を待たずに効かせたいため
+    declared = {}
+    for h in hosts or []:
+        v = h.get("export_interval_min")
+        if v:
+            declared[str(h.get("label"))] = float(v) * 60.0
+
+    out = {}
+    for label in set(hist) | set(declared):
+        ts = [parse_dt(x) for x in hist.get(label, [])]
+        ts = [t for t in ts if t]
+        gaps = sorted((ts[i + 1] - ts[i]).total_seconds()
+                      for i in range(len(ts) - 1))
+        med = gaps[len(gaps) // 2] if gaps else None
+        out[label] = {"interval_sec": declared.get(label) or med,
+                      "n": len(ts), "declared": label in declared}
+    return out
+
+
+def load_saved_models(repo_dir):
+    """保管リポジトリの manifest から {uid: {"path": 名前, "task": 名前}} を作る.
+
+    「この run のモデルはもう手元にあるか」を画面で示すために使う。
+    manifest は追記なので同じ uid が複数回出うる。後勝ちで最新を採る。
+    """
+    out = {}
+    path = os.path.join(os.path.expanduser(repo_dir or ""), "manifest.jsonl")
+    if not repo_dir or not os.path.exists(path):
+        return out
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            uid = rec.get("uid")
+            if not uid:
+                continue
+            got = {}
+            for rel in rec.get("files") or []:
+                head = str(rel).split("/")[0]
+                if head in SUBSYS_ROOT:
+                    got[head] = rel
+            if got:
+                out[uid] = got
+    return out
+
+
+def load_seed_index(repo_dir):
+    """manifest.jsonl から stem -> {生 seed: 通し番号} を復元する。
+
+    **一度振った番号は変えない**。評価スクリプトの --model-seed も論文の表も
+    その番号を指しているので、後から詰め直すと過去の記録とずれる。
+    """
+    table = {}
+    path = os.path.join(repo_dir, "manifest.jsonl")
+    if not os.path.exists(path):
+        return table
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            stem, idx = rec.get("eval_stem"), rec.get("seed_index")
+            if stem is None or idx is None:
+                continue
+            table.setdefault(stem, {})[str(rec.get("seed"))] = int(idx)
+    return table
+
+
+# 評価側がモデルを探す場所。経路と割当で木が分かれる。
+# ファイル名 (eval_model_filename) は両者で同じなので、同じ run から出た
+# 2 本が同じ名前で並ぶ
+EVAL_MODEL_DIRS = {
+    "path": "src/all_policy/models/safe",
+    "task": "src/task_assign/models/safe",
+}
+
+
+def task_file_in(out_dir):
+    """回収したモデルの中から、タスク割当方策の state_dict を選ぶ.
+
+    PPO 割当は <step>/task/agent.th に保存される
+    (src/task_assign/task_policy/ppo.py の save_models)。
+    TP / FIFO は規則ベースなので、そもそもファイルが無い。
+    """
+    cand = os.path.join(out_dir, "task", "agent.th")
+    return cand if os.path.exists(cand) else None
 
 
 def policy_file_in(out_dir):
@@ -1547,7 +1991,7 @@ def _fetch_ssh(host, repo, files, tmp_dir, timeout):
     cmd = ["ssh", "-o", "BatchMode=yes"]
     for opt in host.get("ssh_options") or []:
         cmd += ["-o", opt]
-    cmd += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 10))]
+    cmd += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 8))]
     if host.get("port"):
         cmd += ["-p", str(host["port"])]
     cmd += [host["ssh"], remote]
@@ -1573,7 +2017,11 @@ def _fetch_ssh(host, repo, files, tmp_dir, timeout):
 
 
 def _record_fetch(dest, d, out_dir, files):
-    """回収記録 (manifest.jsonl) と設置コマンド案 (install_hints.sh) を追記する."""
+    """回収記録 (manifest.jsonl) を追記する.
+
+    設置コマンド案 (install_hints.sh) はここでは書かない。ファイル名の通し番号は
+    回収対象がすべて出そろってからでないと決まらないため (write_install_hints)。
+    """
     with open(os.path.join(dest, "manifest.jsonl"), "a") as f:
         f.write(json.dumps({
             "uid": d["uid"], "machine": d.get("machine"),
@@ -1584,11 +2032,7 @@ def _record_fetch(dest, d, out_dir, files):
             "dest": os.path.relpath(out_dir, dest),
             "files": [sub for _r, sub, _z in files],
         }, ensure_ascii=True, default=str) + "\n")
-    policy = policy_file_in(out_dir)
-    if policy:
-        with open(os.path.join(dest, "install_hints.sh"), "a") as f:
-            f.write("cp %s src/all_policy/models/safe/%s\n"
-                    % (_quote(policy), eval_model_filename(d)))
+
 
 
 def _fetch_drop(host, drop_root, items):
@@ -1614,8 +2058,73 @@ def _fetch_drop(host, drop_root, items):
     return None
 
 
+PURGE_MARKER = ".fetched"
+
+
+def purge_drop_models(planned, hosts, drop_root, dry_run=False):
+    """共有フォルダから **回収済みのモデルだけ** を消す.
+
+    iCloud の容量を空けるための後始末。次の 2 つを必ず守る:
+
+    1. **ローカルに同じサイズのファイルがあることを確認してから消す**。
+       1 つでも欠けていたらその run はまるごと残す (消し損じより取り逃しを避ける)
+    2. 空にせず `.fetched` を 1 個置く。送信側の重複判定は
+       「共有フォルダにディレクトリが残っているか」(export_drop の
+       os.listdir) なので、空にすると**次の --export で再送される**。
+       マーカーを残せば送信側を一切変更せずに再送を止められる
+    """
+    bases = {}
+    for h in hosts or []:
+        b = drop_dir_for(h, drop_root)
+        if b:
+            bases[h["label"]] = b
+    removed, freed, kept = 0, 0, 0
+    for d, out_dir, files in planned:
+        base = bases.get(d.get("machine"))
+        export_dir = (d.get("model") or {}).get("export_dir")
+        if not base or not export_dir:
+            continue
+        src_dir = os.path.join(base, export_dir)
+        if not os.path.isdir(src_dir):
+            continue
+        targets, ok = [], True
+        for _rel, sub, _z in files:
+            src = os.path.join(src_dir, sub)
+            if not os.path.exists(src):
+                continue
+            local = os.path.join(out_dir, sub)
+            if not os.path.exists(local) or \
+                    os.path.getsize(local) != os.path.getsize(src):
+                ok = False
+                break
+            targets.append(src)
+        if not ok or not targets:
+            kept += 1
+            continue
+        for t in targets:
+            freed += os.path.getsize(t)
+            if not dry_run:
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+        removed += 1
+        if not dry_run:
+            try:
+                with open(os.path.join(src_dir, PURGE_MARKER), "w") as f:
+                    f.write("fetched %s\n" % now_utc().isoformat())
+            except OSError:
+                pass
+    sys.stderr.write("[purge] %d model dir(s) cleared (%.1f MB freed), "
+                     "%d kept because the local copy did not match%s\n"
+                     % (removed, freed / 1e6, kept,
+                        " (dry run)" if dry_run else ""))
+    return removed
+
+
 def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
-                 max_mb=2000.0, timeout=900, dry_run=False, drop_root=None):
+                 max_mb=2000.0, timeout=900, dry_run=False, drop_root=None,
+                 with_mixer=False):
     """done の run の最終ステップのモデルを dest に集める.
 
     dest/{machine}/{algo}_{map}_{N}agents_seed{seed}_step{t_env}/path/agent.th
@@ -1633,7 +2142,7 @@ def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
         if not model:
             continue
         out_dir = os.path.join(dest, str(d.get("machine")), model_dest_name(d))
-        files = select_model_files(model, what, with_optimizer)
+        files = select_model_files(model, what, with_optimizer, with_mixer)
         if os.path.isdir(out_dir) and os.listdir(out_dir):
             skipped += 1
             present.append((d, out_dir, files))
@@ -1716,18 +2225,59 @@ def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
     return present + planned, fetched
 
 
-def publish_dir(d):
+SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slug(text, default="none"):
+    """ディレクトリ名に使える文字だけにする.
+
+    "8x5_2 10M→aoba00_2 5M" -> "8x5_2-10M-aoba00_2-5M"
+    """
+    out = SLUG_RE.sub("-", str(text or "").strip()).strip("-")
+    return out or default
+
+
+SUBSYS_ROOT = {"path": "path", "task": "task"}
+
+
+def subsystem_of(sub):
+    """モデルファイルの相対パスから、経路 (path) か タスク割当 (task) かを返す.
+
+    epymarl の保存形は <step>/path/agent.th と <step>/task/agent.th。
+    先頭のディレクトリ名がそのまま系統になる (それ以外は経路とみなす)。
+    """
+    head = str(sub or "").replace(os.sep, "/").split("/")[0]
+    return SUBSYS_ROOT.get(head, "path")
+
+
+def publish_dir(d, sub="path/agent.th"):
     """保管用リポジトリ内の配置先ディレクトリ.
 
-        path/{map}/{N}agent/{planner}_{method_tag}/
+        {path|task}/{map}/{N}agent/{setting}/{algo}/{task_assign}[_dyn]/
+
+    経路方策は path/ 配下、タスク割当方策は task/ 配下。**その下の階層と
+    ファイル名は完全に同じ**にしてあるので、同じ run から出た 2 本が
+    同じ名前で並ぶ (どちらがどの run のものか一目で対応が取れる)。
+
+    **実験計画の表と同じ並び** (map -> 台数 -> setting -> algorithm -> assign
+    -> dynamic) にしてある。表で隣にある条件がディレクトリでも隣に来る。
+
+    setting と task_assign を入れているのは、これが無いと別条件が同じ
+    ディレクトリに落ちるため。実測で
+      map_8x5_7_qmix_safe    <- TP と PPO が同居
+      map_aoba00_7_qmix_dbct <- 別々の LaRe 系列が同居
+    が起きていた。
     """
-    tag = d.get("method_tag") or ""
-    planner_dir = "%s_%s" % (d.get("algo"), tag) if tag else str(d.get("algo"))
-    return os.path.join("path", str(d.get("map")), "%sagent" % d.get("agents"),
-                        planner_dir)
+    assign = _slug(d.get("task_assign") or "TP")
+    if d.get("dynamic_agents"):
+        assign += "_dyn"
+    return os.path.join(subsystem_of(sub), str(d.get("map")),
+                        "%sagent" % d.get("agents"),
+                        _slug(d.get("setting"), "safe"), str(d.get("algo")),
+                        assign)
 
 
-def publish_names(d, sub):
+def publish_names(d, sub, seed_index=None):
     """保管用リポジトリでのファイル名を決める.
 
     方策本体は**評価側がそのまま読める名前**にする (cp するだけで済む)。
@@ -1735,7 +2285,7 @@ def publish_names(d, sub):
     mixer / critic は学習専用なので、拾ってあれば接尾辞を付けて併置する。
     step と param_hash はファイル名に入れず manifest.jsonl に持つ。
     """
-    eval_name = eval_model_filename(d)
+    eval_name = eval_model_filename(d, seed_index)
     base = os.path.basename(sub)
     if base == "agent.th":
         return eval_name
@@ -1743,7 +2293,7 @@ def publish_names(d, sub):
     return "%s.%s" % (stem, base)          # 例: ..._seed123.mixer.th
 
 
-def publish_models(planned, repo_dir, dry_run=False, hint=True):
+def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
     """回収したモデルを保管用リポジトリの階層へ配置する.
 
     git の commit / push はしない (外向きの操作なので明示的にやってもらう)。
@@ -1753,6 +2303,10 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True):
     published = skipped = 0
     lines = []
     refused, tmax_warn = 0, 0
+
+    if seed_idx is None:
+        seed_idx = assign_seed_indexes(planned, repo_dir)
+
     for d, out_dir, files in planned:
         # 異常終了した run のモデルは保管しない。--fetch-state を広げて調査した
         # ときにも巻き込まれないよう、ここでも必ず弾く
@@ -1761,8 +2315,10 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True):
             continue
         if d.get("t_max_ok") is False:
             tmax_warn += 1
-        rel = publish_dir(d)
-        dst_dir = os.path.join(repo_dir, rel)
+        stem = eval_model_stem(d)
+        s_idx = seed_idx.get(stem, {}).get(str(d.get("seed")))
+        # 経路 (path/) と タスク割当 (task/) は別の木に置くので、
+        # 配置先はファイルごとに決める
         srcs = []
         for _r, sub, _z in files:
             if os.path.basename(sub).endswith("opt.th"):
@@ -1770,25 +2326,29 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True):
             src = os.path.join(out_dir, sub)
             # dry run では回収前なのでファイルがまだ無い。配置先だけ見せる
             if os.path.exists(src) or dry_run:
-                srcs.append((src, publish_names(d, sub)))
+                srcs.append((src, publish_dir(d, sub), publish_names(d, sub, s_idx)))
         if not srcs:
             continue
-        if all(os.path.exists(os.path.join(dst_dir, n)) for _s, n in srcs):
+        if all(os.path.exists(os.path.join(repo_dir, r, n)) for _s, r, n in srcs):
             skipped += 1
             continue
-        sys.stderr.write("  %s/%s\n" % (rel, srcs[0][1]))
+        for _s, r, n in srcs:
+            sys.stderr.write("  %s/%s\n" % (r, n))
         published += 1
+        rel = srcs[0][1]
         if dry_run:
             continue
-        try:
-            os.makedirs(dst_dir)
-        except OSError:
-            pass
-        for src, name in srcs:
+        for src, r, name in srcs:
+            dst_dir = os.path.join(repo_dir, r)
+            try:
+                os.makedirs(dst_dir)
+            except OSError:
+                pass
             shutil.copy2(src, os.path.join(dst_dir, name))
         lines.append({
             "uid": d["uid"], "machine": d.get("machine"),
-            "path": rel, "eval_name": eval_model_filename(d),
+            "path": rel, "eval_name": eval_model_filename(d, s_idx),
+            "eval_stem": stem, "seed_index": s_idx,
             "t_max_expected": d.get("t_max_expected"), "t_max_ok": d.get("t_max_ok"),
             "map": d.get("map"), "agents": d.get("agents"), "algo": d.get("algo"),
             "seed": d.get("seed"), "t_max": d.get("t_max"),
@@ -1796,7 +2356,7 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True):
             "method_tag": d.get("method_tag"), "lare_mode": d.get("lare_mode"),
             "setting": d.get("setting"), "task_arrival": d.get("task_arrival"),
             "task_assign": d.get("task_assign"), "param_hash": d.get("param_hash"),
-            "files": [n for _s, n in srcs],
+            "files": ["%s/%s" % (r, n) for _s, r, n in srcs],
         })
     if lines and not dry_run:
         try:
@@ -1806,6 +2366,30 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True):
         with open(os.path.join(repo_dir, "manifest.jsonl"), "a") as f:
             for rec in lines:
                 f.write(json.dumps(rec, ensure_ascii=True, default=str) + "\n")
+    # stem には task_assign と dynamic まで入れてあるので、**実験計画の中では
+    # 衝突しない**。残るのは LaRe の事前学習系列が違うのに method_tag が同じ
+    # "dbct" になる場合だけ (計画内は map+N が系列を一意に決めるので起きない)。
+    # 平らな models/safe/ へ install すると同じ通し番号の列に混ざるので知らせる
+    stems = {}
+    for d, _o, _f in planned:
+        if d.get("state") != "done":
+            continue
+        key = (d.get("setting"), d.get("task_assign") or "TP",
+               bool(d.get("dynamic_agents")))
+        stems.setdefault(eval_model_stem(d), set()).add(key)
+    mixed = dict((k, v) for k, v in stems.items() if len(v) > 1)
+    if mixed:
+        sys.stderr.write("[publish] %d stem(s) cover more than one LaRe chain; "
+                         "directories are separate but the FILE NAMES collide "
+                         "(method_tag alone cannot tell the chains apart):\n"
+                         % len(mixed))
+        for k in sorted(mixed):
+            sys.stderr.write("    %s\n" % k)
+            for setting, assign, dyn in sorted(map(lambda x: tuple(map(str, x)),
+                                                   mixed[k])):
+                sys.stderr.write("        setting=%-24s assign=%-4s dynamic=%s\n"
+                                 % (setting, assign, dyn))
+
     sys.stderr.write("[publish] %d placed, %d already there -> %s%s\n"
                      % (published, skipped, repo_dir,
                         " (dry run)" if dry_run else ""))
@@ -1898,36 +2482,79 @@ def publish_commit(repo_dir, n_added, push=False):
     return 0
 
 
-def install_models(planned, models_dir, overwrite=False, dry_run=False):
-    """回収したモデルを評価側が読む名前で src/all_policy/models/safe/ に置く."""
-    import shutil
-    models_dir = os.path.abspath(os.path.expanduser(models_dir))
-    installed = skipped = missing = 0
+def write_install_hints(planned, dest, seed_idx):
+    """評価側へ置くための cp コマンド案を install_hints.sh に書き出す.
+
+    通し番号は回収対象が出そろってからでないと決まらないので、
+    _record_fetch (1 件ずつ) ではなくここでまとめて書く。
+    """
+    path = os.path.join(dest, "install_hints.sh")
+    lines = []
     for d, out_dir, _files in planned:
-        src = policy_file_in(out_dir)
-        if src is None and not dry_run:
+        policy = policy_file_in(out_dir)
+        if not policy:
+            continue
+        s_idx = seed_idx.get(eval_model_stem(d), {}).get(str(d.get("seed")))
+        lines.append("cp %s src/all_policy/models/safe/%s\n"
+                     % (_quote(policy), eval_model_filename(d, s_idx)))
+    if not lines:
+        return
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n# generated by collect_runs.py --fetch-models\n")
+        for l in sorted(lines):
+            f.write(l)
+
+
+def install_models(planned, models_dir, overwrite=False, dry_run=False,
+                   seed_idx=None, task_dir=None):
+    """回収したモデルを評価側が読む名前で置く.
+
+    経路方策 -> models_dir            (既定 src/all_policy/models/safe)
+    割当方策 -> task_dir              (既定 src/task_assign/models/safe)
+
+    **ファイル名は両者で同じ**。同じ run から出た 2 本が同じ名前になるので、
+    評価時に「どの経路方策とどの割当方策が対か」を名前だけで追える。
+    TP / FIFO の run には割当ファイルが無いので経路だけ置かれる。
+    """
+    import shutil
+    if seed_idx is None:
+        seed_idx = assign_seed_indexes(planned)
+    dirs = {"path": os.path.abspath(os.path.expanduser(models_dir)),
+            "task": os.path.abspath(os.path.expanduser(
+                task_dir or EVAL_MODEL_DIRS["task"]))}
+    installed = collections.Counter()
+    skipped = missing = 0
+    for d, out_dir, _files in planned:
+        s_idx = seed_idx.get(eval_model_stem(d), {}).get(str(d.get("seed")))
+        name = eval_model_filename(d, s_idx)
+        found = [("path", policy_file_in(out_dir)), ("task", task_file_in(out_dir))]
+        if all(src is None for _k, src in found) and not dry_run:
             missing += 1
             continue
-        dst = os.path.join(models_dir, eval_model_filename(d))
-        if src is None:
-            # dry run では回収前なのでファイルがまだ無い。付く名前だけ見せる
-            sys.stderr.write("  (not fetched yet) -> %s\n" % os.path.basename(dst))
-            installed += 1
-            continue
-        if os.path.exists(dst) and not overwrite:
-            skipped += 1
-            continue
-        sys.stderr.write("  %s -> %s\n" % (os.path.basename(src), os.path.basename(dst)))
-        if not dry_run:
-            try:
-                os.makedirs(models_dir)
-            except OSError:
-                pass
-            shutil.copy2(src, dst)
-        installed += 1
-    sys.stderr.write("[install] %d installed, %d already there, %d without a policy file%s\n"
-                     % (installed, skipped, missing, " (dry run)" if dry_run else ""))
-    return installed
+        for kind, src in found:
+            dst = os.path.join(dirs[kind], name)
+            if src is None:
+                if dry_run and kind == "path":
+                    # dry run では回収前なのでファイルがまだ無い。付く名前だけ見せる
+                    sys.stderr.write("  (not fetched yet) -> %s/%s\n" % (kind, name))
+                    installed[kind] += 1
+                continue
+            if os.path.exists(dst) and not overwrite:
+                skipped += 1
+                continue
+            sys.stderr.write("  %s/agent.th -> %s/%s\n" % (kind, kind, name))
+            if not dry_run:
+                try:
+                    os.makedirs(dirs[kind])
+                except OSError:
+                    pass
+                shutil.copy2(src, dst)
+            installed[kind] += 1
+    sys.stderr.write("[install] %d path, %d task installed; %d already there, "
+                     "%d run(s) without any model file%s\n"
+                     % (installed["path"], installed["task"], skipped, missing,
+                        " (dry run)" if dry_run else ""))
+    return sum(installed.values())
 
 
 # ---------------------------------------------------------------------------
@@ -2234,7 +2861,7 @@ def bootstrap_push(host, token, db_id, python=None, remote_dir="~/.ldrp",
         base = ["ssh", "-o", "BatchMode=yes"]
         for opt in host.get("ssh_options") or []:
             base += ["-o", opt]
-        base += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 10))]
+        base += ["-o", "ConnectTimeout=%d" % int(host.get("connect_timeout", 8))]
         if host.get("port"):
             base += ["-p", str(host["port"])]
         base += [host["ssh"], cmd]
@@ -2465,17 +3092,46 @@ def load_config(path):
         text = f.read()
     if path.endswith(".json"):
         return json.loads(text)
-    import yaml
+    try:
+        import yaml
+    except ImportError:
+        # ここで黙って {} を返すと、呼び出し側が「設定が無い」と判断して
+        # ホスト定義ごと失われる (実測: ラベルが os.uname()[1] に化けて
+        # 同じ run が二重にキャッシュへ入った)。落ちないが必ず知らせる
+        sys.stderr.write(
+            "[error] PyYAML is missing, so %s cannot be read.\n"
+            "[error]   run with the conda python: "
+            "/opt/anaconda3/envs/ldrp/bin/python\n" % path)
+        return {}
     return yaml.safe_load(text) or {}
+
+
+def local_host_in(conf):
+    """設定ファイルの中の「このマシン」のエントリを返す (無ければ None).
+
+    ssh: local と書かれたホストがこのマシン。--hosts local のときに
+    このラベルを使わないと、同じ run が別ラベルで二重に溜まる
+    (実測: 白 167 run と os.uname()[1] 167 run が完全重複していた)。
+    uid にマシン名が入るので dedupe では消えない。
+    """
+    for h in conf.get("hosts") or []:
+        if not h.get("drop") and h.get("ssh") in (None, "", "local"):
+            return h
+    return None
 
 
 def build_hosts(conf, args):
     if args.hosts:
         labels = [h.strip() for h in args.hosts.split(",") if h.strip()]
         if labels == ["local"]:
-            return [{"label": args.machine or conf.get("machine") or os.uname()[1],
+            me = local_host_in(conf) or {}
+            return [{"label": (args.machine or conf.get("machine")
+                               or me.get("label") or os.uname()[1]),
                      "ssh": "local",
-                     "repos": args.repo or conf.get("repos") or [os.getcwd()]}]
+                     "repos": (args.repo or me.get("repos")
+                               or conf.get("repos") or [os.getcwd()]),
+                     "sacred_subdirs": me.get("sacred_subdirs"),
+                     "model_subdirs": me.get("model_subdirs")}]
         hosts = [h for h in conf.get("hosts", []) if h.get("label") in labels]
         missing = set(labels) - set(h["label"] for h in hosts)
         if missing:
@@ -2483,8 +3139,8 @@ def build_hosts(conf, args):
         return hosts
     hosts = conf.get("hosts") or []
     if not hosts:
-        hosts = [{"label": args.machine or os.uname()[1], "ssh": "local",
-                  "repos": args.repo or [os.getcwd()]}]
+        hosts = [{"label": args.machine or conf.get("machine") or os.uname()[1],
+                  "ssh": "local", "repos": args.repo or [os.getcwd()]}]
     return hosts
 
 
@@ -2544,6 +3200,9 @@ def main(argv=None):
     p.add_argument("--min-steps", type=float, default=None,
                    help="drop runs whose t_max is below this (default: 1e6, "
                         "so short debug runs are hidden; pass 0 to keep everything)")
+    p.add_argument("--diff-params", action="store_true",
+                   help="in --format summary, list every differing parameter "
+                        "(default: the first 8 per condition)")
     p.add_argument("--check", action="store_true",
                    help="exit 1 if any run is stalled/failed/short")
     p.add_argument("--cache", default=None,
@@ -2561,10 +3220,18 @@ def main(argv=None):
                    help="download the final policy model of finished runs into DIR")
     p.add_argument("--fetch-state", default="done",
                    help="which states to fetch models for (default: done)")
-    p.add_argument("--fetch-what", default="path", choices=["path", "all"],
-                   help="'path' = policy only (default), 'all' = task assigner too")
+    p.add_argument("--fetch-what", default="all", choices=["path", "all"],
+                   help="'all' = path policy and task assigner (default), "
+                        "'path' = path policy only")
     p.add_argument("--fetch-optimizer", action="store_true",
                    help="also fetch opt.th (optimizer state; not needed to evaluate)")
+    p.add_argument("--purge-drop", action="store_true",
+                   help="after a successful fetch, delete the copied model files "
+                        "from the shared folder to free iCloud space (leaves a "
+                        ".fetched marker so the sender does not re-upload them)")
+    p.add_argument("--fetch-mixer", action="store_true",
+                   help="also fetch mixer.th (QMIX mixer; only needed to resume "
+                        "training, and 15x the size of agent.th)")
     p.add_argument("--max-fetch-mb", type=float, default=2000.0,
                    help="stop fetching once this much has been queued (default: 2000)")
     p.add_argument("--fetch-timeout", type=int, default=900,
@@ -2583,8 +3250,10 @@ def main(argv=None):
     p.add_argument("--install-models", action="store_true",
                    help="also copy each fetched policy into the evaluation model dir "
                         "under the name test.py expects")
-    p.add_argument("--models-dir", default="src/all_policy/models/safe",
-                   help="where --install-models puts the files")
+    p.add_argument("--models-dir", default=EVAL_MODEL_DIRS["path"],
+                   help="where --install-models puts the path policies")
+    p.add_argument("--task-models-dir", default=EVAL_MODEL_DIRS["task"],
+                   help="where --install-models puts the task-assigner policies")
     p.add_argument("--overwrite-installed", action="store_true",
                    help="overwrite an evaluation model file that already exists")
 
@@ -2681,7 +3350,8 @@ def main(argv=None):
         export_drop(records, [d for d in rows if d["state"] in want],
                     os.path.join(os.path.abspath(os.path.expanduser(args.export)), label),
                     what=args.fetch_what, with_optimizer=args.fetch_optimizer,
-                    max_mb=args.max_fetch_mb, dry_run=args.fetch_dry_run)
+                    max_mb=args.max_fetch_mb, dry_run=args.fetch_dry_run,
+                    with_mixer=args.fetch_mixer)
         return 0
 
     if args.quick:
@@ -2765,7 +3435,7 @@ def main(argv=None):
     if args.format == "markdown":
         text = render_markdown(rows)
     elif args.format == "summary":
-        text = render_summary(rows)
+        text = render_summary(rows, diff_limit=10000 if args.diff_params else 8)
     elif args.format == "status":
         text = render_status(rows, batches)
     elif args.format == "html":
@@ -2808,18 +3478,29 @@ def main(argv=None):
             what=args.fetch_what, with_optimizer=args.fetch_optimizer,
             max_mb=args.max_fetch_mb, timeout=args.fetch_timeout,
             dry_run=args.fetch_dry_run or not args.fetch_models,
-            drop_root=drop_root)
+            drop_root=drop_root, with_mixer=args.fetch_mixer)
+        # ファイル名の通し番号は回収対象がすべて出そろってから 1 回だけ決める。
+        # publish と install で別々に採番すると番号がずれる
+        seed_idx = assign_seed_indexes(planned, args.publish_models)
+        if args.fetch_models and not args.fetch_dry_run:
+            write_install_hints(planned, args.fetch_models, seed_idx)
         if args.publish_models:
             dry = args.fetch_dry_run or not args.fetch_models
             auto = args.publish_commit or args.publish_push
             n_pub = publish_models(planned, args.publish_models, dry_run=dry,
-                                   hint=not auto)
+                                   hint=not auto, seed_idx=seed_idx)
             if auto and not dry:
                 publish_commit(args.publish_models, n_pub, push=args.publish_push)
+        # 共有フォルダの後始末は **配置が終わってから**。
+        # publish より先に消すと、配置に失敗したとき原本が無くなる
+        if args.purge_drop and args.fetch_models and not args.fetch_dry_run:
+            purge_drop_models(planned, hosts, drop_root)
+
         if args.install_models:
             install_models(planned, args.models_dir,
                            overwrite=args.overwrite_installed,
-                           dry_run=args.fetch_dry_run or not args.fetch_models)
+                           dry_run=args.fetch_dry_run or not args.fetch_models,
+                           seed_idx=seed_idx, task_dir=args.task_models_dir)
 
     if args.notion or args.notion_dry_run:
         if not token:

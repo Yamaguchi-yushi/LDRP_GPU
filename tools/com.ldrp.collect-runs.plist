@@ -1,16 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  1 時間ごとに全ホストを巡回して Notion を更新し、完遂した run の方策モデルを回収する。
+  15 分ごとに全ホストを巡回し、完遂した run の方策モデルを回収・保管する。
 
     cp tools/com.ldrp.collect-runs.plist ~/Library/LaunchAgents/
-    # NOTION_TOKEN を書き換えてから
+    # USERNAME を自分のものに置換してから
     launchctl load ~/Library/LaunchAgents/com.ldrp.collect-runs.plist
     launchctl start com.ldrp.collect-runs
     tail -f /tmp/ldrp_collect.log
 
-  30 分ごとに 収集 -> 完了/異常のポップアップ -> Notion 更新 -> モデル回収 を行い、
-  常駐パネル用の要約を ~/.ldrp/status.txt に書き出す。
-  パネル側はこのファイルを読むだけなので一瞬で表示できる。
+  やること:
+    収集 -> 完了/異常のポップアップ -> モデル回収 -> 保管リポジトリへ配置
+    -> 共有フォルダの後始末 -> 常駐パネル用の要約を ~/.ldrp/status.txt に書く
+
+  ダッシュボードを開いていなくても溜まるので、こちらが本体。
+  ダッシュボード側の --collect-every は「開いている間だけ」の補助。
 
   学習が終わった瞬間に近いタイミングで知りたい場合は、
   com.ldrp.quick-check.plist (2 分ごとの軽い完了チェック) も一緒に入れる。
@@ -19,7 +22,11 @@
 
   評価用ディレクトリへの設置まで自動でやりたい場合は、ProgramArguments に
   install-models (先頭にハイフン 2 つ) を 1 要素足す。
-  src/all_policy/models/safe/ に書き込むので、先に手動で挙動を確かめてから有効にすること。
+  src/all_policy/models/safe/ と src/task_assign/models/safe/ に書き込むので、
+  先に手動で挙動を確かめてから有効にすること。
+
+  Notion への書き出しは使わなくなった (ダッシュボードに置き換え)。
+  戻すときは notion (ハイフン 2 つ) と NOTION_TOKEN を足す。
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -35,25 +42,25 @@
     <string>--cache</string>
     <string>/Users/USERNAME/LDRP/tools/.run_cache.jsonl</string>
     <string>--notify</string>
-    <string>--notion</string>
     <string>--fetch-models</string>
-    <string>/Users/USERNAME/LDRP/models_inbox</string>
+    <string>/Users/USERNAME/models_inbox</string>
+    <string>--publish-models</string>
+    <string>/Users/USERNAME/LDRP_models</string>
+    <string>--purge-drop</string>
     <string>--format</string>
     <string>status</string>
     <string>-o</string>
     <string>/Users/USERNAME/.ldrp/status.txt</string>
   </array>
 
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NOTION_TOKEN</key><string>ntn_xxxxxxxxxxxxxxxx</string>
-  </dict>
-
-  <!-- 1800 秒 = 30 分ごと (重い全体収集)。
-       「終了したらすぐ」は com.ldrp.quick-check.plist が 2 分ごとに拾うので、
-       こちらは Notion 更新・モデル回収・パネル更新を担当する。
+  <!-- 900 秒 = 15 分ごと。
+       これより短くしても情報は増えない: 共有フォルダ側 (黒 / M2) は
+       相手の launchd が 1 時間おきにしか書かないため。
+       SSH ホストの走査は相手のディスクを 1 回 20MB ほど読むので、
+       学習中のマシンに余計な負荷をかけないためにも短くしすぎない。
+       「終了したらすぐ」は com.ldrp.quick-check.plist が 2 分ごとに拾う。
        Mac がスリープしていた間は飛ばされ、復帰後の次の回で実行される -->
-  <key>StartInterval</key><integer>1800</integer>
+  <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
 
   <key>WorkingDirectory</key><string>/Users/USERNAME/LDRP</string>

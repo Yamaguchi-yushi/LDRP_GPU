@@ -34,3 +34,10 @@ tools/plan.md
 
 # plan.md のバックアップ
 tools/plan.md.bak
+
+# 実験計画とローカル状態 (マシンごとに違う / 白が master)
+tools/plans/
+tools/.host_seen.json
+tools/*.bak
+tools/*.bak2
+tools/.run_cache.jsonl.bak*

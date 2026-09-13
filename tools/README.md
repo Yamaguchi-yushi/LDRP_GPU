@@ -2,9 +2,10 @@
 
 | ツール | 対象 | 何をするか |
 |---|---|---|
-| [collect_runs.py](collect_runs.py) | **方策学習** | 全マシンの run を収集し、状態・進捗・終了予定を出す。モデル回収、Notion 同期 |
+| [collect_runs.py](collect_runs.py) | **方策学習** | 全マシンの run を収集し、状態・進捗・終了予定を出す。方策モデルの回収と保管 |
 | [eval_report.py](eval_report.py) | **方策評価** | `results/summary.csv` を条件ごとに分解して表示 |
-| [plan.py](plan.py) | 実験計画 | Notion の表 (`plan.md`) をそのままパースする |
+| [plan.py](plan.py) | 実験計画 | `plans/*.md` をパースする。Notion の表をそのまま貼れる |
+| [VISIT_CHECKLIST.md](VISIT_CHECKLIST.md) | 運用 | 他マシンに触れる日の作業手順 |
 | [dashboard/](dashboard/) | 両方 | ローカル Web アプリ (学習の進捗 / 評価結果 の 2 タブ) |
 
 **収集される側のマシン** (SSH で繋がらない Mac など) のセットアップは
@@ -13,9 +14,10 @@
 
 ---
 
-# collect_runs.py — 学習 run のマシン横断収集 & Notion 同期
+# collect_runs.py — 学習 run のマシン横断収集
 
 Notion に seed と条件を手で書き写す作業を無くすためのツール。
+**日常の確認は [dashboard/](dashboard/) を使う** (Notion 連携は残っているが既定では使わない)。
 **実装の説明 (なぜその作りにしたか) は [design/run_collector.md](../design/run_collector.md)**。
 各マシンの sacred 出力を読んで「どの条件の seed が、どこまで学習したか」を 1 つの表にする。
 
@@ -137,10 +139,10 @@ python tools/collect_runs.py -c tools/collect_config.yaml --format table -v
 [別の Mac]                            [共有フォルダ]                     [集約する Mac]
  collect_runs.py --export  ───────>   LDRP_runs/MacB/runs.jsonl   ───>   collect_runs.py
    自分の sacred を読む                 LDRP_runs/MacB/models/...          (drop: true で読む)
-   完遂モデルをコピー                                                       Notion 更新 / 設置
+   完遂モデルをコピー                                                       保管リポジトリへ配置 / 設置
 ```
 
-**相手のマシン側** (1 時間ごとに書き出す):
+**相手のマシン側** (15 分ごとに書き出す):
 
 ```bash
 python tools/collect_runs.py \
@@ -150,7 +152,9 @@ python tools/collect_runs.py \
 
 定期実行の定義は [com.ldrp.export-runs.plist](com.ldrp.export-runs.plist) を使う
 (`USERNAME` と `MacB` を書き換えて `~/Library/LaunchAgents/` へ)。
-このコマンドは **Notion にも外部にも一切アクセスしない**。共有フォルダに書くだけ。
+このコマンドは **外部に一切アクセスしない**。共有フォルダに書くだけ。
+進捗ファイル (`runs.jsonl`) を**モデルより先に**書くので、モデルの同期が
+詰まっても進捗は最新になる。
 
 **集約する Mac 側** ([collect_config.yaml](collect_config.yaml)):
 
@@ -166,8 +170,13 @@ hosts:
 
 ```bash
 python tools/collect_runs.py -c tools/collect_config.yaml \
-    --notion --fetch-models models_inbox --install-models --format none
+    --cache tools/.run_cache.jsonl \
+    --fetch-models ~/models_inbox --publish-models ~/LDRP_models \
+    --purge-drop --format status
 ```
+
+`--purge-drop` は**回収できたモデルだけ**を共有フォルダから消す
+(ローカルに同じサイズのファイルがあることを確認してから消す)。iCloud の容量対策。
 
 > - 相手側が書き出す量は「done の run の最終ステップだけ」なので実測 **35 run で 29MB**。
 >   iCloud の無料 5GB でも十分収まる

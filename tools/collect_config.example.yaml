@@ -44,6 +44,8 @@ hosts:
   - label: GPU1
     ssh: user@your-gpu-host          # ~/.ssh/config の Host 名でもよい
     python: python3                  # リモートの python (conda env のフルパスでも可)
+    # connect_timeout: 15            # TCP 接続の待ち時間 (既定 8 秒)。
+                                     # 長くすると VPN 未接続のとき毎回待たされる
     repos:
       - ~/LDRP
 
@@ -60,12 +62,17 @@ hosts:
   # 相手側で --export を回しておけば、こちらは drop_root/<label>/ を読むだけになる
   # - label: MacB
   #   drop: true          # true = 上の drop_root を使う。別パスにしたければそのパスを書く
+  #   export_interval_min: 60   # 相手が何分おきに --export するか (次項参照)
 
   # --- 黒 (別の Mac。SSH は使わず共有フォルダ経由) --------------------------
   # 黒側で 1 時間ごとに --export すると、drop_root/黒/ に runs.jsonl と
   # モデルが置かれる。こちらはそれを読むだけ (黒に待受ポートを開けない)
   - label: 黒
     drop: true
+    # 相手の launchd が何分おきに --export するか。書いておくと
+    # 「通常の 2 倍たっても来ない」で遅延を検出できる。
+    # 書かなければ実測から学習する (tools/.host_seen.json に蓄積)
+    export_interval_min: 60
 
   # --- Ubuntu -------------------------------------------------------------
   # - label: Ubuntu

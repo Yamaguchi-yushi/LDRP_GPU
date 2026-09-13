@@ -29,7 +29,12 @@
   </array>
 
   <!-- 3600 秒 = 1 時間ごと -->
-  <key>StartInterval</key><integer>3600</integer>
+  <!-- 900 秒 = 15 分ごと。集約側 (白) の収集間隔と揃えてある。
+       runs.jsonl (数百 KB) は毎回書き直すが、モデルは既に共有フォルダに
+       あるものを飛ばすので、2 回目以降はほぼ走査だけ (実測 0.4 秒)。
+       進捗ファイルはモデル転送より先に書くので、iCloud のアップロードが
+       詰まっても進捗だけは最新になる -->
+  <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
 
   <key>StandardOutPath</key><string>/tmp/ldrp_export.log</string>

@@ -41,3 +41,8 @@ tools/.host_seen.json
 tools/*.bak
 tools/*.bak2
 tools/.run_cache.jsonl.bak*
+
+# 学習の副産物・個人設定
+# (gitignore は行末コメントを解釈しないので、説明は必ず独立行に書く)
+tmp_results/
+.claude/skills/

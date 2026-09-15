@@ -27,18 +27,26 @@ def parse_log(text):
 def load_runs(root):
     """root 配下の *.txt を読み、条件 -> {seed: rec} にまとめる."""
     conditions = OrderedDict()
-    for path in sorted(glob.glob(os.path.join(root, "**", "*.txt"), recursive=True)):
+    mtimes = {}
+    paths = sorted(glob.glob(os.path.join(root, "**", "*.txt"), recursive=True), key=lambda p: os.path.getmtime(p))
+    for path in paths:
+        mt = os.path.getmtime(path)
         with open(path, "r", errors="replace") as f:
             for rec in parse_log(f.read()):
                 cond = rec.get("condition", "(unknown)")
                 seed = rec.get("model_seed", "0")
                 bucket = conditions.setdefault(cond, OrderedDict())
+                key = (cond, seed)
                 if seed in bucket:
+                    old = mtimes.get(key, 0)
+                    if mt < old:
+                        continue  # 古い方は無視
                     # 同じ条件 x 同じ seed が 2 回出た = 再実行 or 条件名の衝突.
                     # 黙って 2 seed として数えると std が偽物になるので警告して上書き
                     print(f"  [warn] duplicate entry for {cond} seed{seed}; "
                           f"keeping the last one ({path})")
                 bucket[seed] = rec
+                mtimes[key] = mt
     return conditions
 
 

@@ -27,6 +27,7 @@
     - [12.3 train.py の実行予定を枠として見せる](#123-trainpy-の実行予定を枠として見せる)
     - [12.4 評価結果ダッシュボード](#124-評価結果ダッシュボード)
     - [12.5 実験計画の複数ファイル化 (plan_AAMAS.md / plan_XXX.md)](#125-実験計画の複数ファイル化-plan_aamasmd--plan_xxxmd)
+    - [12.6 学習曲線の CSV をフォルダに整理する (make_graph へ渡すまで)](#126-学習曲線の-csv-をフォルダに整理する-make_graph-へ渡すまで)
 
 ---
 
@@ -525,6 +526,46 @@ cron / systemd から環境変数を渡すのは面倒なので、**ファイル
 
 **やること**: `tools/train_sweep.py` + `tools/sweep_conditions.yaml` を追加する
 (`train.py` は書き換えず、別ファイルとして足す)。
+
+#### 調査結果 (2026-09-22)
+
+**計画表だけでは起動コマンドを組めない。** train.py が渡している `env_args` のうち
+**15 個が計画表に無い**:
+
+```text
+time_limit / state_repre_flag / task_arrival / task_density / task_p_high / task_p_low
+task_switch_prob / mmpp_ratio / rand_p_min / rand_p_max
+min_active_agents / max_active_agents / randomize_initial_active
+use_lare_path_training / allow_reassign_before_pickup
+```
+
+ただし**完了済み run の `config.json` が正解を持っている**ので、同条件の過去 run から
+復元できる。実測 (2026-09-22 時点、未充足 51 条件 / 残り 236 本):
+
+| | 条件数 |
+|---|---|
+| 設定の手本になる完了 run がある | 18 |
+| 手本が無い (新規に組む必要) | 33 |
+
+未充足の内訳は **44 条件が PPO 割当** (うち 12 が dynamic)。
+
+#### 段階を分ける
+
+| 段階 | 内容 | リスク |
+|---|---|---|
+| **1. 提案だけ** | ダッシュボードに「次に回すべき条件」と**起動コマンド**を出す。実行は手動 | ほぼ無し |
+| 2. 手本がある条件だけ自動起動 | 過去の config.json を複製し seed だけ変える | 中 |
+| 3. 全自動 | 手本の無い 33 条件の設定も組む | 高 |
+
+**段階 1 から始めるべき理由 (実例):** 2026-09-15 に黒で、`map_aoba00 10agent 150M` の
+設定を流用したまま map だけ `map_8x5` に変えた run が 2 本起動していた
+(正しくは t_max 50M、LaRe 系列も 8x5 用)。10 日走る計画外の run になり、途中で停止した。
+**画面からコマンドを複製できれば起きない。**
+
+#### 先に決めないといけないこと
+
+**dynamic の 12 条件は `min_active_agents` / `max_active_agents` が未決**。
+ここが決まらないと、手本があっても正しいコマンドを作れない。
 
 ```yaml
 common:                          # 全条件に効く
@@ -1070,3 +1111,192 @@ AAMAS の条件に一致する run は `plan_AAMAS.md` の表に、別の計画�
 
 seed の通し番号 (§4) を計画ではなく `eval_stem` 単位にしてあるので、
 **計画を分割してもモデルのファイル名は動かない**。この不変条件は維持する。
+
+---
+
+### 12.6 学習曲線の CSV をフォルダに整理する (make_graph へ渡すまで)
+
+**ステータス:** 未実装。方針と検証結果のみ。
+
+**担当範囲:** tb_logs から CSV を取り出し、**make_graph が読めるフォルダに並べるところまで**。
+作図は [make_graph](https://github.com/Yamaguchi-yushi/make_graph) の GUI で手作業で行う
+(凡例・色・軸の調整を目で見ながらやりたいため)。**こちらは作図しない。**
+
+```text
+各マシンの tb_logs/  ──抽出──>  results/curves/{条件}/{手法名}/run-{token}/*.csv
+                                                    │
+                                                    └─ make_graph の GUI に読ませる (手作業)
+```
+
+#### 検証済みの事実 (2026-09-19 に実機で確認)
+
+**1. TensorBoard の «Download CSV» は不要。** event ファイルを直接読める。
+
+```python
+from tensorboard.backend.event_processing import event_accumulator
+ea = event_accumulator.EventAccumulator(run_dir, size_guidance={"scalars": 0})
+ea.Reload()
+for e in ea.Scalars("test_task_completion_mean"):
+    ...   # e.wall_time, e.step, e.value  = CSV の 3 列そのもの
+```
+
+`tensorboard` は既に依存に入っているので追加インストールは要らない。
+実際に CSV を生成 → make_graph で作図まで通ることを確認した。
+
+**2. 記録されている scalar は 77 種。** タスク関連も全部ある。
+
+| 分類 | tag |
+|---|---|
+| タスク | `task_completion_mean` / `task_completion_per_agent_mean` / `task_arrival_mean` / `task_dropped_mean` |
+| 待ち行列 | `pending_len_avg_mean` / `pending_len_max_mean` / `unassigned_len_avg_mean` / `unassigned_len_final_mean` |
+| 効率 | `agent_steps_per_task_mean` / `deadhead_ratio_mean` / `busy_ratio_mean` / `service_time_mean_mean` / `pickup_wait_mean_mean` |
+| 安全 | `collision_mean` / `safety_intervention_count_mean` |
+| 台数可変 | `n_active_mean_mean` / `saturated_ratio_mean` |
+| 基本 | `return_mean` / `goal_mean` / `timeup_mean` / `wait_mean` / `ep_length_mean` |
+
+**`test_` 付きが評価時の値**。論文に載せるならそちら。
+**指標によって記録している run 数が違う** (後から追加された指標は古い run に無い)
+ので、条件によっては seed が揃わない。
+
+**3. 出力するフォルダ構成は PAAMS のとき (`~/PAAMS_yamaguchi/data/`) と同じでよい。**
+
+```text
+results/curves/
+└── {map}-v2_{N}agent/                        ← 1 つの図に対応
+    ├── _meta.json                            ← 手法名・色・並び順
+    ├── Baseline/                             ← **フォルダ名がそのまま凡例のラベル**
+    │   └── run-{unique_token}/               ← seed ごと
+    │       ├── run-{unique_token}-tag-goal_mean.csv
+    │       └── run-{unique_token}-tag-collision_mean.csv
+    ├── LaRe/
+    └── Safe-TSL-DBCT/
+```
+
+`_meta.json`:
+
+```json
+{"version": 1,
+ "methods": [{"name": "Baseline", "color": "#03AF7A", "order": 0},
+             {"name": "LaRe",     "color": "#005AFF", "order": 1}]}
+```
+
+make_graph の Web アプリは「手法」を単位に持ち、その `name` が凡例になる
+([app.py](https://github.com/Yamaguchi-yushi/make_graph) の `add_method`)。
+**フォルダ名 = 凡例のラベル**。
+
+**指標の指定は要らない。** make_graph はファイル名の `-tag-{metric}` から
+指標を自動検出し (`detect_metric`)、**指標ごとに図を分けて出力する**。
+map と台数も `extract_map_name` / `extract_agent_count` がファイル名から取る。
+1 つのフォルダに複数指標の CSV が混在していてよい (PAAMS の data/ が実際そう)。
+
+束ね方はこちらの想定どおりに対応する:
+
+| やりたいこと | make_graph 側の単位 |
+|---|---|
+| 同じ (マップ, 台数) を 1 つの図に | `{map}-v2_{N}agent` フォルダ = 1 図 |
+| 同じ条件を複数 seed として扱う | `{手法名}/run-*/` の各フォルダが 1 seed。平均 ± 標準偏差になる |
+| 指標を選ぶ | **不要**。ファイル名から自動で分かれる |
+
+**ファイル名を作るときの注意:** `extract_map_name` は `map_` の後ろを
+`-tag-` か日付まで拾う。epymarl の unique_token には `:` が入る
+(`drp_env:drp_safe-7agent_map_aoba00-v2_2026-07-29 00:37:11...`) ので、
+**`:` を `_` に置換する** (フォルダ名にも使えない)。PAAMS の実物もそうなっている。
+
+```text
+drp_env:drp_safe-3agent_map_8x5-v2  ->  drp_env_drp_safe-3agent_map_8x5-v2
+```
+
+> CLI (`make_multi_panel_plots.py`) に直接渡す場合は規約が違い、
+> **ラベルを tag 名の後ろに付ける** (`-tag-{metric}_{ラベル}.csv`) 必要がある。
+> sidecar `.method` では効かず、全 run が 1 本に潰れる。GUI 運用なら関係ない。
+
+#### 実装方針
+
+**唯一こちらで書く必要があるのが「条件 → 手法名」の対応表。** それ以外は導出できる。
+
+```yaml
+# collect_config.yaml
+curves:
+  metrics: [test_goal_mean, test_collision_mean, test_task_completion_mean]
+  figures:
+    - name: "{map}_{agents}agent"          # フォルダ名のテンプレート
+      methods:                             # 条件の指定は計画表と同じ軸 -> plan.matches() を流用
+        - {name: "QMIX",     color: "#03AF7A", algo: qmix,  setting: safe}
+        - {name: "MAPPO",    color: "#005AFF", algo: mappo, setting: safe}
+        - {name: "MAT",      color: "#FF0000", algo: mat,   setting: safe}
+        - {name: "MAT+LaRe", color: "#F6AA00", algo: mat,   setting: dbct}
+```
+
+- `order` は並び順そのままにする (書かなくてよい)
+- `setting: dbct` は `method_tag` と突き合わせる。`lare_chain` で正規化済みなので
+  **正規の系列だけが `dbct`** になり、外れた系列は混ざらない
+
+**抽出の場所**
+
+| 経路 | どうするか |
+|---|---|
+| local (白) | そのまま読む |
+| ssh (GPU) | 自己送出スクリプトで**リモート側で抽出し CSV だけ持ち帰る**。event ファイルは大きい |
+| 共有フォルダ (黒 / M2) | `--export` に抽出を足す。**進捗ファイルより後**に置く (export_drop の順序と同じ理由) |
+
+抽出済みの run は uid で飛ばす。
+
+#### 保留: どの指標を主軸にするか (2026-09-22 時点で未決)
+
+**サイズの差は指標の種類ではなく記録頻度で決まる** (実測):
+
+| | 点数 | 1 指標あたり | 備考 |
+|---|---|---|---|
+| 学習時 (`log_interval` 10000) | 3,424 | 110〜170 KB | |
+| 評価時 (`test_*`, `test_interval` 50000) | 856 | 27〜39 KB | **4 分の 1** |
+
+1 run で全 36 指標 = 3.5 MB。420 run (84 条件 x 5 seed) なら **1.5 GB**。
+`test_*` 13 指標だけなら 0.2 GB。**全部出すのは容量的に適切でない**ので、
+指標は設定で選ぶ (`curves.metrics`)。既定は後述の保留事項が片付いてから決める。
+
+**比較の公平性に関わる事実 (調査済み・変更していない):**
+
+epymarl は**アルゴリズムの系統で評価時の行動選択が違う**。これは epymarl 本体の
+設計で、こちらの設定ミスではない (`3d2d55d first commit` から不変)。
+
+| 系統 | action_selector | 評価時 (`test_mode=True`) |
+|---|---|---|
+| 価値ベース (qmix / iql / vdn / qplex) | `epsilon_greedy` | **argmax** (`evaluation_epsilon: 0.0`) |
+| 方策勾配 (mappo / mat / mat_dec / ippo / maa2c / coma) | `soft_policies` | **π からサンプリング** (`SoftPoliciesSelector` は `test_mode` を見ない) |
+
+- 方策勾配系では「確率方策そのものが学習結果」なので、サンプリングのまま評価するのが
+  epymarl の立場。argmax にすると別物の方策を測ることになる
+- **学習時の指標は系統をまたいで比較できない** (QMIX は ε ノイズ、方策勾配系は π の
+  エントロピーが混ざり、しかも両者とも学習とともに変化する)
+- `test_*` なら「完成した方策をそのまま動かした結果」で土俵は揃う。
+  `episode_seed_base` を固定すればシナリオも揃う
+
+変えたい場合は `action_selector: "multinomial"` にすると `test_greedy: True`
+(`default.yaml` に既存) が効いて argmax になる。ただし epymarl の慣行から外れ、
+**既に回した結果と混ぜられなくなる**ので、論文での説明とセットで判断すること。
+
+#### 決めていないこと
+
+| 論点 | 選択肢 |
+|---|---|
+| **主軸を test_* にするか** | **保留**。上記の通り学習時は系統間比較に向かないが、最終判断は未 |
+| 間引くか | 3,424 点 -> 1,000 点で容量 1/3。ただし `collision_mean` のようなスパイクが消える恐れ |
+| 実行中の run も抽出するか | (a) 完了した run だけ (モデル回収と同じ) / (b) 途中も定期的に |
+| CSV の置き場所 | `results/curves/` は `.gitignore` 済み。保管リポジトリに入れるかは別途 |
+| 図の束ね方の第 2 軸 | PAAMS では `_ablation_study` という別の束ね方も併存していた。同じ run を複数の図に入れられるようにするか |
+
+#### 注意: python 環境が分かれる
+
+| | 必要なもの | 環境 |
+|---|---|---|
+| 抽出 (こちら) | `tensorboard` | `/opt/anaconda3/envs/ldrp/bin/python` |
+| 作図 (make_graph) | `pandas` / `matplotlib` / `flask` | `/opt/anaconda3/bin/python` |
+
+`ldrp` 環境に pandas は入っていない。**抽出だけこちらで完結させ、
+作図は make_graph 側の環境に任せる**ので、依存を混ぜる必要はない。
+
+#### 先にやっておくとよいこと
+
+seed の通し番号 (§ `assign_seed_indexes`) と `eval_model_stem` を**モデルと共有**する。
+そうすれば「グラフのこの線のモデルはどれか」がファイル名だけで辿れる。
+別体系にすると対応が取れなくなる。

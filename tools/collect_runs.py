@@ -685,8 +685,14 @@ def _num(v):
 DATA_STALE_SEC = 3 * 3600
 
 
+def norm_chain(text):
+    """LaRe 系列の表記ゆれを吸収する ("→" と空白のどちらでも同じ扱い)."""
+    t = re.sub(r"\s*(?:→|->|=>)\s*", " ", str(text or "")).strip()
+    return " ".join(t.split())
+
+
 def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
-           data_stale_sec=DATA_STALE_SEC):
+           data_stale_sec=DATA_STALE_SEC, lare_chain=None):
     """スキャン結果から Notion 列に対応する派生フィールドを作る."""
     cfg, env = rec.get("cfg") or {}, rec.get("env") or {}
     d = dict(rec)
@@ -808,6 +814,14 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         d["method_tag"] = "unsafe"
     else:
         d["method_tag"] = tag_map.get(d["lare_mode"], "")
+        # map ごとに「正規の LaRe 系列」を決めてあるなら、それ以外の系列は
+        # 別のタグにする。全部 dbct にすると、事前学習の経路が違うのに
+        # 同じファイル名になって取り違える (実測で 3 stem が衝突していた)
+        canon = (lare_chain or {}).get(d.get("map"))
+        if canon and d["lare_mode"] in ("pretrained", "finetuning"):
+            if norm_chain(d.get("setting")) != norm_chain(canon):
+                d["method_tag"] = "%s_%s" % (d["method_tag"] or "dbct",
+                                             _slug(d.get("setting"), "alt"))
 
     # 想定 t_max との照合. モデルの選択には使わない (使うのは run の t_max) が、
     # 「30M 回すつもりだったのに 10M で止めた run」を取り違えないための確認用
@@ -1000,7 +1014,8 @@ def collect_drop(host, drop_root, stale_hours=24):
 
 
 def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
-                max_mb=2000.0, dry_run=False, with_mixer=False):
+                max_mb=2000.0, dry_run=False, with_mixer=False,
+                with_critic=False):
     """自分の run 一覧とモデルを共有フォルダへ書き出す (--export).
 
     共有フォルダは iCloud Drive / Dropbox / NFS / USB など何でもよい。
@@ -1019,7 +1034,8 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
         model = rec.get("model")
         if d is None or not model:
             continue
-        files = select_model_files(model, what, with_optimizer, with_mixer)
+        files = select_model_files(model, what, with_optimizer, with_mixer,
+                                   with_critic)
         if not files:
             continue
         dest_name = model_dest_name(d)
@@ -1471,7 +1487,12 @@ def dashboard_data(rows, batches, errors, saved=None, cadence=None):
             m["via"] = d.get("observed_via")
     for label, m in mach.items():
         cad = cadence.get(label) or {}
-        m["interval_sec"] = cad.get("interval_sec")
+        # 「いつもの間隔」が意味を持つのは共有フォルダ経由だけ。
+        # local / ssh の観測時刻は **こちらが収集した時刻** なので、
+        # そこから学習した間隔は「ツールを何分おきに回したか」でしかない
+        m["interval_sec"] = (cad.get("interval_sec")
+                             if (m.get("via") == "drop" or cad.get("declared"))
+                             else None)
         m["interval_n"] = cad.get("n") or 0
         m["overdue_sec"] = overdue_sec(m["interval_sec"])
         m["stale_data"] = bool(m["data_age_sec"] is not None
@@ -1710,7 +1731,7 @@ def _rel_under_step(model, rel):
 
 
 def select_model_files(model, what="path", with_optimizer=False,
-                       with_mixer=False):
+                       with_mixer=False, with_critic=False):
     """回収するファイルを絞る.
 
     epymarl の新しい保存形は <step>/path/{agent,mixer,opt}.th と <step>/task/*.th。
@@ -1719,7 +1740,7 @@ def select_model_files(model, what="path", with_optimizer=False,
     (TP / FIFO の run には task/ が無いので自然に経路だけになる)。
     opt.th / agent_opt.th / critic_opt.th (optimizer state) は評価に要らないので既定で外す。
 
-    mixer.th も既定で外す。QMIX の学習を再開するときにしか使わず、評価側
+    mixer.th と critic.th も既定で外す。学習を再開するときにしか使わず、評価側
     (src/all_policy / test.py / runner.py) はどこからも読まない。それでいて
     agent.th の 15 倍あり (実測 平均 1.24MB 対 80KB)、共有フォルダの 93% を
     占めていた。再開したくなったら元のマシンに残っている。
@@ -1733,6 +1754,11 @@ def select_model_files(model, what="path", with_optimizer=False,
         if not with_optimizer and os.path.basename(sub).endswith("opt.th"):
             continue
         if not with_mixer and os.path.basename(sub) == "mixer.th":
+            continue
+        # critic も学習専用。評価側はどこからも読まない
+        # (MAT ですら agent.th の中の decoder.* だけ使い critic.* は捨てる:
+        #  src/all_policy/mat_policy_runner.py)
+        if not with_critic and os.path.basename(sub) == "critic.th":
             continue
         picked.append((rel, sub, size))
     return picked
@@ -1787,22 +1813,106 @@ def eval_model_filename(d, seed_index=None):
     return "%s_seed%s.th" % (eval_model_stem(d), n)
 
 
-def assign_seed_indexes(planned, repo_dir=None):
-    """回収対象に stem ごとの通し番号を割り当てて {stem: {生 seed: 番号}} を返す.
+def assign_seed_indexes(planned, repo_dir=None, conds=None, planned_only=True):
+    """保管する run に stem ごとの通し番号を割り当てて {stem: {生 seed: 番号}} を返す.
 
     既に manifest に載っているものはその番号を引き継ぐ。新規は **学習を開始した順**
     に 0,1,2,... と振るので、表に並べた順とファイル名の番号が一致する。
+
+    **採番の対象は「実際に保管する run」だけ**にする。計画外の run にも番号を
+    配ってしまうと、若い番号がそちらに食われて計画内の条件が seed5..9 のように
+    飛び番になる (実測で 40 条件中 14 条件がそうなっていた)。
+    評価側は model_seed=0 が既定なので、0 から詰まっていないと困る。
     """
     table = load_seed_index(repo_dir) if repo_dir else {}
     fresh = [t for t in planned if t[0].get("state") == "done"]
+    if planned_only and conds:
+        fresh = [t for t in fresh if plans_of(t[0], conds)]
     fresh.sort(key=lambda t: (str(t[0].get("start_time") or ""), str(t[0].get("seed"))))
+
+    # 1 巡目: **実験計画の表に書いてある行順**をそのまま番号にする。
+    # seed0 が表の 1 行目に対応するので、ファイル名から表を引ける
+    for d, _o, _f in fresh:
+        stem = eval_model_stem(d)
+        tab = table.setdefault(stem, {})
+        key = str(d.get("seed"))
+        if key in tab:
+            continue
+        pos = plan_row_of(d, conds)
+        if pos is not None and pos not in tab.values():
+            tab[key] = pos
+
+    # 2 巡目: 表に無い seed は空いている番号へ詰める
     for d, _o, _f in fresh:
         tab = table.setdefault(eval_model_stem(d), {})
         key = str(d.get("seed"))
-        if key not in tab:
-            # len ではなく max+1。間が抜けても既存の番号と衝突しない
-            tab[key] = max(tab.values()) + 1 if tab else 0
+        if key in tab:
+            continue
+        used = set(tab.values())
+        n = 0
+        while n in used:
+            n += 1
+        tab[key] = n
     return table
+
+
+def plan_row_of(d, conds):
+    """この run の seed が、計画表の何行目に書いてあるか (0 始まり). 無ければ None."""
+    if not conds:
+        return None
+    import plan as PLAN
+    want = str(d.get("seed"))
+    for c in conds:
+        if not PLAN.matches(c, d):
+            continue
+        for i, sl in enumerate(c.get("seeds") or []):
+            if sl.get("seed") and str(sl["seed"]) == want:
+                return i
+    return None
+
+
+def check_seed_order(planned, conds, seed_idx):
+    """計画表とモデルの対応を突き合わせ、ずれていたら知らせる.
+
+    - 表に無い seed のモデル (表を書き足し忘れ)
+    - 表にあるのにモデルが無い seed (回収できていない)
+    どちらも黙って進むと「seed0 が表の何行目か」が分からなくなる。
+    """
+    if not conds:
+        return
+    import plan as PLAN
+    from collections import defaultdict
+    got = defaultdict(set)
+    for d, _o, _f in planned:
+        if d.get("state") == "done":
+            got[id(None)]  # noqa - placeholder to keep defaultdict typed
+    have_seed = defaultdict(set)
+    for d, _o, _f in planned:
+        if d.get("state") != "done":
+            continue
+        for c in conds:
+            if PLAN.matches(c, d):
+                have_seed[id(c)].add(str(d.get("seed")))
+
+    off_table, missing = [], []
+    for c in conds:
+        planned_seeds = [str(sl["seed"]) for sl in (c.get("seeds") or []) if sl.get("seed")]
+        have = have_seed.get(id(c), set())
+        for sd in sorted(have - set(planned_seeds)):
+            off_table.append((PLAN.label(c), c.get("algo"), sd))
+        for sd in planned_seeds:
+            if sd not in have:
+                missing.append((PLAN.label(c), c.get("algo"), sd))
+    if off_table:
+        sys.stderr.write("[seed] %d model(s) whose seed is not written in the plan "
+                         "(numbered after the table rows):\n" % len(off_table))
+        for lab, algo, sd in off_table[:8]:
+            sys.stderr.write("    %-26s %-6s seed %s\n" % (lab, algo, sd))
+    if missing:
+        sys.stderr.write("[seed] %d seed(s) in the plan have no model yet:\n"
+                         % len(missing))
+        for lab, algo, sd in missing[:8]:
+            sys.stderr.write("    %-26s %-6s seed %s\n" % (lab, algo, sd))
 
 
 SEEN_PATH = "tools/.host_seen.json"
@@ -1892,9 +2002,12 @@ def load_saved_models(repo_dir):
                 continue
             got = {}
             for rel in rec.get("files") or []:
-                head = str(rel).split("/")[0]
-                if head in SUBSYS_ROOT:
-                    got[head] = rel
+                # files は "{計画名}/{path|task}/..." (計画名が無い古い記録もある)。
+                # 先頭だけ見ると計画名を拾ってしまうので、path/task の segment を探す
+                for seg in str(rel).split("/"):
+                    if seg in SUBSYS_ROOT:
+                        got[seg] = rel
+                        break
             if got:
                 out[uid] = got
     return out
@@ -2035,6 +2148,33 @@ def _record_fetch(dest, d, out_dir, files):
 
 
 
+def copy_cloud_file(src, dst):
+    """iCloud 上のファイルを安全にコピーする.
+
+    macOS の shutil.copy2 は内部で fcopyfile を使うが、実体が退避された
+    ファイル (ls -lO が dataless) だと
+      OSError: [Errno 11] Resource deadlock avoided
+    で落ちる。先に実体を落とし、それでも駄目なら素の読み書きで運ぶ。
+    """
+    import shutil
+    try:
+        subprocess.call(["brctl", "download", src],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    try:
+        shutil.copy2(src, dst)
+        return
+    except OSError:
+        pass                                  # fcopyfile が使えない。手で運ぶ
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        shutil.copyfileobj(fi, fo, 1024 * 1024)
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+
+
 def _fetch_drop(host, drop_root, items):
     """共有フォルダに置かれたモデルをコピーする (--export 済みのホスト用)."""
     import shutil
@@ -2054,7 +2194,7 @@ def _fetch_drop(host, drop_root, items):
                 os.makedirs(os.path.dirname(dst))
             except OSError:
                 pass
-            shutil.copy2(src, dst)
+            copy_cloud_file(src, dst)
     return None
 
 
@@ -2124,7 +2264,7 @@ def purge_drop_models(planned, hosts, drop_root, dry_run=False):
 
 def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
                  max_mb=2000.0, timeout=900, dry_run=False, drop_root=None,
-                 with_mixer=False):
+                 with_mixer=False, with_critic=False):
     """done の run の最終ステップのモデルを dest に集める.
 
     dest/{machine}/{algo}_{map}_{N}agents_seed{seed}_step{t_env}/path/agent.th
@@ -2142,7 +2282,8 @@ def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
         if not model:
             continue
         out_dir = os.path.join(dest, str(d.get("machine")), model_dest_name(d))
-        files = select_model_files(model, what, with_optimizer, with_mixer)
+        files = select_model_files(model, what, with_optimizer, with_mixer,
+                                   with_critic)
         if os.path.isdir(out_dir) and os.listdir(out_dir):
             skipped += 1
             present.append((d, out_dir, files))
@@ -2250,10 +2391,24 @@ def subsystem_of(sub):
     return SUBSYS_ROOT.get(head, "path")
 
 
-def publish_dir(d, sub="path/agent.th"):
+UNPLANNED_DIR = "_unplanned"
+
+
+def plans_of(d, conds):
+    """この run が一致する計画名のリスト。どれにも一致しなければ空."""
+    if not conds:
+        return []
+    import plan as PLAN                      # 白でしか使わないので遅延 import
+    return sorted(set(c["plan"] for c in conds if PLAN.matches(c, d)))
+
+
+def publish_dir(d, sub="path/agent.th", plan_name=None):
     """保管用リポジトリ内の配置先ディレクトリ.
 
-        {path|task}/{map}/{N}agent/{setting}/{algo}/{task_assign}[_dyn]/
+        {計画名}/{path|task}/{map}/{N}agent/{setting}/{algo}/{task_assign}[_dyn]/
+
+    先頭を計画名にすると「AAMAS で使うモデル一式」がフォルダごと取り出せる。
+    どの計画にも一致しない run は _unplanned/ へ (捨てずに残す)。
 
     経路方策は path/ 配下、タスク割当方策は task/ 配下。**その下の階層と
     ファイル名は完全に同じ**にしてあるので、同じ run から出た 2 本が
@@ -2271,7 +2426,8 @@ def publish_dir(d, sub="path/agent.th"):
     assign = _slug(d.get("task_assign") or "TP")
     if d.get("dynamic_agents"):
         assign += "_dyn"
-    return os.path.join(subsystem_of(sub), str(d.get("map")),
+    return os.path.join(_slug(plan_name or UNPLANNED_DIR, UNPLANNED_DIR),
+                        subsystem_of(sub), str(d.get("map")),
                         "%sagent" % d.get("agents"),
                         _slug(d.get("setting"), "safe"), str(d.get("algo")),
                         assign)
@@ -2293,7 +2449,8 @@ def publish_names(d, sub, seed_index=None):
     return "%s.%s" % (stem, base)          # 例: ..._seed123.mixer.th
 
 
-def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
+def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
+                   conds=None, planned_only=False):
     """回収したモデルを保管用リポジトリの階層へ配置する.
 
     git の commit / push はしない (外向きの操作なので明示的にやってもらう)。
@@ -2302,10 +2459,18 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
     repo_dir = os.path.abspath(os.path.expanduser(repo_dir))
     published = skipped = 0
     lines = []
-    refused, tmax_warn = 0, 0
+    refused, tmax_warn, unplanned = 0, 0, 0
 
     if seed_idx is None:
-        seed_idx = assign_seed_indexes(planned, repo_dir)
+        seed_idx = assign_seed_indexes(planned, repo_dir, conds, planned_only)
+    if planned_only and not conds:
+        # 計画が 1 条件も読めていないのに planned_only で走らせると、
+        # 「計画に無い」と判定されて **1 つも保管されない**。
+        # 設定ミスで静かに空になる方が危ないので、全部出す側に倒す
+        sys.stderr.write("[publish] no plan conditions loaded; publishing "
+                         "everything under %s/ instead of skipping all\n"
+                         % UNPLANNED_DIR)
+        planned_only = False
 
     for d, out_dir, files in planned:
         # 異常終了した run のモデルは保管しない。--fetch-state を広げて調査した
@@ -2317,6 +2482,13 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
             tmax_warn += 1
         stem = eval_model_stem(d)
         s_idx = seed_idx.get(stem, {}).get(str(d.get("seed")))
+        # この run が属する計画。複数に一致したらそれぞれへ置く
+        # (ファイルの中身は同じなので git は 1 blob しか持たない)
+        names = plans_of(d, conds)
+        if planned_only and not names:
+            unplanned += 1
+            continue
+        targets = names or [UNPLANNED_DIR]
         # 経路 (path/) と タスク割当 (task/) は別の木に置くので、
         # 配置先はファイルごとに決める
         srcs = []
@@ -2326,7 +2498,9 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
             src = os.path.join(out_dir, sub)
             # dry run では回収前なのでファイルがまだ無い。配置先だけ見せる
             if os.path.exists(src) or dry_run:
-                srcs.append((src, publish_dir(d, sub), publish_names(d, sub, s_idx)))
+                for pn in targets:
+                    srcs.append((src, publish_dir(d, sub, pn),
+                                 publish_names(d, sub, s_idx)))
         if not srcs:
             continue
         if all(os.path.exists(os.path.join(repo_dir, r, n)) for _s, r, n in srcs):
@@ -2348,7 +2522,7 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
         lines.append({
             "uid": d["uid"], "machine": d.get("machine"),
             "path": rel, "eval_name": eval_model_filename(d, s_idx),
-            "eval_stem": stem, "seed_index": s_idx,
+            "eval_stem": stem, "seed_index": s_idx, "plans": names,
             "t_max_expected": d.get("t_max_expected"), "t_max_ok": d.get("t_max_ok"),
             "map": d.get("map"), "agents": d.get("agents"), "algo": d.get("algo"),
             "seed": d.get("seed"), "t_max": d.get("t_max"),
@@ -2393,6 +2567,8 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None):
     sys.stderr.write("[publish] %d placed, %d already there -> %s%s\n"
                      % (published, skipped, repo_dir,
                         " (dry run)" if dry_run else ""))
+    if unplanned:
+        sys.stderr.write("[publish] %d run(s) skipped: not in any plan\n" % unplanned)
     if refused:
         sys.stderr.write("[publish] %d run(s) skipped: not finished cleanly\n" % refused)
     if tmax_warn:
@@ -2987,7 +3163,8 @@ def quick_check(conf, hosts, cache_path, tail_bytes, timeout, stale, tag_map,
             if not r.get(k) and old_rec.get(k):
                 r[k] = old_rec[k]
 
-    rows = [derive(r, stale, tag_map) for r in fresh]
+    rows = [derive(r, stale, tag_map, lare_chain=conf.get("lare_chain"))
+            for r in fresh]
     n = notify_transitions(rows, prev_states)
 
     state_by_uid = dict((d["uid"], d["state"]) for d in rows)
@@ -3229,6 +3406,8 @@ def main(argv=None):
                    help="after a successful fetch, delete the copied model files "
                         "from the shared folder to free iCloud space (leaves a "
                         ".fetched marker so the sender does not re-upload them)")
+    p.add_argument("--fetch-critic", action="store_true",
+                   help="also fetch critic.th (value function; training only)")
     p.add_argument("--fetch-mixer", action="store_true",
                    help="also fetch mixer.th (QMIX mixer; only needed to resume "
                         "training, and 15x the size of agent.th)")
@@ -3242,6 +3421,12 @@ def main(argv=None):
                    help="place fetched models into the archive repository as "
                         "path/{map}/{N}agent/{planner}_{tag}/{name}__{step}_{hash}/ "
                         "and append to its manifest.jsonl (does not commit or push)")
+    p.add_argument("--plan", action="append", default=None, metavar="GLOB",
+                   help="experiment plan file(s); used to group published models "
+                        "by plan name (default: tools/plans/*.md -> tools/plan.md)")
+    p.add_argument("--publish-all", action="store_true",
+                   help="also publish runs that match no plan (they go under "
+                        "%s/). default: only runs that are in a plan" % UNPLANNED_DIR)
     p.add_argument("--publish-commit", action="store_true",
                    help="commit the archive repository after placing models "
                         "(does nothing when there is no change)")
@@ -3341,7 +3526,8 @@ def main(argv=None):
         tag_map = conf.get("method_tag_by_lare_mode")
         stale_m = args.stale_minutes or conf.get("stale_minutes") or 90
         records = [r for r in dedupe(records)]
-        rows = [derive(r, stale_m, tag_map) for r in records]
+        rows = [derive(r, stale_m, tag_map, lare_chain=conf.get("lare_chain"))
+                for r in records]
         if min_steps:
             keep = set(d["uid"] for d in rows if (d.get("t_max") or 0) >= min_steps)
             records = [r for r in records if r["uid"] in keep]
@@ -3351,7 +3537,8 @@ def main(argv=None):
                     os.path.join(os.path.abspath(os.path.expanduser(args.export)), label),
                     what=args.fetch_what, with_optimizer=args.fetch_optimizer,
                     max_mb=args.max_fetch_mb, dry_run=args.fetch_dry_run,
-                    with_mixer=args.fetch_mixer)
+                    with_mixer=args.fetch_mixer,
+                    with_critic=args.fetch_critic)
         return 0
 
     if args.quick:
@@ -3407,7 +3594,8 @@ def main(argv=None):
 
     tag_map = conf.get("method_tag_by_lare_mode")
     exp_t_max = conf.get("expected_t_max")
-    rows = [derive(r, stale, tag_map, exp_t_max) for r in dedupe(raw)]
+    rows = [derive(r, stale, tag_map, exp_t_max,
+                   lare_chain=conf.get("lare_chain")) for r in dedupe(raw)]
 
     if args.notify:
         notify_transitions(rows, prev_states)
@@ -3478,17 +3666,34 @@ def main(argv=None):
             what=args.fetch_what, with_optimizer=args.fetch_optimizer,
             max_mb=args.max_fetch_mb, timeout=args.fetch_timeout,
             dry_run=args.fetch_dry_run or not args.fetch_models,
-            drop_root=drop_root, with_mixer=args.fetch_mixer)
+            drop_root=drop_root, with_mixer=args.fetch_mixer,
+            with_critic=args.fetch_critic)
         # ファイル名の通し番号は回収対象がすべて出そろってから 1 回だけ決める。
         # publish と install で別々に採番すると番号がずれる
-        seed_idx = assign_seed_indexes(planned, args.publish_models)
+        # 計画は白でしか読まない (リモートへ送るスクリプトには影響しない)
+        plan_conds = None
+        if args.publish_models:
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import plan as _PLAN
+                plan_conds = _PLAN.parse_plans(_PLAN.find_plans(args.plan))
+            except Exception as e:
+                sys.stderr.write("[publish] plan not loaded (%s: %s); "
+                                 "everything goes under %s/\n"
+                                 % (type(e).__name__, e, UNPLANNED_DIR))
+        # 採番は計画を読んだあと。計画外に若い番号を食われないようにする
+        seed_idx = assign_seed_indexes(planned, args.publish_models, plan_conds,
+                                       not args.publish_all)
+        check_seed_order(planned, plan_conds, seed_idx)
         if args.fetch_models and not args.fetch_dry_run:
             write_install_hints(planned, args.fetch_models, seed_idx)
         if args.publish_models:
             dry = args.fetch_dry_run or not args.fetch_models
             auto = args.publish_commit or args.publish_push
             n_pub = publish_models(planned, args.publish_models, dry_run=dry,
-                                   hint=not auto, seed_idx=seed_idx)
+                                   hint=not auto, seed_idx=seed_idx,
+                                   conds=plan_conds,
+                                   planned_only=not args.publish_all)
             if auto and not dry:
                 publish_commit(args.publish_models, n_pub, push=args.publish_push)
         # 共有フォルダの後始末は **配置が終わってから**。

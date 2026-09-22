@@ -107,6 +107,15 @@ expected_t_max:
 # (既存モデル 21 件は旧称 ours。run.py の method_tag リストに合わせて dbct にした)
 # 非 Safe 環境 (drp-*) で学習したモデルは、この表に関係なく "unsafe" になる
 # (design/multi_seed_eval.md の運用に合わせる)。
+# map ごとの「正規の LaRe 事前学習系列」。これに一致する run だけ method_tag が
+# dbct になり、外れた系列は dbct_<系列名> になる。
+# 分けないと、事前学習の経路が違うのにモデルのファイル名が同じになって
+# 取り違える (実測で 3 stem が衝突していた)。
+# 書かなければ従来どおり全部 dbct。
+lare_chain:
+  map_8x5: 8x5_2 10M→8x5_3 5M
+  map_aoba00: 8x5_2 10M→aoba00_2 5M
+
 # 別の軸 (タスク割当の同時学習など) で分けたくなったらここを書き換える
 method_tag_by_lare_mode:
   pretrained: dbct

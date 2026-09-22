@@ -123,6 +123,8 @@ class State(object):
 
         used = set()
         out = []
+        # パラメータが多数派とずれている run。印を付ける判断に使う
+        odd_uids = set(d["uid"] for d in CR.odd_param_runs(rows))
         for c in conds:
             hit = [d for d in rows if PLAN.matches(c, d)]
             by_seed = {}
@@ -139,13 +141,23 @@ class State(object):
                     run = shaped.get(d["uid"])
                 slots.append({"seed": sd, "machine": sl.get("machine"),
                               "reassign": sl.get("reassign"), "run": run})
-            # 計画に無い seed で回っているもの (捨てずに「計画外の seed」として出す)
+            # 計画に無い seed で回っているもの (捨てずに出す)。
+            # ただし印 (*) を付けるのは **不具合が疑わしいときだけ** にする。
+            # seed 欄を空けたまま自動検出に任せている条件では全行が黄色になり、
+            # 本当に見るべきものが埋もれるため (実測で 84 条件中 46 条件が空欄運用)。
             extra = []
             for sd, ds in by_seed.items():
                 for d in ds:
                     used.add(d["uid"])
+                    # suspect = **本当に見るべきもの**だけ。状態 / params✗ / t_max は
+                    # 別の欄に既に出ているので、ここで黄色にするのは
+                    # 「表に 5 seed 書いてあるのに、さらに別の seed が回っている」場合。
+                    # 取り違えか二重実行が疑われる
+                    full = sum(1 for sl in c["seeds"] if sl.get("seed")) >= c["want"]
                     extra.append({"seed": sd, "machine": d.get("machine"),
-                                  "run": shaped.get(d["uid"]), "unplanned_seed": True})
+                                  "run": shaped.get(d["uid"]),
+                                  "unplanned_seed": True,      # 表に無い = 補足情報
+                                  "suspect": bool(full and d.get("state") == "done")})
             # 同じ条件のはずなのにパラメータが割れていたら、**どのキーが違うか**を渡す。
             # ハッシュだけでは何を直せばよいか分からない
             pdiff, phashes = [], {}
@@ -189,7 +201,9 @@ class State(object):
         raw = [r for r in raw if r.get("kind") != "batch"]
         stale = conf.get("stale_minutes") or 90
         rows = [CR.derive(r, stale, conf.get("method_tag_by_lare_mode"),
-                          conf.get("expected_t_max")) for r in CR.dedupe(raw)]
+                          conf.get("expected_t_max"),
+                          lare_chain=conf.get("lare_chain"))
+                for r in CR.dedupe(raw)]
         min_steps = conf.get("min_steps", 1e6)
         if min_steps:
             rows = [d for d in rows if (d.get("t_max") or 0) >= min_steps]
@@ -255,7 +269,9 @@ class State(object):
             merged = CR.dedupe(CR.read_cache(cache) + runs)
             stale = conf.get("stale_minutes") or 90
             rows = [CR.derive(r, stale, conf.get("method_tag_by_lare_mode"),
-                              conf.get("expected_t_max")) for r in merged]
+                              conf.get("expected_t_max"),
+                              lare_chain=conf.get("lare_chain"))
+                    for r in merged]
             by_uid = dict((d["uid"], d["state"]) for d in rows)
             for r in merged:
                 r["_state"] = by_uid.get(r.get("uid"))

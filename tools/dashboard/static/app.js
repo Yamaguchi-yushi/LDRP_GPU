@@ -127,8 +127,13 @@ function renderTrain() {
   const R = trainRows();
   const c = {};
   R.forEach(r => c[r.state] = (c[r.state] || 0) + 1);
+  // 状態の並びを固定する。オブジェクトのキー順だと実行のたびに入れ替わって読みにくい
+  const ORDER = ["running", "done", "short", "stalled", "failed", "unknown"];
+  const LBL = { running: "実行中", done: "完了", short: "途中終了",
+                stalled: "停止", failed: "失敗", unknown: "不明" };
   $("t-counts").textContent =
-    Object.entries(c).map(([k, v]) => `${k}=${v}`).join("  ") + `   計 ${R.length}`;
+    ORDER.filter(k => c[k]).map(k => `${LBL[k]} ${c[k]}`).join("  ")
+    + `   計 ${R.length}`;
 
   // machines
   const byM = {};
@@ -150,15 +155,12 @@ function renderTrain() {
       let fresh = `<span class="mut">-</span>`;
       if (b && b.data_age_sec != null) {
         const via = VIA[b.via] || b.via || "";
-        // 「いつもの間隔」を併記する。3h という固定値より、
-        // 「通常 60 分なのに 123 分」の方が異常だと分かりやすい
-        const cad = b.interval_sec
-          ? `通常 ${dur(b.interval_sec)} 間隔` : (via || "");
-        const v = cad ? ` <span class="mut">(${esc(cad)}${
-          via && b.interval_sec ? " / " + esc(via) : ""})</span>` : "";
-        fresh = b.stale_data
-          ? `<span class="err">${dur(b.data_age_sec)} 前</span>${v}`
-          : `<span class="mut">${dur(b.data_age_sec)} 前${v}</span>`;
+        // 列を短く保つ。経路と「いつもの間隔」は title に逃がし、
+        // 本体は経過時間だけにする (長い文字列で表が崩れるため)
+        const tip = via + (b.interval_sec ? ` / 通常 ${dur(b.interval_sec)} 間隔` : "");
+        fresh = `<span class="${b.stale_data ? "err" : "mut"}" title="${esc(tip)}">`
+              + `${dur(b.data_age_sec)} 前</span>`
+              + (via ? ` <span class="mut sm">${esc(via)}</span>` : "");
       }
       // 「完了した run のうち何本のモデルを手元に持っているか」
       const nd = (b && b.done) || 0, ns = (b && b.saved) || 0;
@@ -256,6 +258,12 @@ function renderTrain() {
                                 && (s.run.state === "done" || s.run.state === "running"));
       hidden = before - slots.length;
     }
+    // モデルを手元に保管できている本数。学習の完了とは別の軸なので分けて出す
+    const saved = c.slots.filter(s => s.run && s.run.state === "done"
+                                      && !s.run.odd_params
+                                      && s.run.saved && s.run.saved.length).length;
+    const kept = Math.min(saved, want);
+    const allDone = filled && kept >= want;     // 学習もモデルも揃って「完了」
     const odd = filled ? 0 : c.slots.filter(s => s.run && s.run.odd_params).length;
     const tmax = slots.find(s => s.run && s.run.t_max_ok === false);
     const dyn = c.dynamic == null ? "" : (c.dynamic ? "T" : "F");
@@ -277,7 +285,10 @@ function renderTrain() {
       <td>${esc(c.setting)}</td><td>${esc(ALGO(c.algo))}</td>
       <td>${esc(c.task_arrival)}</td><td>${esc(c.task_assign || "TP")}</td>
       <td>${esc(dyn)}</td>
-      <td class="${filled ? "c-ok" : "wrn"}">${done}/${want} done${
+      <td>${
+        `<span class="${filled ? "c-ok" : "wrn"}">学習 ${done}/${want}</span>`}${
+        `<span class="${kept >= want ? "c-ok" : (kept ? "wrn" : "mut")}">モデル ${kept}/${want}</span>`}${
+        allDone ? ` <span class="c-ok">✔ 完了</span>` : ""}${
         odd ? ` <span class="wrn">⚠要再実行 ${odd}</span>` : ""}${
         tmax ? ` <span class="wrn">⚠t_max</span>` : ""}${
         hidden ? ` <span class="mut">(失敗 ${hidden} 件を非表示)</span>` : ""}${
@@ -323,6 +334,10 @@ function renderTrain() {
           if (r.saved && r.saved.length)
             got = ` <span class="c-ok" title="保管済み: ${esc(r.saved.join(", "))}">`
                 + `📦${r.saved.length > 1 ? " " + r.saved.join("+") : ""}</span>`;
+          // サーバが古いとこれらのキー自体が無い。"モデル無し" と断定すると
+          // 全行が誤表示になるので、未定義は「不明」として区別する
+          else if (r.has_model === undefined)
+            got = ` <span class="mut" title="サーバを再起動すると分かります">-</span>`;
           else if (!r.has_model)
             got = ` <span class="mut" title="この run にはモデルファイルが残っていません">モデル無し</span>`;
           else
@@ -345,8 +360,11 @@ function renderTrain() {
               + ` title="どのパラメータが違うか出す">違いを見る</button>` : ""}`;
       }
       const sr = "";
-      html += `<tr><td class="${sl.unplanned_seed ? "wrn" : (r ? "" : "mut")}">${
-          esc(sl.seed || "—")}${sl.unplanned_seed ? " *" : ""}</td>
+      // 表に無い seed は薄字の "+" で補足するだけ。黄色くするのは suspect のときだけ
+      // (状態 / params✗ / t_max は別の欄に出ているので、ここで重ねて警告しない)
+      html += `<tr><td class="${sl.suspect ? "wrn" : (r ? "" : "mut")}">${
+          esc(sl.seed || "—")}${sl.suspect ? ' <span class="wrn" title="表には 5 seed 書いてあるのに、別の seed も完了しています">*</span>'
+            : (sl.unplanned_seed ? ' <span class="mut" title="計画表に書かれていない seed">+</span>' : "")}</td>
         <td class="mut">${esc((r && r.machine) || sl.machine || "")}</td>
         <td colspan="4"></td><td>${esc(sr)}</td><td>${st}</td></tr>`;
     });

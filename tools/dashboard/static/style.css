@@ -91,3 +91,10 @@ table.cond tr.condrow td{background:var(--card);border-top:1px solid var(--line)
 
 .steps{font-variant-numeric:tabular-nums}
 table.cond td{vertical-align:middle}
+
+/* 条件行の 学習 / モデル を並べるときの間隔 */
+.cond td span + span{margin-left:10px}
+
+/* 表の中の補助表示 (収集経路など) */
+.sm{font-size:10px;opacity:.75}
+#t-mach td,#t-mach th{white-space:nowrap}

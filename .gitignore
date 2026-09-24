@@ -21,3 +21,13 @@ src/lare/task/checkpoints/
 # 旧パス saved_models/ も後方互換のためサポートしているが git 管理外
 src/lare/path/saved_models/
 src/lare/task/saved_models/
+# collect_runs.py のローカルキャッシュ
+tools/.run_cache.jsonl
+
+# collect_runs.py が回収した学習済みモデルの受け皿
+models_inbox/
+tools/.notion_token
+
+# tools/: 接続先と実験計画は各自のローカルに置く (見本を .example として公開)
+tools/collect_config.yaml
+tools/plan.md

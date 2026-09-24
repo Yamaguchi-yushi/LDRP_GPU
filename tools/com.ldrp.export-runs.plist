@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SSH で繋がらないマシン側に置く定義 (drop モード)。
+  1 時間ごとに、自分の run 一覧と完遂モデルを共有フォルダへ書き出すだけ。
+  Notion にも外部にも接続しない。集約側の Mac がそのフォルダを読む。
+
+  置き換えるのは machine の値だけ (例: 黒 / MacB)。
+  スクリプトはリポジトリのものを直接使うので、git pull すれば更新される。
+  パスは ~ のままでよい (sh が展開するのでユーザー名に依存しない)。
+
+    cp tools/com.ldrp.export-runs.plist ~/Library/LaunchAgents/
+    vi ~/Library/LaunchAgents/com.ldrp.export-runs.plist   # machine を書き換える
+    launchctl load ~/Library/LaunchAgents/com.ldrp.export-runs.plist
+    launchctl start com.ldrp.export-runs
+    tail -f /tmp/ldrp_export.log
+
+  止めるとき: launchctl unload ~/Library/LaunchAgents/com.ldrp.export-runs.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ldrp.export-runs</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <string>python3 ~/LDRP/tools/collect_runs.py --export ~/Library/Mobile\ Documents/com~apple~CloudDocs/LDRP_runs --machine 黒 --repo ~/LDRP</string>
+  </array>
+
+  <!-- 3600 秒 = 1 時間ごと -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/tmp/ldrp_export.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ldrp_export.log</string>
+</dict>
+</plist>

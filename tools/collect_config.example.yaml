@@ -1,0 +1,117 @@
+# collect_runs.py の設定の**見本**。
+#   cp tools/collect_config.example.yaml tools/collect_config.yaml
+# としてから自分の環境に合わせて書き換える。
+# 実物 (collect_config.yaml) は接続先が入るので .gitignore してある。
+# ---------------------------------------------------------------------------
+# tools/collect_runs.py の設定ファイル
+#
+#   pull モード (Mac から各ホストへ ssh):  python tools/collect_runs.py -c tools/collect_config.yaml
+#   push モード (各マシン上で自分の分だけ): python tools/collect_runs.py --hosts local --machine GPU1 --notion
+#
+# Notion の token はこのファイルには書かない。環境変数 (既定: NOTION_TOKEN) から読む。
+# ---------------------------------------------------------------------------
+
+# このマシン自身のラベル (--hosts local のときに使われる)
+machine: 白                      # このマシンのラベル
+
+# RUNNING なのに heartbeat がこの分数だけ止まっていたら "stalled" (プロセス落ち) とみなす
+stale_minutes: 90
+
+# cout.txt の末尾から読むバイト数。巨大ログでもここしか読まないのでメモリを食わない
+tail_bytes: 65536
+
+# t_max がこの値未満の run は除外する (デバッグ run を表に出さないため). 0 で全件
+min_steps: 1000000
+
+# SSH で繋がらないマシンを「共有フォルダ経由」で集めるときの置き場。
+# iCloud Drive / Dropbox / Google Drive / NFS / USB など、両方のマシンから
+# 見えるパスであれば何でもよい (中身はただのファイル)。
+# 相手のマシン側では、これと同じフォルダを指して定期的に --export する:
+#   python tools/collect_runs.py --export "<下と同じパス>" --machine MacB --repo ~/LDRP
+drop_root: ~/Library/Mobile Documents/com~apple~CloudDocs/LDRP_runs   # 共有フォルダ
+
+hosts:
+  # --- この Mac -----------------------------------------------------------
+  - label: 白
+    ssh: local                       # "local" または省略で ssh を使わない
+    repos:
+      - ~/LDRP
+
+  # --- GPU1 ---------------------------------------------------------------
+  # ssh: の値は ~/.ssh/config の Host 名 か user@host。
+  # cron から動かすので、鍵認証でパスフレーズ無しに入れる状態にしておくこと
+  #   ssh-copy-id your-gpu-host
+  - label: GPU1
+    ssh: user@your-gpu-host          # ~/.ssh/config の Host 名でもよい
+    python: python3                  # リモートの python (conda env のフルパスでも可)
+    repos:
+      - ~/LDRP
+
+  # --- GPU2 ---------------------------------------------------------------
+  - label: GPU2
+    ssh: user@your-other-gpu-host
+    python: python3
+    # 負荷が高いと 10 秒では接続できないことがある (実測 load average 34)
+    connect_timeout: 30
+    repos:
+      - ~/LDRP
+
+  # --- SSH で繋がらない別の Mac (共有フォルダ経由) --------------------------
+  # 相手側で --export を回しておけば、こちらは drop_root/<label>/ を読むだけになる
+  # - label: MacB
+  #   drop: true          # true = 上の drop_root を使う。別パスにしたければそのパスを書く
+
+  # --- 黒 (別の Mac。SSH は使わず共有フォルダ経由) --------------------------
+  # 黒側で 1 時間ごとに --export すると、drop_root/黒/ に runs.jsonl と
+  # モデルが置かれる。こちらはそれを読むだけ (黒に待受ポートを開けない)
+  - label: 黒
+    drop: true
+
+  # --- Ubuntu -------------------------------------------------------------
+  # - label: Ubuntu
+  #   ssh: ubuntu-box
+  #   python: python3
+  #   repos:
+  #     - ~/LDRP
+
+# repo ルートからの相対で sacred の出力を探す場所。既定は下の 2 つ。
+# 学習の出力先を変えているホストがあれば、その host に sacred_subdirs を書けば個別に上書きできる
+# sacred_subdirs:
+#   - src/epymarl/results/sacred
+#   - src/epymarl/tmp_results/sacred
+
+# 条件ごとに想定している t_max。run の t_max がこれとズレていたら警告する。
+# モデルの選択には使わない (使うのは run 自身の t_max = 最終 checkpoint)。
+# 「30M 回すつもりだったのに 10M で止めた run」を取り違えないための確認用。
+# 20050000 のように +50000 されている運用なので、M 単位に丸めて比較する。
+# map 名で引いて無ければ default を見る。書かなければ照合しない
+# (default: を書くと全マップに適用される。古い探索用 run まで警告対象になるので、
+#  実験計画があるマップだけ書くほうが実用的)
+expected_t_max:
+  map_8x5:
+    5agent: 20.0M
+    7agent: 30.0M
+    10agent: 50.0M
+  map_aoba00:
+    7agent: 100.0M
+
+# 評価用モデルのファイル名に入る method_tag を、学習時の LaRe モードから決める規則。
+# 既定は「事前学習した LaRe モデルを使ったか」で dbct / safe を分ける。
+# (既存モデル 21 件は旧称 ours。run.py の method_tag リストに合わせて dbct にした)
+# 非 Safe 環境 (drp-*) で学習したモデルは、この表に関係なく "unsafe" になる
+# (design/multi_seed_eval.md の運用に合わせる)。
+# 別の軸 (タスク割当の同時学習など) で分けたくなったらここを書き換える
+method_tag_by_lare_mode:
+  pretrained: dbct
+  finetuning: dbct
+  scratch: safe
+  "scratch(frozen)": safe
+  "off": safe        # クォート必須 (YAML では裸の off は false になる)
+
+notion:
+  # `--notion-create-db <PAGE_ID>` で作った DB の id を貼る
+  database_id: ""
+  # token を入れておく環境変数名
+  token_env: NOTION_TOKEN
+  # --notion-create-db で新規作成するときの DB 名
+  title: LDRP runs

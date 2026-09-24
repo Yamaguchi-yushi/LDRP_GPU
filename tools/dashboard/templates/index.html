@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LDRP experiments</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>LDRP experiments</h1>
+  <div class="bar">
+    <button id="tab-train" class="tab on">学習の進捗</button>
+    <button id="tab-eval"  class="tab">評価結果</button>
+    <span class="sep"></span>
+    <button id="collect">今すぐ収集</button>
+    <label><input type="checkbox" id="auto" checked> 自動更新</label>
+    <span class="right mut" id="stamp">…</span>
+  </div>
+  <div id="errors"></div>
+</header>
+
+<!-- ── 学習の進捗 ───────────────────────────────────────────── -->
+<section id="pane-train">
+  <div class="bar filters">
+    <span><label>machine</label><select id="t-machine"></select></span>
+    <span><label>map</label><select id="t-map"></select></span>
+    <span><label>N</label><select id="t-agents"></select></span>
+    <span><label>algo</label><select id="t-algo"></select></span>
+    <span><label>状態</label><select id="t-state">
+      <option value="">(all)</option><option>done</option><option>running</option>
+      <option>stalled</option><option>failed</option><option>short</option>
+    </select></span>
+    <span class="right mut" id="t-counts"></span>
+  </div>
+
+  <h2>machines</h2>
+  <div class="wrap"><table id="t-mach"></table></div>
+
+  <h2>running now</h2>
+  <div class="wrap"><table id="t-run"></table></div>
+
+  <h2>conditions</h2>
+  <div id="t-conds"></div>
+</section>
+
+<!-- ── 評価結果 ─────────────────────────────────────────────── -->
+<section id="pane-eval" hidden>
+  <div class="bar filters">
+    <span><label>map</label><select id="e-map"></select></span>
+    <span><label>N</label><select id="e-n"></select></span>
+    <span><label>env</label><select id="e-env"></select></span>
+    <span><label>planner</label><select id="e-planner"></select></span>
+    <span><label>tag</label><select id="e-tag"></select></span>
+    <span><label>alloc</label><select id="e-alloc"></select></span>
+    <span><label>metric</label><select id="e-metric"></select></span>
+    <span><label><input type="checkbox" id="e-log"> log 軸</label></span>
+    <span class="right mut" id="e-counts"></span>
+  </div>
+  <div id="e-chart"></div>
+  <div class="wrap"><table id="e-tbl"></table></div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

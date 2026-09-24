@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  学習が終わったことを 2 分以内に知るための軽い定期チェック。
+
+  キャッシュ上で「実行中」になっている run だけを読み直し (数件)、
+  完了 / 異常になっていればデスクトップ通知を出す。
+  全体収集 (com.ldrp.collect-runs.plist / 30 分ごと) とは役割が別。
+
+    quick : 実行中の数件だけ  -> 2 分ごと  -> ポップアップ
+    full  : 全 run + モデル   -> 30 分ごと -> Notion / モデル回収 / パネル
+
+  ssh は接続を使い回す (ControlMaster) ので、2 回目以降はほぼ無料。
+
+    cp tools/com.ldrp.quick-check.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.ldrp.quick-check.plist
+    tail -f /tmp/ldrp_quick.log
+
+  止めるとき: launchctl unload ~/Library/LaunchAgents/com.ldrp.quick-check.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ldrp.quick-check</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/anaconda3/envs/ldrp/bin/python</string>
+    <string>/Users/USERNAME/LDRP/tools/collect_runs.py</string>
+    <string>-c</string>
+    <string>/Users/USERNAME/LDRP/tools/collect_config.yaml</string>
+    <string>--cache</string>
+    <string>/Users/USERNAME/LDRP/tools/.run_cache.jsonl</string>
+    <string>--quick</string>
+    <string>--notify</string>
+  </array>
+
+  <!-- 120 秒 = 2 分ごと。読むのは実行中の数件だけなので軽い -->
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>WorkingDirectory</key><string>/Users/USERNAME/LDRP</string>
+  <key>StandardOutPath</key><string>/tmp/ldrp_quick.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ldrp_quick.log</string>
+</dict>
+</plist>

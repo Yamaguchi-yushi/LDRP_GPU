@@ -88,12 +88,31 @@ class Runner():
         a = self.args
         tag = f"_{a.method_tag}" if getattr(a, "method_tag", "") else ""
         reassign = getattr(a, "reassign_before_pickup", "base")
-        env_tag = "safe" if getattr(a, "use__safe_env", True) else "unsafe"
+        env_tag = "safe" if getattr(a, "use_safe_env", True) else "unsafe"
         env_re = "_envreassign" if getattr(a, "allow_reassign_before_pickup", False) else ""
         train_n = getattr(a, "mat_model_agent_num", None) if a.path_planner == "mat_dec" else None
         train = f"_train{train_n}" if train_n else ""
         return (f"{a.map_name}/{a.agent_num}agent/"
                 f"{env_tag}_{a.path_planner}{tag}_{reassign}_{a.task_assigner}{train}{env_re}")
+
+    def _print_result_line(self, times):
+        infos = list(self.info_buffer)
+        if not infos:
+            return
+        m = {"condition": self._condition_id(),
+             "model_seed": self.model_seed,
+             "n_ep": len(infos)}
+        for k in ("step", "goal_account", "task_completion", "task_completion_per_agent",
+                  "n_active_mean", "busy_ratio", "deadhead_ratio",
+                  "deadhead_steps_per_task", "agent_steps_per_task",
+                  "task_arrival", "task_dropped", "pending_len_avg", "pending_len_max",
+                  "unassigned_len_avg", "unassigned_len_final"):
+            if k in infos[0]:
+                m[k] = f"{np.mean([i[k] for i in infos]):.6g}"
+        m["collision_rate"] = f"{np.mean([1.0 if i.get('collision') else 0.0 for i in infos]):.6g}"
+        if len(times) == len(infos):
+            m["time_sec"] = f"{np.mean(times):.6g}"
+        print("[RESULT] " + " ".join(f"{k}={v}" for k, v in m.items()), flush=True)
 
     def get_avail_actions(self):
         avail_actions = []
@@ -299,6 +318,7 @@ class Runner():
         print("--- 実行時間 ---")
         print(f"合計:   {np.sum(times):.2f} 秒")
         print(f"平均/ep: {np.mean(times):.2f} 秒")
+        self._print_result_line(times)
         #print("ロックなし", np.mean(non_lock_completion), len(non_lock_completion))
 
         return

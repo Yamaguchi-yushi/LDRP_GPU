@@ -158,8 +158,13 @@ class PPO(nn.Module):
 
 class PPOAgent():
     def __init__(self, args):
-        input_dim = args.agent_num * args.node_num * 2 + args.task_num * args.node_num + args.agent_num 
-        output_dim = args.task_num * args.agent_num 
+        use_dynamic_agents = getattr(args, "use_dynamic_agents", False)
+        input_dim = args.agent_num * args.node_num * 2 + args.task_num * args.node_num + args.agent_num
+        output_dim = args.task_num * args.agent_num
+        if use_dynamic_agents:
+            input_dim += args.agent_num + 1
+            output_dim = (args.task_num + 1) * args.agent_num + 1
+        self.use_dynamic_agents = use_dynamic_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = PPO(input_dim, output_dim).to(self.device)
         self.buffer = Buffer(args.buffer_size, args.n_envs, (input_dim,), output_dim, self.device, args)
@@ -266,9 +271,11 @@ class PPOAgent():
     
 
     def _assign(self, env, env_idx, step_idx, test_mode):
-        current_tasklist = copy.deepcopy(env.current_tasklist)  
-        assigned_tasklist = copy.deepcopy(env.assigned_tasks)
-        assigned_list = copy.deepcopy(env.assigned_list)
+        # deepcopy は過剰. current_tasklist / assigned_tasks は list[list[scalar]],
+        # assigned_list は list[scalar] なので浅いコピーで足りる (実測 12 倍速).
+        current_tasklist = [list(t) for t in env.current_tasklist]
+        assigned_tasklist = [list(t) for t in env.assigned_tasks]
+        assigned_list = list(env.assigned_list)
 
         agent_num = env.n_agents
         task_num = env.task_num
@@ -283,32 +290,46 @@ class PPOAgent():
         for _ in range(agent_num):
             if not any(len(t) == 0 for t in assigned_tasklist):
                 break
-            if len_current_task <= 0:
+            if len_current_task <= 0 and not self.use_dynamic_agents:
+                break
+
+            #マスク
+            #task持ちのエージェント
+            # マスクは policy に依存しないので forward より前に作る. 全部マスクされる
+            # 回で create_state と forward を丸ごと省ける (zeros_like は使えない).
+            stride = task_num + 1 if self.use_dynamic_agents else task_num
+            mask = torch.zeros(self.model.output_dim, device=self.device)
+            for k in range(agent_num):
+                if len(assigned_tasklist[k]) > 0 or (
+                    getattr(env, "use_dynamic_agents", False) and (not env.active[k] or env.pending_off[k])):
+                    mask[stride * k:stride * (k + 1)] = 1
+            #task数が少ないとき
+            for j in range(env.task_num):
+                if j > len(current_tasklist) - 1:
+                    mask[[stride * k + j for k in range(agent_num)]] = 1
+            #使用済みのtask
+            for j in range(len(current_tasklist)):
+                taken = (current_tasklist[j][0] == -1) or (j < len(assigned_list) and assigned_list[j] != -1)
+                if taken:
+                    mask[[stride * k + j for k in range(agent_num)]] = 1
+
+            if self.use_dynamic_agents:
+                min_active = int(getattr(env, "min_active_agents", 1))
+                active_count = sum(1 for k in range(agent_num) if env.active[k] and not env.pending_off[k])
+                for k in range(agent_num):
+                    can_off = (len(assigned_tasklist[k]) == 0) and env.active[k] \
+                        and (not env.pending_off[k]) and task_assign[k] == -1 \
+                        and (active_count - 1 >= min_active)
+                    if not can_off:
+                        mask[stride * k + task_num] = 1
+                mask[-1] = 1
+
+            if bool((mask == 1).all()):
                 break
 
             state = self.create_state(env, current_tasklist, assigned_tasklist)
             state = state.clone().detach().to(self.device)
             policy, value = self.model(state)
-            #マスク
-            #task持ちのエージェント
-            mask = torch.zeros_like(policy)
-            for k in range(agent_num):
-                if len(assigned_tasklist[k]) > 0 or (
-                    getattr(env, "use_dynamic_agents", False) and (not env.active[k] or env.pending_off[k])):
-                    mask[task_num * k:task_num * (k + 1)] = 1
-            #task数が少ないとき
-            for j in range(env.task_num):
-                if j > len(current_tasklist) - 1:
-                    mask[[task_num * k + j for k in range(agent_num)]] = 1
-            #使用済みのtask
-            for j in range(len(current_tasklist)):
-                taken = (current_tasklist[j][0] == -1) or (j < len(assigned_list) and assigned_list[j] != -1)
-                if taken:
-                    mask[[task_num * k + j for k in range(agent_num)]] = 1
-
-            if bool((mask == 1).all()):
-                break
-
             policy = policy.masked_fill(mask.bool(), float('-inf'))
             policy = F.softmax(policy, dim=-1)
 
@@ -326,10 +347,16 @@ class PPOAgent():
                     step_idx, state, action, log_prob, entropy, value, mask,
                     env_idx=env_idx
                 )
-        
+
             #actionをみてtask_assignを決定
             #currentとassignedを更新
-            q, r = divmod(action, env.task_num)
+            if self.use_dynamic_agents:
+                q, r = divmod(action, task_num + 1)
+                if r == task_num:
+                    task_assign[q] = -2
+                    continue
+            else:
+                q, r = divmod(action, task_num)
             assigned_tasklist[q] = list(current_tasklist[r])  # エージェントqにタスクrを割り当て
             task_assign[q] = r
             if r < len(assigned_list):
@@ -337,9 +364,51 @@ class PPOAgent():
             current_tasklist[r][0] = -1  # タスクを割り当てたので、タスクリストから削除
             len_current_task -= 1
 
+        if self.use_dynamic_agents and any(not env.active[i] for i in range(agent_num)):
+            stride = task_num + 1
+            NO_SPAWN = stride * agent_num
+
+            state = self.create_state(env, current_tasklist, assigned_tasklist, phase=1)
+            state = state.clone().detach().to(self.device)
+            policy, value = self.model(state)
+            mask = torch.zeros_like(policy)
+            for k in range(agent_num):
+                if env.active[k]:
+                    mask[stride * k:stride * (k + 1)] = 1
+                else:
+                    mask[stride * k + task_num] = 1
+            for j in range(task_num):
+                gone = (j > len(current_tasklist) - 1)
+                if not gone:
+                    gone = (current_tasklist[j][0] == -1) or \
+                    (j < len(assigned_list) and assigned_list[j] != -1)
+                if gone:
+                    mask[[stride * k + j for k in range(agent_num)]] = 1
+            mask[NO_SPAWN] = 0
+
+            policy = policy.masked_fill(mask.bool(), float('-inf'))
+            policy = F.softmax(policy, dim=-1)
+
+            if test_mode:
+                action = policy.argmax().item()
+            else:
+                dist = Categorical(policy)
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
+                entropy = dist.entropy()
+                action = action.item()
+                self.buffer.add_actions(
+                    step_idx, state, action, log_prob, entropy, value, mask,
+                    env_idx=env_idx
+                )
+
+            if action != NO_SPAWN:
+                q, r = divmod(action, stride)
+                task_assign[q] = r
+
         return task_assign
-    
-    def create_state(self, env, current_tasklist, assigned_tasklist):
+
+    def create_state(self, env, current_tasklist, assigned_tasklist, phase=0):
         current_tasklist = copy.deepcopy(current_tasklist)#[[4,2,-1],[1,5,-1]][s,g,time]->s,gのonehotに
         assigned_tasklist = copy.deepcopy(assigned_tasklist)#[[4,2,-1]]->エージェントごとのonehotに
         onehot_obs = copy.deepcopy(env.obs_onehot)
@@ -367,6 +436,11 @@ class PPOAgent():
                 assigned.append(0)
         assigned_tensor = torch.tensor(assigned, dtype=torch.float32)
         state = torch.cat((state, assigned_tensor), dim=0)
+
+        if self.use_dynamic_agents:
+            active_vec = torch.tensor(
+                [float(env.active[i]) for i in range(env.n_agents)], dtype=torch.float32)
+            state = torch.cat((state, active_vec, torch.tensor([float(phase)])), dim=0)
 
         return state
         

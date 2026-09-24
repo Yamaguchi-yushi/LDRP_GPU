@@ -56,6 +56,7 @@ randomize_initial_active: False
 min_active_agents: 2
 max_active_agents: null
 initial_active_num: null
+exclude_station_from_tasks: null
 
 # =============================================================================
 # LaRe-Path (System A: 経路計画用) - 利用設定

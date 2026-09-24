@@ -32,6 +32,7 @@ env_args:
   min_active_agents: 2
   max_active_agents: null
   initial_active_num: null
+  exclude_station_from_tasks: null
 
 test_greedy: True
 test_nepisode: 100

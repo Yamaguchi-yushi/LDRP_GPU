@@ -154,7 +154,8 @@ def run_sequential(args, logger):
                     "node_num": env_info["n_actions"],
                     "task_num": args.task_num,
                     "n_envs": runner.batch_size,
-                    "path_planner": args.name})
+                    "path_planner": args.name,
+                    "use_dynamic_agents": bool(args.env_args.get("use_dynamic_agents", False))})
         from src.task_assign.task_policy.ppo import PPOAgent
         runner.task_assigner = PPOAgent(SN(**_ta))
         runner.task_assigner.set_test_mode(False)

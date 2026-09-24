@@ -32,16 +32,26 @@ if __name__ == "__main__":
         for tok in sys.argv[5:]:
             if tok == "":
                 continue
-            if tok in ("base", "reassign"):
+            if "=" in tok:
+                key, val = tok.split("=", 1)
+                if key == "model_seed":
+                    config.model_seed = int(val)
+                elif key == "use_safe_env":
+                    config.use_safe_env = val.lower() in ("1", "true", "yes")
+                else:
+                    raise ValueError(f"Unknown key in argument: {key}")
+            elif tok in ("base", "reassign"):
                 config.reassign_before_pickup = tok
             elif tok.isdigit():
                 config.mat_model_agent_num = int(tok)
             else:
                 config.method_tag = tok
 
-    env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
-    #env_name = "drp_env:drp_safe-" + str(config.agent_num) + "agent_" + config.map_name + "-v2"
+    use_safe_env = bool(getattr(config, "use_safe_env", True))
+    prefix = "drp_safe-" if use_safe_env else "drp-"
+    env_name = f"drp_env:{prefix}{config.agent_num}agent_{config.map_name}-v2"
     config.env_name = env_name
+    print(f"[test] env={env_name} method_tag={getattr(config, 'method_tag', '') or '(none)'}", flush=True)
 
     # Optionally forward LaRe-Path params from config (no-op when use_lare_path=false).
     lare_path_keys = [
@@ -100,6 +110,7 @@ if __name__ == "__main__":
         "min_active_agents",
         "max_active_agents",
         "initial_active_num",
+        "exclude_station_from_tasks",
     ]
     dynamic_agent_kwargs = {k: getattr(config, k) for k in dynamic_agent_keys if hasattr(config, k)}
 
@@ -116,6 +127,7 @@ if __name__ == "__main__":
 
     for reassign_flag in (False,):
         print(f"\n########## model={model_tag}  allow_reassign_before_pickup={reassign_flag} ##########", flush=True)
+        config.allow_reassign_before_pickup = reassign_flag
         np.random.seed(config.seed if training else config.eval_seed)
         torch.manual_seed(config.seed)
         env = gym.make(

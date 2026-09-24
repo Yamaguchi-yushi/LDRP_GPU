@@ -524,6 +524,68 @@ use_lare_path_training: false   # 学習はする, 環境の報酬は元のま�
 
 ---
 
+### 2026-09-08 学習 run の収集・監視ツール `tools/` 追加 — PC 版から取り込み
+
+- **意図**: このマシンで走らせている学習の進捗・完遂状態を、集約マシン (Mac) 側から機械的に把握できるようにする。「設定した `t_max` まで完遂したか」「途中でプロセスが死んでいないか」を手作業で確認しなくて済ませる。PC 版コミット `64aaa84` / `8d3e834` の取り込み
+- **変わること**:
+  - 新ツール `tools/collect_runs.py` (run 収集・状態判定)、`tools/eval_report.py` (評価結果の集計)、`tools/plan.py` (実験計画のパース)、`tools/dashboard/` (ローカル Web UI) を追加。**学習・実行系 (`train.py` / `test.py` / `run.py` / `src/`) には一切触っていない** — sacred が既に吐いている `config.json` / `run.json` / `cout.txt` / `metrics.json` と `results/summary.csv` を読むだけ
+  - このマシン (GPU 機) は **「収集される側」** に該当する。手順は [tools/SETUP_export_machine.md](tools/SETUP_export_machine.md) を参照。`python3 tools/collect_runs.py --hosts local --export DIR` で共有フォルダに書き出す運用 (drop モード)
+  - 状態判定: `OK` (t_max 完遂) / `SHORT` (COMPLETED だが t_max 未達) / `RUN` (学習中) / `STALL` (heartbeat 停止 = プロセス落ち) / `FAIL`
+  - `cout.txt` が 0 byte の環境 (stdout をシェルでリダイレクトしている本 GPU 機が該当) では `metrics.json` の末尾 256KB から最後の `t_env` を拾う
+  - リモート側の要件は `python3` (標準ライブラリのみ)
+  - 接続先 `tools/collect_config.yaml` と実験計画 `tools/plan.md` は `.gitignore` 済み (見本は `.example` として公開)。**このマシンでは `plan.md` を触らない / `--notion` `--publish-models` を使わない** (実験計画は集約マシンが master)
+- **触ったファイル**: 新規 `tools/` 一式, `design/run_collector.md` / 改修 `.gitignore` (`tools/.run_cache.jsonl`, `models_inbox/`, `tools/.notion_token`, `tools/collect_config.yaml`, `tools/plan.md` を追加)
+- **互換性**: 影響なし (既存コードへの変更なし)
+
+---
+
+### 2026-08-20 階層強化学習: 経路方策と PPO タスク割当器の同時学習 — PC 版から取り込み
+
+- **意図**: これまで経路方策 (epymarl) とタスク割当器 (PPO) を別々に学習していたが、両者を 1 プロセスで同時に学習できるようにする。PC 版コミット `5cc852f Hierarchical Reinforcement Learning` / `9659583 modify` の取り込み
+- **変わること**:
+  - **新設定キー 2 つ** (`src/epymarl/src/config/default.yaml`):
+
+    | キー | デフォルト | 意味 |
+    |---|---|---|
+    | `train_task_assigner` | `False` | `True` で PPO タスク割当器を経路方策と同時に学習する |
+    | `task_num` | `10` | タスク割当器が扱うタスクスロット数 |
+
+  - **runner の強制切替**: `train_task_assigner=True` かつ `runner != "parallel"` のとき、起動時に `runner="parallel"` へ自動変更される（ログに `[joint] runner='episode' -> change to parallel` が出る）。QMIX 等の episode runner が既定のアルゴでも parallel になる
+  - **タスク割当の経路**: env worker が `get_task_state()` を返し、`ParallelRunner` が `PPOAgent.assign_task_from_state()` でタスクを決めて `{"pass": ..., "task": ...}` の dict action として env に送る。報酬は LaRe-Task が学習済みなら `lare_task_proxy_reward`、そうでなければ env 報酬を PPO バッファに積む
+  - **モデル保存先の変更 (破壊的)**: 保存先が `results/models/{token}/{t}/` から **`results/models/{token}/{t}/path/`** に変わる。`train_task_assigner=True` のときは併せて **`{t}/task/`** に PPO 割当器が保存される。**この変更は `train_task_assigner` の値に関係なく常に適用される**ので、`.th` を `src/all_policy/models/safe/` へコピーする際のコピー元パスが変わる
+  - `test.py` / `run.py` の評価経路は従来どおり（`test.py` は `PPOAgent.assign_task(env)` を使い、こちらの API は維持されている）
+- **触ったファイル**: `src/epymarl/src/config/default.yaml`, `src/epymarl/src/envs/__init__.py`, `src/epymarl/src/run.py`, `src/epymarl/src/runners/parallel_runner.py`, `src/main/drp_env/drp_env.py`, `src/task_assign/task_policy/ppo.py`, `train.py`
+- **互換性**:
+  - `train_task_assigner` のデフォルトは `False` で、この場合タスク割当は従来どおり env 内蔵の TP が行う。学習の数値挙動は変わらない (3agent map_5x4 で smoke 検証済み)
+  - **モデル保存パスの変更だけは既定でも効く**（上記）。既存の保存済みモデルの配置は変わらないが、今後の学習で出力される階層が 1 段深くなる
+  - `checkpoint_path` からの再開は新旧どちらの形式でも動く。`{t}/path/agent.th` があればそれを、なければ従来どおり `{t}/` を読む
+
+---
+
+### 2026-08-18 動的フリートサイジング (`use_dynamic_agents`) — PC 版から取り込み
+
+- **意図**: 需要に対して配備台数が過剰なとき idle が支配的になる問題に対応するため、稼働エージェント台数を制御できるようにする。PC 版コミット `c8693f5 dynamic fleet sizing` の取り込み
+- **現状の実装範囲**: **エピソード開始時に稼働台数を決め、そのエピソード中は台数固定**。エピソード中の増減 (稼働開始・station への帰還) は受け皿だけがコードに入っており、まだ動かない (下記「未接続の部分」参照)
+- **変わること**:
+  - **新設定キー 5 つ** (`gymma.yaml` の `env_args` / `DrpEnv.__init__`):
+
+    | キー | デフォルト | 意味 |
+    |---|---|---|
+    | `use_dynamic_agents` | `False` | 動的フリートの ON/OFF。`True` にする場合は `task_flag=True` と station ノードが必須 (`assert`) |
+    | `randomize_initial_active` | `False` | `True` でエピソード毎に初期稼働台数を `[min_active_agents, max_active_agents]` からランダム抽選 |
+    | `min_active_agents` | `2` (yaml) / `1` (env 引数) | ランダム抽選の下限 |
+    | `max_active_agents` | `null` (= 全台) | ランダム抽選の上限 |
+    | `initial_active_num` | `null` (= 全台) | `randomize_initial_active=False` のときの初期稼働台数 |
+
+  - **非稼働 (`active[i] == False`) エージェントの扱い**: station ノードに配置され、衝突判定 (`collision_detect` / `get_collision_agents`)・SafeEnv の安全制御・タスク割当 (TP / Random / PPO) のすべてから除外される。選択可能行動もその場待機の 1 つだけになる
+  - **未接続の部分 (エピソード中の増減)**: `drp_env.py` には稼働開始 (非稼働エージェントにタスクが割り当てられたら 1 ステップ最大 1 台まで復帰) と帰還 (`task_assign[i] = -2` で最寄り station をゴールにし、到着で非稼働化) の処理が入っているが、**これを駆動する割当器がまだない**。TP / Random / PPO はいずれも非稼働・帰還中のエージェントを skip し、`-2` を返す実装もどこにも存在しないため、現状これらの分岐は通らない
+  - **station ノードの定義**: `map/<map名>/node.csv` の 5 列目 `station` が `1` の行。全 13 マップに 1 個ずつ定義済み
+  - **設定の入り口**: 学習系 (train.py → epymarl) は `src/epymarl/src/config/envs/gymma.yaml`、評価系 (test.py / run.py) は `src/config/default.yaml`。どちらも同じ 5 キーを持ち、test.py が `gym.make()` へ転送する
+- **触ったファイル**: `src/main/drp_env/drp_env.py`, `src/main/drp_env/EE_map.py`, `src/main/drp_env/wrapper/safe_marl.py`, `src/task_assign/task_policy/{ppo,random,tp}.py`, `src/epymarl/src/config/envs/gymma.yaml`, `src/config/default.yaml`, `test.py`, `train.py`
+- **互換性**: `use_dynamic_agents` のデフォルトが `False` で、この場合すべての分岐が従来コードと同一パスを通るため既存の学習・評価には影響なし。既存モデル (`.th` / `.pth`) もそのまま使用可能。observation の形状も変わらない
+
+---
+
 ### 2026-06-26 MAT-Dec (Multi-Agent Transformer, 分散実行版) アルゴリズム追加
 
 - **意図**: epymarl に Transformer ベースの方策 MAT-Dec を追加し、QMIX/IQL/MAPPO 等に加えて選択可能にする。LDRP_GPU リポの MAT 実装を CPU 開発機向けに移植 (GPU 専用の `multiprocessing spawn` 化は除外し、既定の fork のまま)

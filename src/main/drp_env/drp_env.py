@@ -78,6 +78,11 @@ class DrpEnv(gym.Env):
 			min_active_agents = 1,
 			max_active_agents = None,
 			initial_active_num = None,
+			# station ノードを pickup/dropoff から除外するか.
+			# None (デフォルト) = use_dynamic_agents に連動 (動的なら除外, 固定なら除外しない).
+			# True / False で明示指定も可能. 評価で動的と固定のタスク列を揃えるときは
+			# 両条件に True を渡す (design/aamas_submission.md の DiD 比較の前提).
+			exclude_station_from_tasks = None,
 			task_arrival = "fixed",	# "fixed" / "bernoulli" / "mmpp"
 			task_density = 0.3,
 			task_p_high = 0.8,
@@ -168,6 +173,9 @@ class DrpEnv(gym.Env):
 		self.min_active_agents = int(min_active_agents)
 		self.max_active_agents = max_active_agents
 		self.initial_active_num = initial_active_num
+		# None なら use_dynamic_agents に連動させる (動的学習では常に station を除外).
+		self.exclude_station_from_tasks = self.use_dynamic_agents if exclude_station_from_tasks is None \
+			else bool(exclude_station_from_tasks)
 		self.station_nodes = list(getattr(self.ee_env, "station_nodes", []))
 		self.active = [True] * self.agent_num		    # エージェントがアクティブ状態ならTrue
 		self.pending_off = [False] * self.agent_num   	# ステーションノードに戻るエージェントはTrue
@@ -783,7 +791,8 @@ class DrpEnv(gym.Env):
 				self.alltasks = self.ee_env.create_tasklist(
 					self.time_limit, self.agent_num, self.task_density,
 					mode=self.task_arrival, p_high=self.task_p_high,
-					p_low=self.task_p_low, switch_prob=self.task_switch_prob)
+					p_low=self.task_p_low, switch_prob=self.task_switch_prob,
+					exclude_nodes=self.station_nodes if self.exclude_station_from_tasks else None)
 
 		#initialize obs
 		self.active = [True] * self.agent_num
@@ -1149,6 +1158,11 @@ class DrpEnv(gym.Env):
 				if (self.assigned_tasks[i] == [] or i in self.assigned_list) and task_assign[i] != -1:
 					if self.use_dynamic_agents and not self.active[i]:
 						if spawned_this_step >= 1:
+							continue
+						st_i = int(self.current_start[i])
+						if any(self.active[k] and (int(self.current_start[k]) == st_i
+			 					or (self.current_goal[k] is not None and int(self.current_goal[k]) == st_i))
+			 						for k in range(self.agent_num) if k != i):
 							continue
 						self.active[i] = True
 						spawned_this_step += 1

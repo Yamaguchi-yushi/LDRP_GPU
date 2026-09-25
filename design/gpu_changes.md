@@ -303,6 +303,29 @@ epymarl は `{local_results_path}/models/{unique_token}/{t_env}` に保存する
 
 ---
 
+## 2026-09-25 PC コミット取り込み (`42624e3` 〜 `44e5d6d`, 10 件)
+
+### 適用ファイル (PC 版そのまま採用)
+
+`tools/` 一式 (collect_runs.py / dashboard / mini.py / plan.py / plist / README / VISIT_CHECKLIST.md 等), `aggregate.py` (新規), `src/all_policy/policy.py`, `design/run_collector.md`, `design/dynamic_agent_count.md`, `design/make_graph_integration_prompt.md` (新規), `src/lare/path/models/QMIX_PATH_Safe_map_8x5_7agents_20.0M_checkpoint.pth` (新規)
+
+### 衝突解決メモ
+
+| ファイル | 衝突内容 | 採用 |
+|---|---|---|
+| `.gitignore` | `tools/plan.md` の後ろに PC が `tools/plan.md.bak` を追加 | 両方 (PC の追加行を残す)。`CLAUDE.md` の行は引き続き入れない |
+| `src/config/default.yaml` | ① `exclude_station_from_tasks` の説明コメント ② PPO 学習制御キーのブロック | ① PC 側 (コメント追加のみ) ② **GPU 版** (上部に配置済みのため PC 側の重複ブロックを破棄)。PC が追加した `model_seed` / `save_eval_json` / `use_safe_env` / `episode_seed_base: 0` は採用 |
+| `run.py` | PC が複数 seed 評価 (`model_stem` / `list_model_seeds` / `aggregate.py` 呼び出し) に全面改修 | **PC 版の構造を採用し、選択リストだけ GPU 版の値に戻した**: `map_8x5` / `agent_num=[7, 10]` / `mappo` / `task_assigner=[fifo, tp]` / `method_tag=[safe, ours]`。GPU の `test.py` は既に `model_seed=` / `use_safe_env=` / 位置引数 `base`・数字を受け付けるので改修不要 |
+| `train.py` (`44e5d6d`) | PC の実験条件 (qmix / map_8x5 / t_max / LaRe / `maxpurocesses=2` 等) と dashboard フックが同居 | **部分取り込み**: `_publish_batch()` (`~/.ldrp/batch_<pid>.json` にバッチ進捗を書く) の追加 4 箇所だけ入れ、実験条件は GPU 版のまま |
+| `tools/collect_runs.py` | PC が 3 回大改修 (`36a0969` / `d018eff` / `44e5d6d`) | 自動マージで通過。**GPU 版の `t_env` 第 3 フォールバック (`t_source = "model"`) が残っていることを確認済み** (PC 版には無い)。299 run で無検証の `OK` はゼロ |
+
+### スキップ
+
+- `f24d98d new model`: 同一バイナリが GPU 版に `239b4ac` で既にコミット済みのため空コミットになり skip
+- `df66cf5 add reward` (ステーション待機中の移動ペナルティ): 報酬まわりは取り込まない方針のため未適用のまま
+
+---
+
 ## PC→GPU 取り込み手順
 
 1. PC 版の変更を `git fetch` / `git cherry-pick` 等で取得

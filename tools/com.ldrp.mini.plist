@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  デスクトップの進捗パネル (tools/dashboard/mini.py) をログイン時に自動起動する。
+
+  GUI を出すので **LaunchAgents に置く** (LaunchDaemons ではウィンドウが出せない)。
+  ダッシュボード本体 (app.py) が落ちていてもパネルは起動し、
+  クリックしたときに app.py を立ち上げる。
+
+    cp tools/com.ldrp.mini.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.ldrp.mini.plist
+
+  止めるとき:
+    launchctl unload ~/Library/LaunchAgents/com.ldrp.mini.plist
+
+  KeepAlive を true にしてあるので、右クリック→終了しても launchd が
+  すぐ起こし直す。**一時的に消したいときは unload する。**
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ldrp.mini</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <string>/opt/anaconda3/envs/ldrp/bin/python ~/LDRP/tools/dashboard/mini.py</string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <key>StandardOutPath</key><string>/tmp/ldrp_mini.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ldrp_mini.log</string>
+</dict>
+</plist>

@@ -131,3 +131,32 @@ notion:
   token_env: NOTION_TOKEN
   # --notion-create-db で新規作成するときの DB 名
   title: LDRP runs
+
+# 学習曲線の書き出し (--export-curves)。make_graph が読める形に整理する。
+# make_graph の GUI から curve_spec.json をもらう場合は --curve-spec が優先される。
+curves:
+  # 1 指標あたりの点数の上限。0 で間引かない。
+  # 実測: 学習時の指標 3,424 点 / 評価時 (test_*) 856 点
+  max_points: 0
+  # y_label / kind は _meta.json にそのまま書き写される。書いておくと make_graph が
+  # 指標名から推測しなくて済む (test_collision_mean を「率」と誤認して y 軸が
+  # [0,1] に固定され、曲線が軸外へ消えるのを防ぐ)。
+  # kind: rate/ratio/fraction/count/value/length  better: up/down
+  metrics:
+    - {name: test_return_mean,          y_label: Return,          kind: value, better: up}
+    - {name: test_goal_mean,            y_label: Goals,           kind: count, better: up}
+    - {name: test_task_completion_mean, y_label: Completed Tasks, kind: count, better: up}
+    - {name: test_collision_mean,       y_label: Collision Count, kind: count, better: down}
+  # 条件 -> 手法フォルダ。**dir がフォルダ名と完全一致**する必要がある
+  # (ずれると make_graph 側でエラーにならず既定色になる)。凡例の文字列は label。
+  # match の軸は実験計画表と同じ (plan.matches() で突き合わせる)。
+  # 書かなければ algo/method_tag/task_assign から機械的に決まる。
+  methods:
+    - {dir: QMIX,     label: QMIX,     color: "#03AF7A", order: 0, match: {algo: qmix,  setting: safe, task_assign: TP}}
+    - {dir: MAPPO,    label: MAPPO,    color: "#005AFF", order: 1, match: {algo: mappo, setting: safe, task_assign: TP}}
+    - {dir: MAT,      label: MAT,      color: "#FF0000", order: 2, match: {algo: mat,   setting: safe, task_assign: TP}}
+    - {dir: MAT_LaRe, label: MAT+LaRe, color: "#F6AA00", order: 3, match: {algo: mat,   setting: dbct, task_assign: TP}}
+  # 条件フォルダを決める軸。既定は map x agents (= 1 図に全手法が並ぶ)
+  grouping: [map, agents]
+  x_label: Training steps
+  require_seeds: 5

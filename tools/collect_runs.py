@@ -299,6 +299,83 @@ def build_model_index(repo, model_subdirs):
     return index
 
 
+DEFAULT_TB_SUBDIRS = (
+    "src/epymarl/results/tb_logs",
+    "src/epymarl/tmp_results/tb_logs",
+    "results/tb_logs",
+)
+
+
+def build_tb_index(repo, tb_subdirs):
+    """repo 配下の tb_logs/<unique_token> を列挙する.
+
+    ディレクトリ名は models/ と同じ unique_token なので、find_model と
+    同じ前綴りで sacred の run に紐づけられる。
+    """
+    index = []
+    for sub in tb_subdirs or ():
+        root = sub if os.path.isabs(sub) else os.path.join(repo, sub)
+        if not os.path.isdir(root):
+            continue
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            full = os.path.join(root, name)
+            if os.path.isdir(full):
+                index.append((name, full))
+    return index
+
+
+def find_tb_dir(index, algo, seed, env_key):
+    """run に対応する tb_logs ディレクトリを返す (find_model と同じ規則)."""
+    if not index or seed in (None, "") or not algo:
+        return None
+    cands = [c for c in index if c[0].startswith("%s_seed%s_" % (algo, seed))]
+    if env_key:
+        keyed = [c for c in cands if env_key in c[0]]
+        if keyed:
+            cands = keyed
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[0])
+    return cands[-1]                      # 再実行があれば新しい方 (末尾が時刻)
+
+
+def read_scalars(tb_dir, metrics=None, max_points=0):
+    """event ファイルから scalar を読む -> {tag: [(wall, step, value), ...]}.
+
+    tensorboard が無い環境 (自己送出先のリモート等) では黙って空を返す。
+    run の収集そのものは止めない。
+    """
+    try:
+        from tensorboard.backend.event_processing import event_accumulator
+    except ImportError:
+        return None                       # None = 読めなかった (空 {} と区別する)
+    try:
+        ea = event_accumulator.EventAccumulator(tb_dir, size_guidance={"scalars": 0})
+        ea.Reload()
+        tags = ea.Tags()["scalars"]
+    except Exception:
+        return None
+    out = {}
+    for t in tags:
+        if metrics and t not in metrics:
+            continue
+        try:
+            pts = [(e.wall_time, e.step, e.value) for e in ea.Scalars(t)]
+        except Exception:
+            continue
+        if max_points and len(pts) > max_points:
+            # 等間隔に間引く。最後の点は必ず残す (収束値が消えると困る)
+            step = len(pts) / float(max_points)
+            idx = sorted(set([int(i * step) for i in range(max_points)] + [len(pts) - 1]))
+            pts = [pts[i] for i in idx]
+        out[t] = pts
+    return out
+
+
 def find_model(index, repo, algo, seed, env_key):
     """run に対応するモデルディレクトリの「最終ステップ」を返す."""
     if not index or seed in (None, "") or not algo:
@@ -435,6 +512,56 @@ def root_tag_of_run(run_dir):
 
 BATCH_DIR = "~/.ldrp"
 PS_TRAIN_RE = re.compile(r"(?:^|/)python[0-9.]*\s+(?:-\S+\s+)*(\S*train\.py)\b")
+
+# epymarl のコマンド行から key=value を拾う。値は素・"..."・'...' のいずれも取る
+CMD_KV_RE = re.compile(r"([A-Za-z_][\w.]*)=(\"[^\"]*\"|'[^']*'|\S+)")
+CMD_CONFIG_RE = re.compile(r"--config=(\S+)")
+
+
+def _cmd_value(raw):
+    """コマンド行の値を config.json に載っているのと同じ型に戻す."""
+    v = raw.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    if v in ("True", "False"):
+        return v == "True"
+    if v in ("None", "null"):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        return v
+
+
+def parse_train_command(cmd):
+    """train.py が起動する epymarl のコマンド行を {cfg, env} に開く.
+
+    `--config=qmix ... t_max=100050000 env_args.key="drp_env:drp_safe-7agent_..."`
+    のキー名は config.json のものと同じなので、**derive() をそのまま通せる**形に
+    戻せば、条件の判定 (setting / method_tag / task_assign / dynamic) を
+    実績の run と同じ 1 か所の実装で行える。
+
+    予約 (まだ sacred のディレクトリが無い run) を実験計画の表に並べるために使う。
+    """
+    cfg, env = {}, {}
+    if not cmd:
+        return {"cfg": cfg, "env": env}
+    m = CMD_CONFIG_RE.search(cmd)
+    if m:
+        cfg["name"] = m.group(1)
+    for k, raw in CMD_KV_RE.findall(cmd):
+        if k.startswith("--"):
+            continue
+        val = _cmd_value(raw)
+        if k.startswith("env_args."):
+            env[k[len("env_args."):]] = val
+        elif "." not in k:
+            cfg[k] = val
+    return {"cfg": cfg, "env": env}
 ETIME_RE = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
 
 
@@ -492,6 +619,10 @@ def scan_batches(machine):
                 "machine": machine, "pid": pid, "source": "file",
                 "total": info.get("total"), "started": info.get("started"),
                 "elapsed_sec": elapsed, "cmd": cmd,
+                # train.py が書いた epymarl のコマンド行。これがあると
+                # 「どの条件を何本待っているか」まで分かる。条件の判定は
+                # 白側で derive() を通して行う (計画表を持っているのは白だけ)
+                "train_cmd": info.get("cmd"),
             })
     for pid, (elapsed, cmd) in sorted(live.items()):
         if pid in seen:
@@ -523,8 +654,14 @@ def iter_run_dirs(sacred_root):
                 yield run_p
 
 
-def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None):
-    """repos 配下を走査し、レコードを 1 件ずつ emit に渡す (溜め込まない)."""
+def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None,
+         curve_metrics=None, curve_max_points=0, tb_subdirs=None):
+    """repos 配下を走査し、レコードを 1 件ずつ emit に渡す (溜め込まない).
+
+    curve_metrics を渡すと、学習曲線も {"kind":"curve"} レコードとして emit する。
+    **抽出は event ファイルのある側で行い、点列だけを持ち帰る**
+    (event ファイルは 1 run 5MB あり、運ぶには重い)。
+    """
     for b in scan_batches(machine):
         emit(b)
     n = 0
@@ -532,6 +669,8 @@ def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None):
         repo = os.path.abspath(os.path.expanduser(repo))
         model_index = build_model_index(
             repo, model_subdirs or list(DEFAULT_MODEL_SUBDIRS))
+        tb_index = (build_tb_index(repo, tb_subdirs or list(DEFAULT_TB_SUBDIRS))
+                    if curve_metrics else [])
         for sub in sacred_subdirs:
             root = sub if os.path.isabs(sub) else os.path.join(repo, sub)
             if not os.path.isdir(root):
@@ -540,9 +679,25 @@ def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None):
             for run_dir in iter_run_dirs(root):
                 rec = scan_run_dir(run_dir, machine, tag, tail_bytes,
                                    repo=repo, model_index=model_index)
-                if rec is not None:
-                    emit(rec)
-                    n += 1
+                if rec is None:
+                    continue
+                emit(rec)
+                n += 1
+                if not curve_metrics:
+                    continue
+                cfg = rec.get("cfg") or {}
+                hit = find_tb_dir(tb_index, cfg.get("name") or rec.get("algo_dir"),
+                                  cfg.get("seed"),
+                                  (rec.get("env") or {}).get("key"))
+                if not hit:
+                    continue
+                token, tb_dir = hit
+                sc = read_scalars(tb_dir, curve_metrics, curve_max_points)
+                if not sc:
+                    continue
+                for t, pts in sc.items():
+                    emit({"kind": "curve", "uid": rec["uid"], "machine": machine,
+                          "token": token, "tag": t, "points": pts})
     return n
 
 
@@ -563,9 +718,13 @@ def cmd_scan(args):
         sys.stdout.flush()
         return 0
 
+    metrics = set(m for m in (args.scan_curves or "").split(",") if m)
     scan(args.repo, args.sacred_subdir or list(DEFAULT_SACRED_SUBDIRS),
          args.machine, args.tail_bytes, emit,
-         model_subdirs=args.model_subdir or list(DEFAULT_MODEL_SUBDIRS))
+         model_subdirs=args.model_subdir or list(DEFAULT_MODEL_SUBDIRS),
+         curve_metrics=metrics or None,
+         curve_max_points=args.curve_max_points,
+         tb_subdirs=args.tb_subdir or list(DEFAULT_TB_SUBDIRS))
     sys.stdout.flush()
     return 0
 
@@ -878,12 +1037,14 @@ def _script_source():
         return f.read()
 
 
-def collect_local(host, tail_bytes):
+def collect_local(host, tail_bytes, curves=None, curve_max_points=0):
     recs = []
     scan(host.get("repos") or ["."],
          host.get("sacred_subdirs") or list(DEFAULT_SACRED_SUBDIRS),
          host["label"], tail_bytes, recs.append,
-         model_subdirs=host.get("model_subdirs") or list(DEFAULT_MODEL_SUBDIRS))
+         model_subdirs=host.get("model_subdirs") or list(DEFAULT_MODEL_SUBDIRS),
+         curve_metrics=curves, curve_max_points=curve_max_points,
+         tb_subdirs=host.get("tb_subdirs") or list(DEFAULT_TB_SUBDIRS))
     return recs, None
 
 
@@ -902,12 +1063,19 @@ def multiplex_options(enabled):
 
 
 def collect_ssh(host, tail_bytes, timeout, verbose=False, only_dirs=None,
-                multiplex=False):
+                multiplex=False, curves=None, curve_max_points=0):
     """このスクリプト自身を stdin で送り込み、リモートで --scan させる."""
     quote = _quote
     py = host.get("python") or "python3"
     remote_args = ["--scan", "--machine", host["label"],
                    "--tail-bytes", str(tail_bytes)]
+    if curves:
+        # 抽出はリモートで行い、点列だけ持ち帰る (event ファイルは 1 run 5MB)
+        remote_args += ["--scan-curves", ",".join(sorted(curves))]
+        if curve_max_points:
+            remote_args += ["--curve-max-points", str(curve_max_points)]
+        for sub in host.get("tb_subdirs") or []:
+            remote_args += ["--tb-subdir", sub]
     if only_dirs:
         for d in only_dirs:
             remote_args += ["--scan-dir", d]
@@ -1118,7 +1286,7 @@ SSH_BACKOFF_SEC = 600
 
 
 def collect(hosts, tail_bytes, timeout, verbose=False, drop_root=None,
-            skip_unchanged=None):
+            skip_unchanged=None, curves=None, curve_max_points=0):
     """各ホストから run を集める.
 
     skip_unchanged: {label: mtime} を渡すと、共有フォルダの runs.jsonl が
@@ -1143,7 +1311,7 @@ def collect(hosts, tail_bytes, timeout, verbose=False, drop_root=None,
                     skip_unchanged[label] = mt
             recs, err = collect_drop(host, drop_root)
         elif host.get("ssh") in (None, "", "local"):
-            recs, err = collect_local(host, tail_bytes)
+            recs, err = collect_local(host, tail_bytes, curves, curve_max_points)
             stamp_observed(recs, now_utc(), "local")
         else:
             until = _SSH_BACKOFF.get(label, 0)
@@ -1151,7 +1319,9 @@ def collect(hosts, tail_bytes, timeout, verbose=False, drop_root=None,
                 errors.append((label, "skipped for %d more s (last attempt failed)"
                                % int(until - now)))
                 continue
-            recs, err = collect_ssh(host, tail_bytes, timeout, verbose)
+            recs, err = collect_ssh(host, tail_bytes, timeout, verbose,
+                                    curves=curves,
+                                    curve_max_points=curve_max_points)
             stamp_observed(recs, now_utc(), "ssh")
             if err and not recs:
                 _SSH_BACKOFF[label] = now + SSH_BACKOFF_SEC
@@ -2199,6 +2369,465 @@ def _fetch_drop(host, drop_root, items):
 
 
 PURGE_MARKER = ".fetched"
+
+
+# 色覚バリアフリー配色 (PAAMS の data/ で使っていたもの)。手法に色が無いときの既定
+CURVE_PALETTE = ("#03AF7A", "#005AFF", "#FF0000", "#F6AA00",
+                 "#4DC4FF", "#804000", "#990099", "#FFF100")
+_META_BAD_CHARS = re.compile(r'[<>:"/\\|?*]')
+# condition.key は図のファイル名の接頭辞になるので、スキーマで文字集合が決まっている
+_COND_BAD_CHARS = re.compile(r"[^A-Za-z0-9._+@~-]+")
+# make_graph は -tag- の後ろを [A-Za-z0-9_]+ で取るので、それ以外の tag は扱えない
+METRIC_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def metric_names(spec_metrics):
+    """curves.metrics は文字列の列でも {name, y_label, ...} の列でもよい。名前だけ取る."""
+    out = []
+    for m in spec_metrics or []:
+        n = m.get("name") if isinstance(m, dict) else m
+        if n:
+            out.append(str(n))
+    return out
+
+
+# make_graph の docs/interchange/*.schema.json が受け付ける語彙。
+# 外れた値は **落とさずそのまま書き写す** (仕様は「書き写すだけ」) が、
+# make_graph 側で無言で推測にフォールバックするので、ここで知らせる
+METRIC_KINDS = ("rate", "ratio", "fraction", "count", "value", "length")
+METRIC_BETTER = ("up", "down")
+
+
+def metric_specs(spec_metrics):
+    """_meta.json の metrics[] にそのまま書ける形 (dict の列) に揃える."""
+    out = []
+    for m in spec_metrics or []:
+        e = dict(m) if isinstance(m, dict) else {"name": str(m)}
+        n = e.get("name")
+        if not METRIC_NAME_RE.match(str(n or "")):
+            sys.stderr.write("[curves] metric %r has characters make_graph "
+                             "cannot parse out of a file name\n" % n)
+        if e.get("kind") and e["kind"] not in METRIC_KINDS:
+            sys.stderr.write("[curves] %s: kind=%r is not one of %s; make_graph "
+                             "will fall back to guessing from the name\n"
+                             % (n, e["kind"], "/".join(METRIC_KINDS)))
+        if e.get("better") and e["better"] not in METRIC_BETTER:
+            sys.stderr.write("[curves] %s: better=%r is not 'up' or 'down'\n"
+                             % (n, e["better"]))
+        out.append(e)
+    return out
+
+
+def _meta_dir(name):
+    """手法フォルダ名。make_graph が書き出し時に潰す文字だけ '_' にする.
+
+    _meta.json の methods[].dir は**フォルダ名と完全一致**が必須なので、
+    ここで決めた名前をフォルダにもメタにも同じく使う。
+    """
+    return _META_BAD_CHARS.sub("_", str(name or "")).strip() or "method"
+
+
+def _git_short_head(repo="."):
+    try:
+        out = subprocess.check_output(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                                      stderr=subprocess.DEVNULL, timeout=5)
+        return out.decode("ascii", "replace").strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _match_field(d, k):
+    key = {"setting": "method_tag", "algo": "algo", "task_assign": "task_assign",
+           "dynamic": "dynamic_agents", "map": "map", "agents": "agents",
+           "method_tag": "method_tag"}.get(k, k)
+    return d.get(key)
+
+
+def curve_method_of(d, methods):
+    """この run がどの手法フォルダに入るかを返す (dict) or None.
+
+    methods[] は make_graph の curve_spec.json と同じ形:
+      {dir, label, color, order, match: {algo, setting, task_assign, dynamic}}
+    旧形式 {name, ...} も受ける (name を dir と label の両方に使う)。
+    match の setting は method_tag (safe / dbct / dbct_xxx) と比べる。
+    """
+    for i, m in enumerate(methods or []):
+        mt = m.get("match") or {}
+        ok = True
+        for k, want in mt.items():
+            got = _match_field(d, k)
+            if k == "dynamic":
+                ok = bool(got) == bool(want)
+            elif k == "task_assign":
+                w = (str(want) if want is not None else "").upper() or "TP"
+                g = (got or "").upper() or "TP"
+                ok = (g == w)
+            else:
+                ok = (str(got) == str(want))
+            if not ok:
+                break
+        if ok:
+            name = m.get("dir") or m.get("name") or "method%d" % i
+            return {"dir": _meta_dir(name),
+                    "label": m.get("label") or m.get("name") or _meta_dir(name),
+                    "color": m.get("color"),
+                    "order": m.get("order", i),
+                    "match": dict(mt)}
+    return None
+
+
+def _mechanical_method(d):
+    """手法の指定が無いときの機械的な手法名。条件の軸だけで決める (判断を挟まない)."""
+    parts = [str(d.get("algo")), str(d.get("method_tag") or "safe"),
+             (d.get("task_assign") or "TP").upper()]
+    if d.get("dynamic_agents"):
+        parts.append("dyn")
+    dir_ = _meta_dir("_".join(parts))
+    return {"dir": dir_, "label": dir_, "color": None, "order": None,
+            "match": {"algo": d.get("algo"), "setting": d.get("method_tag") or "safe",
+                      "task_assign": d.get("task_assign") or "",
+                      "dynamic": bool(d.get("dynamic_agents"))}}
+
+
+GROUP_AXES = ("map", "agents", "t_max", "setting", "algo", "task_assign", "dynamic")
+
+
+def _bump(counter, key):
+    counter[key] = counter.get(key, 0) + 1
+
+
+def _majority(counter):
+    """多数派の値と、割れているかどうか."""
+    if not counter:
+        return None, False
+    v = max(counter.items(), key=lambda kv: (kv[1], str(kv[0])))[0]
+    return v, len(counter) > 1
+
+
+def cond_key(d, grouping=None):
+    """条件フォルダ名。grouping にある軸だけで作る (既定は map x agents = 1 図).
+
+    make_graph は条件フォルダ名を「置き場所」としか見ない (_meta.json があるため)
+    ので自由に付けてよいが、PAAMS のときと同じ `{map}-v2_{N}agent` に揃えておく。
+    """
+    g = list(grouping or ("map", "agents"))
+    parts = []
+    for ax in g:
+        if ax == "map":
+            m = str(d.get("map") or "").replace("map_", "")
+            parts.append("%s-v2" % m if m else "")
+        elif ax == "agents":
+            parts.append("%sagent" % d["agents"] if d.get("agents") else "")
+        elif ax == "t_max":
+            tm = _num(d.get("t_max"))
+            parts.append("%gM" % (tm / 1e6) if tm else "")
+        elif ax == "setting":
+            parts.append(str(d.get("method_tag") or "safe"))
+        elif ax == "algo":
+            parts.append(str(d.get("algo")))
+        elif ax == "task_assign":
+            parts.append((d.get("task_assign") or "TP").upper())
+        elif ax == "dynamic":
+            parts.append("dyn" if d.get("dynamic_agents") else "fixed")
+    return _COND_BAD_CHARS.sub("-", "_".join(x for x in parts if x)).strip("-") \
+        or "condition"
+
+
+def curve_filter_ok(d, filt):
+    """curve_spec.json の filter。空・未指定の軸は「制限なし」."""
+    if not filt:
+        return True
+    def has(key, got, norm=None):
+        want = filt.get(key)
+        if not want:
+            return True
+        if norm:
+            return norm(got) in [norm(w) for w in want]
+        return got in want
+    m = str(d.get("map") or "")
+    if filt.get("maps") and not (m in filt["maps"]
+                                 or m.replace("map_", "") in filt["maps"]):
+        return False
+    if filt.get("agents") and _num(d.get("agents")) not in [_num(a) for a in filt["agents"]]:
+        return False
+    if not has("settings", d.get("method_tag") or "safe"):
+        return False
+    if not has("algos", d.get("algo")):
+        return False
+    if filt.get("task_assigns") and (d.get("task_assign") or "TP").upper() not in \
+            [str(t or "TP").upper() for t in filt["task_assigns"]]:
+        return False
+    if filt.get("dynamic") and bool(d.get("dynamic_agents")) not in \
+            [bool(x) for x in filt["dynamic"]]:
+        return False
+    return True
+
+
+def build_metrics_catalog(rows, curves, grouping=None):
+    """metrics_catalog.json を組み立てる (make_graph の指標ピッカーの材料).
+
+    仕様は make_graph の docs/interchange/metrics_catalog.schema.json。
+    value_min/max を入れておくと make_graph が指標の種類を **名前ではなく
+    実測値から** 決められる。無いと test_collision_mean (1 エピソードあたりの
+    衝突「回数」) が「率」と誤認され、y 軸が [0,1] に固定されて曲線が軸外へ消える。
+    """
+    by_uid = dict((d["uid"], d) for d in rows)
+    per_tag = {}
+    for c in curves:
+        t = c["tag"]
+        if not METRIC_NAME_RE.match(t):
+            continue          # make_graph のファイル名解析を通らない tag は載せない
+        e = per_tag.setdefault(t, {"uids": set(), "pts": [], "bytes": [],
+                                   "lo": None, "hi": None, "first": None})
+        e["uids"].add(c["uid"])
+        e["pts"].append(len(c["points"]))
+        e["bytes"].append(sum(len("%s,%s,%s\n" % p) for p in c["points"]))
+        vals = [p[2] for p in c["points"]]
+        if vals:
+            lo, hi = min(vals), max(vals)
+            e["lo"] = lo if e["lo"] is None else min(e["lo"], lo)
+            e["hi"] = hi if e["hi"] is None else max(e["hi"], hi)
+        if e["first"] is None and c["uid"] in by_uid:
+            e["first"] = cond_key(by_uid[c["uid"]], grouping)
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if xs else 0
+
+    mets = []
+    for t in sorted(per_tag):
+        e = per_tag[t]
+        m = {"name": t, "n_runs": len(e["uids"]),
+             "points_per_run": int(median(e["pts"])),
+             "bytes_per_run": int(median(e["bytes"])),
+             "is_eval": t.startswith("test_")}
+        if e["lo"] is not None:
+            m["value_min"], m["value_max"] = float(e["lo"]), float(e["hi"])
+        if e["first"]:
+            m["first_seen"] = e["first"]
+        mets.append(m)
+    return {"version": 1,
+            "generated_by": "ldrp collect_runs.py --scan",
+            "generated_at": now_utc().isoformat(),
+            "n_runs_scanned": len(set(c["uid"] for c in curves)),
+            "n_conditions": len(set(cond_key(by_uid[c["uid"]], grouping)
+                                    for c in curves if c["uid"] in by_uid)),
+            "metrics": mets}
+
+
+def export_curves(rows, curves, dest, methods=None, spec_metrics=None, conds=None,
+                  dry_run=False, repo=".", filt=None, grouping=None,
+                  x_label=None, require_seeds=0):
+    """学習曲線を make_graph が読めるフォルダ構成で書き出し、条件ごとに _meta.json (v2) を書く.
+
+        {dest}/{map}-v2_{N}agent/            <- 1 図 = 1 条件フォルダ (_meta.json はここ)
+            {手法 dir}/run-{token}/run-{token}-tag-{metric}.csv
+
+    命名の制約 (make_graph の実装で確認済み):
+      - `-tag-{metric}` の**後ろに英字を足さない**。detect_metric が
+        [A-Za-z0-9_]+ を貪欲に取るので、指標が手法ごとに分裂する
+      - unique_token の ':' は '_' に置換する (フォルダ名に使えない)
+      - ファイル名は 150 バイトまで (clean_basename が切り詰める)
+      - methods[].dir はフォルダ名と完全一致 (ずれると黙って既定色になる)
+    手法はフォルダで表し、ファイル名には入れない。
+
+    _meta.json v2 の仕様は make_graph の docs/interchange/meta.schema.json。
+    condition.t_max を必ず入れる: 条件ごとに学習ステップ数が違うので、
+    make_graph が x 軸の上限と「途中で止まった run」の判定に使う。
+    """
+    dest = os.path.abspath(os.path.expanduser(dest))
+    want = set(metric_names(spec_metrics)) or None
+    by_uid = dict((d["uid"], d) for d in rows)
+    written, skipped_run, skipped_method, skipped_filter = 0, 0, 0, 0
+    figs = {}
+    for c in curves:
+        d = by_uid.get(c.get("uid"))
+        if d is None or d.get("state") != "done":
+            skipped_run += 1
+            continue
+        if want and c.get("tag") not in want:
+            continue
+        if conds is not None and not plans_of(d, conds):
+            skipped_run += 1
+            continue
+        if not curve_filter_ok(d, filt):
+            skipped_filter += 1
+            continue
+        if methods:
+            m = curve_method_of(d, methods)
+            if m is None:
+                skipped_method += 1
+                continue
+        else:
+            m = _mechanical_method(d)
+        fig = cond_key(d, grouping)
+        token = str(c.get("token") or "").replace(":", "_")
+        rd = os.path.join(dest, fig, m["dir"], "run-" + token)
+        fn = clean_curve_name("run-%s-tag-%s.csv" % (token, c["tag"]))
+
+        F = figs.setdefault(fig, {"map": {}, "agents": {}, "setting": {},
+                                  "task_assign": {}, "dynamic": {},
+                                  "t_max": {}, "tags": set(), "methods": {}})
+        _bump(F["map"], str(d.get("map") or "").replace("map_", ""))
+        _bump(F["agents"], d.get("agents"))
+        _bump(F["setting"], str(d.get("method_tag") or "safe"))
+        _bump(F["task_assign"], (d.get("task_assign") or "TP").upper())
+        _bump(F["dynamic"], bool(d.get("dynamic_agents")))
+        tm = _num(d.get("t_max"))
+        if tm:
+            _bump(F["t_max"], int(tm))
+        F["tags"].add(c["tag"])
+        M = F["methods"].setdefault(m["dir"], {
+            "label": m["label"], "color": m["color"], "order": m["order"],
+            "match": m["match"], "seeds": set(), "runs": set(), "stems": set()})
+        M["runs"].add("run-" + token)
+        M["seeds"].add(d.get("seed"))
+        M["stems"].add(eval_model_stem(d))
+
+        if dry_run:
+            written += 1
+            continue
+        try:
+            os.makedirs(rd)
+        except OSError:
+            pass
+        with open(os.path.join(rd, fn), "w") as f:
+            f.write("Wall time,Step,Value\n")
+            for wall, step, val in c["points"]:
+                f.write("%s,%s,%s\n" % (wall, step, val))
+        written += 1
+
+    # ---- 条件ごとに _meta.json (v2) ----------------------------------------
+    # 仕様: make_graph の docs/interchange/meta.schema.json
+    commit = _git_short_head(repo)
+    mspecs = metric_specs(spec_metrics)
+    # 色が指定されていない手法に割り当てるパレットの添字。条件ごとに数えると
+    # 「5agent には MAPPO があるが 7agent には無い」で同じ手法の色がずれるので、
+    # この export に出てくる手法全体で 1 回だけ決める
+    allm = {}
+    for F in figs.values():
+        for dir_, M in F["methods"].items():
+            o = M["order"]
+            cur = allm.get(dir_, "?")
+            if cur == "?" or (o is not None and (cur is None or o < cur)):
+                allm[dir_] = o
+    pal_ix = dict((d, i) for i, d in enumerate(
+        sorted(allm, key=lambda d: (allm[d] is None, allm[d] if allm[d] is not None else 0, d))))
+
+    for fig, F in sorted(figs.items()):
+        # t_max: 同じ条件なら計画上は 1 つ。割れていたら多数派を採り、知らせる
+        t_max, split = _majority(F["t_max"])
+        if split:
+            sys.stderr.write("[curves] %s: t_max differs across runs %s; using %s\n"
+                             % (fig, sorted(F["t_max"]), t_max))
+        # map / agents はこの条件で一意のときだけ書く (grouping 次第で混ざりうる)
+        mp, mp_split = _majority(F["map"])
+        ag, ag_split = _majority(F["agents"])
+
+        # methods[]: order が無いものは dir 名順で後ろに詰める。色が無ければパレット
+        items = sorted(F["methods"].items(),
+                       key=lambda kv: (kv[1]["order"] is None,
+                                       kv[1]["order"] if kv[1]["order"] is not None else 0,
+                                       kv[0]))
+        meths = []
+        for i, (dir_, M) in enumerate(items):
+            stems = sorted(x for x in M["stems"] if x)
+            if len(stems) > 1:
+                sys.stderr.write("[curves] %s/%s: %d model stems in one method folder "
+                                 "(match is looser than the plan): %s\n"
+                                 % (fig, dir_, len(stems), stems))
+            seeds = []
+            for sd in M["seeds"]:
+                try:
+                    seeds.append(int(sd))
+                except (TypeError, ValueError):
+                    seeds.append(str(sd))
+            if require_seeds and len(M["runs"]) < require_seeds:
+                sys.stderr.write("[curves] %s/%s: %d seed(s), fewer than the "
+                                 "required %d\n"
+                                 % (fig, dir_, len(M["runs"]), require_seeds))
+            entry = {"dir": dir_, "label": M["label"],
+                     "color": M["color"] or CURVE_PALETTE[pal_ix.get(dir_, i)
+                                                          % len(CURVE_PALETTE)],
+                     "order": i,
+                     "seeds": sorted(seeds, key=lambda x: (isinstance(x, str), x)),
+                     "runs": sorted(M["runs"]),
+                     "match": M["match"]}
+            if stems:
+                entry["model_stem"] = stems[0]
+            if len(stems) > 1:
+                entry["model_stems"] = stems
+            meths.append(entry)
+
+        # metrics[]: 仕様があれば **その順序で**、この条件に実在する tag だけ
+        if mspecs:
+            metrics = [dict(m) for m in mspecs if m.get("name") in F["tags"]]
+        else:
+            metrics = [{"name": t} for t in sorted(F["tags"])]
+
+        # null はスキーマを通らない (t_max/agents は integer, model_stem は string)
+        # ので、値が無いキーは書かない
+        cond = {"key": fig}
+        if t_max:
+            cond["t_max"] = int(t_max)
+        if not mp_split and mp:
+            cond["map"] = mp
+        if not ag_split and (_num(ag) or 0) > 0:
+            cond["agents"] = int(_num(ag))
+        # 軸がこの条件で一意に決まるときだけ書く。grouping が既定 (map x agents)
+        # なら algo/setting は手法ごとに違うので、当然ここには出ない
+        for ax, key in (("setting", "setting"), ("task_assign", "task_assign"),
+                        ("dynamic", "dynamic")):
+            v, split2 = _majority(F[ax])
+            if v is not None and not split2:
+                cond[key] = v
+        meta = {
+            "version": 2,
+            "generated_by": "ldrp collect_runs.py",
+            "generated_at": now_utc().isoformat(),
+            "ldrp_commit": commit,
+            "spec_version": 1,
+            "condition": cond,
+            "x_label": x_label or "Training steps",
+            "metrics": metrics,
+            "methods": meths,
+        }
+        if not mp_split and mp:
+            meta["map_name"] = mp
+        if not ag_split and ag is not None:
+            # スキーマ上 condition.agents は整数、トップレベルは文字列
+            meta["agent_count"] = str(ag)
+        if not dry_run:
+            fd = os.path.join(dest, fig)
+            try:
+                os.makedirs(fd)
+            except OSError:
+                pass
+            tmp = os.path.join(fd, "_meta.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, os.path.join(fd, "_meta.json"))
+
+    sys.stderr.write("[curves] %d csv written into %d condition(s) -> %s%s\n"
+                     % (written, len(figs), dest, " (dry run)" if dry_run else ""))
+    if skipped_run:
+        sys.stderr.write("[curves] %d skipped: run is not done or not in a plan\n"
+                         % skipped_run)
+    if skipped_method:
+        sys.stderr.write("[curves] %d skipped: no method matched\n" % skipped_method)
+    if skipped_filter:
+        sys.stderr.write("[curves] %d skipped by the spec filter\n" % skipped_filter)
+    return figs
+
+
+def clean_curve_name(name, max_len=150):
+    """make_graph の clean_basename と同じ 150 バイト制限に合わせる."""
+    root, ext = os.path.splitext(name)
+    b = root.encode("utf-8")
+    budget = max(1, max_len - len(ext.encode("utf-8")))
+    if len(b) > budget:
+        root = b[:budget].decode("utf-8", "ignore")
+    return root + ext
 
 
 def purge_drop_models(planned, hosts, drop_root, dry_run=False):
@@ -3345,6 +3974,13 @@ def main(argv=None):
                    help="sacred dir relative to repo root (repeatable)")
     p.add_argument("--model-subdir", action="append", default=None,
                    help="saved-model dir relative to repo root (repeatable)")
+    p.add_argument("--scan-curves", default="",
+                   help="scanner mode: also emit learning curves for these comma "
+                        "separated scalar tags (extracted where the event files are)")
+    p.add_argument("--curve-max-points", type=int, default=0,
+                   help="thin each curve down to this many points (0 = keep all)")
+    p.add_argument("--tb-subdir", action="append",
+                   help="where tb_logs live, relative to --repo")
     p.add_argument("--scan-dir", action="append", default=None,
                    help="scan only these sacred run directories (repeatable); "
                         "used by the quick finished-run check")
@@ -3402,6 +4038,17 @@ def main(argv=None):
                         "'path' = path policy only")
     p.add_argument("--fetch-optimizer", action="store_true",
                    help="also fetch opt.th (optimizer state; not needed to evaluate)")
+    p.add_argument("--export-curves", metavar="DIR", nargs="?", const="",
+                   help="write learning curves as CSV under DIR, laid out for "
+                        "make_graph ({cond}/{method}/run-{token}/*.csv). "
+                        "with no DIR, the spec's out_root is used")
+    p.add_argument("--curve-spec", "--spec", metavar="JSON", dest="curve_spec",
+                   help="curve_spec.json from make_graph (metrics / methods / "
+                        "filter / grouping). falls back to the 'curves' section "
+                        "of the config")
+    p.add_argument("--metrics-catalog", metavar="JSON",
+                   help="write the list of available scalar tags (with a size "
+                        "estimate per run) so make_graph can offer a picker")
     p.add_argument("--purge-drop", action="store_true",
                    help="after a successful fetch, delete the copied model files "
                         "from the shared folder to free iCloud space (leaves a "
@@ -3529,7 +4176,12 @@ def main(argv=None):
         rows = [derive(r, stale_m, tag_map, lare_chain=conf.get("lare_chain"))
                 for r in records]
         if min_steps:
-            keep = set(d["uid"] for d in rows if (d.get("t_max") or 0) >= min_steps)
+            # batch (train.py の実行予定) は t_max を持たないので、この足切りに
+            # 巻き込まれて消える。**予定は共有フォルダ経由でも届けたい** ので残す
+            # (これが無いと黒 / M2 の「あと何本回すか」が白から一切見えない)
+            keep = set(d["uid"] for d in rows
+                       if (d.get("t_max") or 0) >= min_steps
+                       or d.get("kind") == "batch")
             records = [r for r in records if r["uid"] in keep]
             rows = [d for d in rows if d["uid"] in keep]
         want = set(x.strip() for x in (args.fetch_state or "done").split(",") if x.strip())
@@ -3563,8 +4215,29 @@ def main(argv=None):
         p.error("no hosts to visit")
 
     drop_root = args.drop_root or conf.get("drop_root")
+
+    # 学習曲線の仕様。--curve-spec (make_graph が書く) が優先、無ければ config
+    spec = {}
+    if args.curve_spec:
+        spec = _read_json(os.path.expanduser(args.curve_spec)) or {}
+    if not spec:
+        spec = conf.get("curves") or {}
+    if args.export_curves == "":
+        args.export_curves = spec.get("out_root")
+        if not args.export_curves:
+            p.error("--export-curves needs a directory "
+                    "(the spec has no out_root)")
+    want_curves = None
+    if args.export_curves or args.metrics_catalog:
+        want_curves = set(metric_names(spec.get("metrics"))) or None
+        if args.metrics_catalog:
+            want_curves = None            # カタログは全タグを見たい
+
     raw, errors = collect(hosts, tail_bytes, args.ssh_timeout, args.verbose,
-                          drop_root=drop_root)
+                          drop_root=drop_root,
+                          curves=want_curves if (args.export_curves or
+                                                 args.metrics_catalog) else None,
+                          curve_max_points=int(spec.get("max_points") or 0))
 
     # 前回の state はキャッシュに書き込んである (_state). 再導出すると
     # 「到達できないホストの running が時間経過で stalled に変わる」等でぶれるので、
@@ -3572,7 +4245,8 @@ def main(argv=None):
     # バッチ (train.py の実行予定) は「いまの状態」なのでキャッシュしない。
     # 古い予約が残ると、終わったバッチの枠がいつまでも埋まって見える
     batches = [r for r in raw if r.get("kind") == "batch"]
-    raw = [r for r in raw if r.get("kind") != "batch"]
+    curves = [r for r in raw if r.get("kind") == "curve"]
+    raw = [r for r in raw if r.get("kind") not in ("batch", "curve")]
 
     prev_states = {}
     cache_path = os.path.expanduser(args.cache) if args.cache else None
@@ -3657,6 +4331,37 @@ def main(argv=None):
     sys.stderr.write("[info] %d runs  %s\n" % (
         len(rows), "  ".join("%s=%d" % (STATE_MARK[s], counts[s])
                              for s in STATE_ORDER if counts[s])))
+
+    if args.metrics_catalog:
+        cat = build_metrics_catalog(rows, curves, spec.get("grouping"))
+        out = os.path.expanduser(args.metrics_catalog)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out)))
+        except OSError:
+            pass
+        with open(out, "w") as f:
+            json.dump(cat, f, indent=2, ensure_ascii=False)
+        sys.stderr.write("[catalog] %d metric(s) from %d run(s) -> %s\n"
+                         % (len(cat["metrics"]), cat["n_runs_scanned"], out))
+
+    if args.export_curves:
+        plan_conds = None
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import plan as _PLAN
+            plan_conds = _PLAN.parse_plans(_PLAN.find_plans(args.plan))
+        except Exception as e:
+            sys.stderr.write("[curves] plan not loaded (%s: %s); "
+                             "every done run is exported\n" % (type(e).__name__, e))
+        export_curves(rows, curves, args.export_curves,
+                      methods=spec.get("methods"),
+                      spec_metrics=spec.get("metrics"),
+                      conds=plan_conds,
+                      repo=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      filt=spec.get("filter"),
+                      grouping=spec.get("grouping"),
+                      x_label=spec.get("x_label"),
+                      require_seeds=int(spec.get("require_seeds") or 0))
 
     if args.fetch_models or args.fetch_dry_run:
         want = set(x.strip() for x in (args.fetch_state or "done").split(",") if x.strip())

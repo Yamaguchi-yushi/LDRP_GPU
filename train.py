@@ -1,6 +1,22 @@
 import subprocess
 import time
 import os
+import json
+
+_SLOT = os.path.expanduser("~/.ldrp/batch_%d.json" % os.getpid())
+
+def _publish_batch(started, cmd=None):
+    try:
+        os.makedirs(os.path.dirname(_SLOT), exist_ok=True)
+        rec = {"pid": os.getpid(), "total": num_runs,
+               "started": started, "updated": time.time()}
+        if cmd:
+            rec["cmd"] = cmd
+        with open(_SLOT, "w") as f:
+            json.dump(rec, f)
+    except OSError:
+        pass
+
 """
 command = [
     ["python3", "test.py", "map_5x4", "3", "pbs", "tp"]
@@ -13,6 +29,7 @@ command = [
 num_runs = 1
 maxpurocesses = 1
 running_processes = []
+_publish_batch(0)
 
 for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
@@ -98,6 +115,7 @@ for i in range(num_runs):
     env.pop('PYTHONPATH', None)
     proc = subprocess.Popen(command, shell=True, env=env)
     running_processes.append(proc)
+    _publish_batch(i + 1, command)
 
     while len(running_processes) >= maxpurocesses:
         for p in running_processes[:]:
@@ -109,3 +127,7 @@ for p in running_processes:
     p.wait()
 
 print("All runs completed.")
+try:
+    os.remove(_SLOT)
+except OSError:
+    pass

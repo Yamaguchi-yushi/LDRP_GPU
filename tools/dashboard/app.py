@@ -43,6 +43,10 @@ def _load(name):
 # 表示順。ベースライン -> 提案 の順に並ぶようにする
 ALGO_ORDER = ("qmix", "mappo", "mat", "mat_dec", "qplex", "iql", "vdn", "transf_qmix")
 
+# 計画の枠 (5 seed) を埋められる run の状態。failed / stalled / short は
+# 「回し直しが要る」ので枠を占めさせない (占めると未実行の数が実態より減る)
+SLOT_STATES = ("done", "running")
+
 
 def _rank(seq, v):
     try:
@@ -103,6 +107,46 @@ class State(object):
             spec = conf.get("plans")
         return PLAN.find_plans(spec)
 
+    def pending_by_cond(self, conds):
+        """train.py がこれから回す予定を、実験計画の条件ごとに数える.
+
+        sacred は run が **始まって初めて** ディレクトリを作るので、5 本連続実行の
+        2 本目を回している時点では 1 本しか見えない。マシンが埋まっているのに
+        表は「未実行 4」のままになり、二重に投入してしまう。
+        train.py が書いた予約 (`~/.ldrp/batch_<pid>.json` の cmd) を条件に
+        対応づけて、残り (total - started) を「実行待ち」として枠に出す。
+
+        条件の判定は実績の run と **同じ derive() 1 か所** で行う。
+        コマンド行のキー名は config.json と同じなので、そのまま通せる。
+        """
+        out = {}
+        conf = self.conf()
+        for b in (self.batches or []):
+            total, started = b.get("total"), b.get("started")
+            cmd = b.get("train_cmd")
+            if not cmd or total is None or started is None:
+                continue                  # 予約を書いていない = 本数が分からない
+            left = int(total) - int(started)
+            if left <= 0:
+                continue
+            rec = CR.parse_train_command(cmd)
+            rec.update({"uid": b.get("uid"), "machine": b.get("machine")})
+            try:
+                d = CR.derive(rec, conf.get("stale_minutes") or 90,
+                              conf.get("method_tag_by_lare_mode"),
+                              conf.get("expected_t_max"),
+                              lare_chain=conf.get("lare_chain"))
+            except Exception:             # 解析できない予約で画面を壊さない
+                continue
+            for i, c in enumerate(conds):
+                if PLAN.matches(c, d):
+                    e = out.setdefault(i, {"n": 0, "machines": []})
+                    e["n"] += left
+                    if b.get("machine") not in e["machines"]:
+                        e["machines"].append(b.get("machine"))
+                    break
+        return out
+
     def plan_view(self, rows, shaped):
         """**表は計画から作る**。実績はそこに埋めていく.
 
@@ -125,13 +169,15 @@ class State(object):
         out = []
         # パラメータが多数派とずれている run。印を付ける判断に使う
         odd_uids = set(d["uid"] for d in CR.odd_param_runs(rows))
-        for c in conds:
+        pending = self.pending_by_cond(conds)
+        for ci, c in enumerate(conds):
             hit = [d for d in rows if PLAN.matches(c, d)]
             by_seed = {}
             for d in hit:
                 by_seed.setdefault(str(d.get("seed")), []).append(d)
 
             slots = []
+            blanks = []                       # seed 欄が空のままの枠 (添字)
             for sl in c["seeds"]:
                 sd = str(sl["seed"]) if sl["seed"] else None
                 run = None
@@ -141,23 +187,50 @@ class State(object):
                     run = shaped.get(d["uid"])
                 slots.append({"seed": sd, "machine": sl.get("machine"),
                               "reassign": sl.get("reassign"), "run": run})
-            # 計画に無い seed で回っているもの (捨てずに出す)。
-            # ただし印 (*) を付けるのは **不具合が疑わしいときだけ** にする。
-            # seed 欄を空けたまま自動検出に任せている条件では全行が黄色になり、
-            # 本当に見るべきものが埋もれるため (実測で 84 条件中 46 条件が空欄運用)。
+                if sd is None:
+                    blanks.append(len(slots) - 1)
+
+            # 計画に seed が書かれていない run。**まず空いている枠を埋める**。
+            # 枠と別に並べると 5 seed の条件が「未実行 5 行 + 実績 2 行」の 7 行に
+            # なり、あと何本回せばよいのかが表から読めなくなる (実測で 84 条件中
+            # 46 条件が seed 欄を空けたまま自動検出に任せている)。
+            # 枠より多い分だけを下に足す。
+            leftover = sorted((d for ds in by_seed.values() for d in ds),
+                              key=lambda d: (str(d.get("state") not in SLOT_STATES),
+                                             str(d.get("start_time") or ""),
+                                             str(d.get("seed"))))
+            # 印 (*) を付けるのは **不具合が疑わしいときだけ**。状態 / params✗ /
+            # t_max は別の欄に既に出ているので、ここで黄色にするのは「表に 5 seed
+            # 書いてあるのに、さらに別の seed が回っている」場合 (取り違えか二重実行)。
+            full = sum(1 for sl in c["seeds"] if sl.get("seed")) >= c["want"]
             extra = []
-            for sd, ds in by_seed.items():
-                for d in ds:
-                    used.add(d["uid"])
-                    # suspect = **本当に見るべきもの**だけ。状態 / params✗ / t_max は
-                    # 別の欄に既に出ているので、ここで黄色にするのは
-                    # 「表に 5 seed 書いてあるのに、さらに別の seed が回っている」場合。
-                    # 取り違えか二重実行が疑われる
-                    full = sum(1 for sl in c["seeds"] if sl.get("seed")) >= c["want"]
-                    extra.append({"seed": sd, "machine": d.get("machine"),
-                                  "run": shaped.get(d["uid"]),
-                                  "unplanned_seed": True,      # 表に無い = 補足情報
-                                  "suspect": bool(full and d.get("state") == "done")})
+            for d in leftover:
+                used.add(d["uid"])
+                row = {"seed": str(d.get("seed")), "machine": d.get("machine"),
+                       "run": shaped.get(d["uid"]),
+                       "unplanned_seed": True,       # 表に無い seed = 補足情報
+                       "suspect": bool(full and d.get("state") == "done")}
+                # 失敗・停止した run は枠を埋めない。埋めてしまうと 5 行のうち
+                # 1 行が失敗で占められ、「あと何本回せばよいか」が読めなくなる。
+                # 消さずに下へ出す (どの seed が落ちたかは見たいため)
+                if blanks and d.get("state") in SLOT_STATES:
+                    i = blanks.pop(0)
+                    row["reassign"] = slots[i].get("reassign")
+                    slots[i] = row
+                else:
+                    extra.append(row)
+
+            # train.py がこれから回す分を「実行待ち」として置く。**run が入って
+            # いない枠すべて**が対象 (seed が明記された枠も含む)。train.py は
+            # seed を自分で引くので予約とその seed 番号は結び付かないが、
+            # 埋めたいのは「この条件はあと何本要るか」なので枠の別は問わない。
+            # 枠より多く予約されていても表は 5 行のまま。
+            p = pending.get(ci)
+            if p:
+                empty = [i for i, s in enumerate(slots) if not s.get("run")]
+                for i in empty[:p["n"]]:
+                    slots[i]["pending"] = True
+                    slots[i]["pending_on"] = "/".join(x for x in p["machines"] if x)
             # 同じ条件のはずなのにパラメータが割れていたら、**どのキーが違うか**を渡す。
             # ハッシュだけでは何を直せばよいか分からない
             pdiff, phashes = [], {}
@@ -206,7 +279,13 @@ class State(object):
                 for r in CR.dedupe(raw)]
         min_steps = conf.get("min_steps", 1e6)
         if min_steps:
-            rows = [d for d in rows if (d.get("t_max") or 0) >= min_steps]
+            # 短い run (動作確認用の t_max=数万) は表を埋めるので既定で落とす。
+            # ただし **走っている間は必ず見せる**。報酬設計を変えた直後の試し
+            # 実行のように、計画に無く t_max も小さい run こそ進捗を見たい。
+            # 終われば消えるが、そのときは計画外の件数として数えられる
+            rows = [d for d in rows
+                    if (d.get("t_max") or 0) >= min_steps
+                    or d.get("state") == "running"]
         with self.lock:
             data = CR.dashboard_data(
                 rows, self.batches, self.errors,
@@ -294,6 +373,57 @@ class State(object):
             return {"busy": self.busy, "collected_at": self.collected_at,
                     "errors": self.errors}
 
+    def mini(self):
+        """デスクトップの小さいパネル用の要約 (1KB 未満).
+
+        train() は 1.8MB あり、常駐パネルが毎分取りにくるには重い。
+        中身は同じ計算なので、要るものだけ抜いて返す。
+        """
+        d = self.train()
+        plan = d.get("plan") or []
+        full = part = todo = 0
+        need = running = 0
+        for c in plan:
+            want = c.get("want") or 5
+            slots = (c.get("slots") or [])[:want]
+            done = sum(1 for s in slots
+                       if s.get("run") and s["run"].get("state") == "done")
+            kept = sum(1 for s in slots
+                       if s.get("run") and (s["run"].get("saved") or []))
+            run = sum(1 for s in slots
+                      if s.get("run") and s["run"].get("state") == "running")
+            need += max(0, want - done - run)
+            running += run
+            if done >= want and kept >= want:
+                full += 1
+            elif done or run:
+                part += 1
+            else:
+                todo += 1
+        # マシンごとの「最後に何を終わらせたか」。実行中が 0 でも、直前に
+        # 終わったのが 3 日前なら手が空いている = 投入すべき、と判断できる
+        last = {}
+        for r in d.get("runs") or []:
+            if r.get("state") != "done" or not r.get("stop_at"):
+                continue
+            k = r.get("machine")
+            if k not in last or r["stop_at"] > last[k]["stop_at"]:
+                last[k] = r
+        machines = []
+        for name, m in sorted((d.get("machines") or {}).items()):
+            r = last.get(name)
+            machines.append({
+                "name": name, "running": m.get("running") or 0,
+                "age": m.get("data_age_sec"), "stale": bool(m.get("stale_data")),
+                "last_done": r.get("stop_at") if r else None,
+                "last_what": ("%sag %s %s" % (r.get("agents"),
+                                              str(r.get("map") or "").replace("map_", ""),
+                                              r.get("algo"))) if r else None,
+            })
+        return {"conditions": len(plan), "full": full, "part": part, "todo": todo,
+                "need": need, "running": running, "machines": machines,
+                "collected_at": self.collected_at, "busy": self.busy}
+
 
 # ---------------------------------------------------------------------------
 # ルーティング (flask / 標準ライブラリのどちらからも同じものを呼ぶ)
@@ -304,6 +434,7 @@ def make_routes(state):
         ("GET", "/api/train"): lambda body: state.train(),
         ("GET", "/api/eval"): lambda body: state.eval(),
         ("GET", "/api/status"): lambda body: state.status(),
+        ("GET", "/api/mini"): lambda body: state.mini(),
         ("POST", "/api/collect"): lambda body: {"started": state.collect()},
     }
 

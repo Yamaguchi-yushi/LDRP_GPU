@@ -122,6 +122,44 @@ document.addEventListener("click", ev => {
     .forEach(el => el.setAttribute("aria-expanded", show ? "true" : "false"));
 });
 
+// 「実行中」の条件名から、計画表の同じ run の行へ飛ぶ。
+// 条件が 84 個あるので、目で探すと毎回 1 分かかる
+function gotoCondRow(el) {
+  const uid = el.getAttribute("data-goto");
+  // uid には ":" と "/" が入る (sacred のパス) ので、セレクタには入れず走査で引く
+  const row = [...document.querySelectorAll("#t-conds tr[data-uid]")]
+    .find(tr => tr.getAttribute("data-uid") === uid);
+  if (!row) {
+    // 絞り込みで隠れているか、計画外で表に出ていない。
+    // 文字を書き換えると条件名が消えるので、脇に一言足して戻す
+    if (el.querySelector(".gotomiss")) return;
+    const note = document.createElement("span");
+    note.className = "mut gotomiss";
+    note.textContent = " (表に無し)";
+    el.appendChild(note);
+    setTimeout(() => note.remove(), 1600);
+    return;
+  }
+  // 見出しが sticky で上端に貼り付いているぶん、center にしないと隠れる
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+  document.querySelectorAll("tr.flash").forEach(t => t.classList.remove("flash"));
+  row.classList.add("flash");
+  setTimeout(() => row.classList.remove("flash"), 2000);
+}
+
+document.addEventListener("click", ev => {
+  const el = ev.target.closest && ev.target.closest("[data-goto]");
+  if (el) gotoCondRow(el);
+});
+// span なので Enter / Space は自分で拾う (button なら既定で効くもの)
+document.addEventListener("keydown", ev => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const el = ev.target.closest && ev.target.closest("[data-goto]");
+  if (!el) return;
+  ev.preventDefault();
+  gotoCondRow(el);
+});
+
 function renderTrain() {
   if (!TRAIN) return;
   const R = trainRows();
@@ -138,18 +176,26 @@ function renderTrain() {
   // machines
   const byM = {};
   R.forEach(r => {
-    const m = byM[r.machine] || (byM[r.machine] = { run: 0, done: 0, bad: 0, eta: null });
+    const m = byM[r.machine] || (byM[r.machine] = { run: 0, done: 0, bad: 0, eta: null,
+                                                    planDone: 0, planSaved: 0 });
     if (r.state === "running") { m.run++; if (r.eta && (!m.eta || r.eta < m.eta)) m.eta = r.eta; }
-    else if (r.state === "done") m.done++;
-    else if (["stalled", "failed", "short"].includes(r.state)) m.bad++;
+    else if (r.state === "done") {
+      m.done++;
+      // 回収は計画内の run だけが対象なので、計画外を分母に入れない。
+      // 入れると「全部回収済みでも 112/182」になり、未回収との区別が付かない
+      if (r.in_plan) { m.planDone++; if ((r.saved || []).length) m.planSaved++; }
+    } else if (["stalled", "failed", "short"].includes(r.state)) m.bad++;
   });
   // 「情報がいつのものか」を machine 表の主役にする。これが無いと
   // 「そのマシンが黙っている」ことに気づけず、古い情報を現状だと誤読する
   $("t-mach").innerHTML =
     // 「予約待ち」列は train.py が予約ファイルを書かないと埋まらないので出さない
     // (design/run_collector.md §12.3 が入ったら戻す)
-    "<tr><th>machine</th><th>いつの情報か</th><th>実行中</th>"
-    + "<th>完了</th><th>モデル回収</th><th>異常</th><th>次の完了</th></tr>"
+    // 数の列は th にも .num を付ける。td だけ right、th は left のままだと
+    // 見出しと数字が左右に離れて、どの列の数か読み取れなくなる
+    "<tr><th>machine</th><th>いつの情報か</th><th class=\"num\">実行中</th>"
+    + "<th class=\"num\">完了</th><th class=\"num\">モデル回収</th>"
+    + "<th class=\"num\">異常</th><th>次の完了</th></tr>"
     + (Object.keys(byM).sort().map(k => {
       const m = byM[k], b = (TRAIN.machines || {})[k];
       let fresh = `<span class="mut">-</span>`;
@@ -162,10 +208,15 @@ function renderTrain() {
               + `${dur(b.data_age_sec)} 前</span>`
               + (via ? ` <span class="mut sm">${esc(via)}</span>` : "");
       }
-      // 「完了した run のうち何本のモデルを手元に持っているか」
-      const nd = (b && b.done) || 0, ns = (b && b.saved) || 0;
-      const got = nd ? `<span class="${ns >= nd ? "c-ok" : "wrn"}">${ns}/${nd}</span>`
-                     : `<span class="mut">-</span>`;
+      // 「**計画内の**完了 run のうち何本のモデルを手元に持っているか」。
+      // 分母を全完了にすると計画外 (別マップ・mmpp 導入前の設定など) が混ざり、
+      // 回収が済んでいても埋まらない
+      const nd = m.planDone, ns = m.planSaved;
+      const skip = m.done - nd;
+      const tip = `計画内の完了 ${nd} 本のうち ${ns} 本を回収済み`
+                + (skip ? ` (計画外の完了 ${skip} 本は対象外)` : "");
+      const got = nd ? `<span class="${ns >= nd ? "c-ok" : "wrn"}" title="${esc(tip)}">${ns}/${nd}</span>`
+                     : `<span class="mut" title="${esc(tip)}">-</span>`;
       return `<tr><td>${esc(k)}</td><td>${fresh}</td><td class="num">${m.run}</td>
         <td class="num">${m.done}</td><td class="num">${got}</td>
         <td class="num ${m.bad ? "err" : "mut"}">${m.bad}</td>
@@ -189,7 +240,8 @@ function renderTrain() {
   const run = R.filter(r => r.state === "running")
     .sort((a, b) => (a.eta || "9") < (b.eta || "9") ? -1 : 1);
   $("t-run").innerHTML =
-    "<tr><th>進捗</th><th>t_env</th><th>残り</th><th>終了予定</th><th>machine</th>"
+    "<tr><th>進捗</th><th class=\"num\">t_env</th><th class=\"num\">残り</th>"
+    + "<th>終了予定</th><th>machine</th>"
     + "<th>条件</th><th>seed</th><th>経過</th></tr>"
     + (run.length ? run.map(r => `<tr>
         <td><span class="pb"><i style="width:${((r.progress || 0) * 100).toFixed(0)}%"></i></span>
@@ -197,7 +249,12 @@ function renderTrain() {
         <td class="mut num">${M(r.t_last)}/${M(r.t_max)}M</td>
         <td class="num">${dur(r.remaining_sec)}</td><td>${when(r.eta)}</td>
         <td>${esc(r.machine)}</td>
-        <td>${r.agents}ag ${esc(r.map)} ${esc(r.algo)} ${esc(r.setting)}</td>
+        <td>${(cond => r.in_plan
+            // ボタンを置くと行が騒がしくなるので、条件名そのものを押させる。
+            // ただの文字だと押せると気づけないので、点線の下線で示す
+            ? `<span class="goto" role="button" tabindex="0" data-goto="${esc(r.uid)}"`
+              + ` title="計画表のこの run の行へ移動">${cond}</span>`
+            : cond)(`${r.agents}ag ${esc(r.map)} ${esc(r.algo)} ${esc(r.setting)}`)}</td>
         <td class="mut">${esc(r.seed)}${r.in_plan ? "" : ' <span class="wrn">計画外</span>'}${
           r.stale_data ? ` <span class="wrn" title="このホストからの情報が古い">情報 ${dur(r.data_age_sec)} 前</span>` : ""}</td>
         <td class="mut">${esc(r.duration)}</td></tr>`).join("")
@@ -318,7 +375,14 @@ function renderTrain() {
     slots.forEach(sl => {
       const r = sl.run;
       let st;
-      if (!r) st = `<span class="mut">未実行</span>`;
+      // train.py が「これから回す」と予約している枠。sacred のディレクトリは
+      // まだ無いので run は付かない。未実行と分けないと、埋まっているマシンに
+      // 二重で投入してしまう
+      if (!r && sl.pending)
+        st = `<span class="pend" title="train.py がこの条件をあと何本か回す予定です${
+              sl.pending_on ? " (" + esc(sl.pending_on) + ")" : ""}。seed は起動時に決まるので、この行の seed 番号とは限りません">⏳ 実行待ち${
+              sl.pending_on ? ` <span class="mut sm">${esc(sl.pending_on)}</span>` : ""}</span>`;
+      else if (!r) st = `<span class="mut">未実行</span>`;
       else {
         const pct = ((r.progress || 0) * 100).toFixed(0);
         const steps = `${M(r.t_last)}M / ${M(r.t_max)}M`;
@@ -362,7 +426,8 @@ function renderTrain() {
       const sr = "";
       // 表に無い seed は薄字の "+" で補足するだけ。黄色くするのは suspect のときだけ
       // (状態 / params✗ / t_max は別の欄に出ているので、ここで重ねて警告しない)
-      html += `<tr><td class="${sl.suspect ? "wrn" : (r ? "" : "mut")}">${
+      // data-uid: 「実行中」の表から、この行へ飛ぶための目印
+      html += `<tr${r ? ` data-uid="${esc(r.uid)}"` : ""}><td class="${sl.suspect ? "wrn" : (r ? "" : "mut")}">${
           esc(sl.seed || "—")}${sl.suspect ? ' <span class="wrn" title="表には 5 seed 書いてあるのに、別の seed も完了しています">*</span>'
             : (sl.unplanned_seed ? ' <span class="mut" title="計画表に書かれていない seed">+</span>' : "")}</td>
         <td class="mut">${esc((r && r.machine) || sl.machine || "")}</td>
@@ -429,8 +494,8 @@ function renderEval() {
                 ["method_tag", "tag"], ["allocator", "alloc"], ["metric", metric]];
   $("e-tbl").innerHTML =
     "<tr>" + cols.map(([k, l]) =>
-      `<th class="sortable" onclick="evalSortBy('${k}')">${esc(l)}${evalSortCol === k ? (evalSortAsc ? " ▲" : " ▼") : ""}</th>`).join("")
-    + "<th>n</th><th>per-seed</th></tr>"
+      `<th class="sortable${["n", "metric"].includes(k) ? " num" : ""}" onclick="evalSortBy('${k}')">${esc(l)}${evalSortCol === k ? (evalSortAsc ? " ▲" : " ▼") : ""}</th>`).join("")
+    + "<th class=\"num\">n</th><th>per-seed</th></tr>"
     + rows.map(d => {
       const st = d.metrics[metric] || {};
       const cls = st.n === 1 ? "one" : (st.n < 5 ? "thin" : "");

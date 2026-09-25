@@ -495,6 +495,46 @@ python tools/collect_runs.py -c tools/collect_config.yaml --format none \
 
 ---
 
+## 学習曲線の書き出し (make_graph へ渡す)
+
+TensorBoard の «Download CSV» は要らない。event ファイルを直接読んで、
+[make_graph](https://github.com/Yamaguchi-yushi/make_graph) が読める形に並べる。
+**作図はしない** (凡例・軸は向こうの GUI で目で見ながら決める)。
+
+```bash
+# 1. どの指標が使えるかを make_graph に渡す
+python tools/collect_runs.py --metrics-catalog ~/metrics_catalog.json
+
+# 2. GUI が書いた仕様で CSV と _meta.json を作る
+python tools/collect_runs.py --export-curves ~/curves --spec ~/curve_spec.json
+```
+
+```text
+~/curves/
+└── 8x5-v2_5agent/                      ← 1 条件 = 1 図のセット
+    ├── _meta.json                      ← 色・順番・軸・t_max
+    ├── QMIX/                           ← methods[].dir と完全一致
+    │   └── run-{token}/
+    │       └── run-{token}-tag-test_return_mean.csv
+    └── MAT_LaRe/
+```
+
+`--spec` を省くと `collect_config.yaml` の `curves:` が使われる (キーの形は同じ)。
+受け渡しの仕様は make_graph 側の `docs/interchange/` にある。
+
+- `_meta.json` の **`condition.t_max`** が要点。条件ごとに学習ステップ数が違う
+  (5agent 20M / 7agent 30M / 10agent 50M / aoba00 7agent 100M) ので、
+  複数条件を一括で作図するとき x 軸の上限と「途中で止まった run」の判定に使われる
+- `methods[].dir` は**フォルダ名と完全一致**が必須。ずれても**エラーにならず**
+  既定色で描かれるので、ここは機械で揃える
+- `model_stem` に `eval_model_stem()` と同じ文字列を入れてあるので、
+  **グラフの線 → 評価用モデルのファイル名**が辿れる
+- 出すのは **`--plan` に載っている完了済み run だけ**。全 36 指標 x 420 run は
+  1.5 GB になるので、指標は仕様で絞る (`test_*` 3 種なら約 0.1 GB)
+
+> **未対応:** 共有フォルダ経由のマシン (黒 / M2) からの抽出。いまは白と
+> ssh で繋がる GPU のみ。
+
 ## 完了ポップアップと常駐パネル
 
 ### 二段構えにする理由

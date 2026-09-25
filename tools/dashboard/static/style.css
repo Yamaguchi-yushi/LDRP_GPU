@@ -61,11 +61,18 @@ svg{max-width:100%;height:auto}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
 
 /* conditions: 元の管理表と同じ形 (条件行 + seed 行) */
-h3{font-size:13px;margin:18px 0 6px;font-weight:normal}
+/* 条件の見出し (マップ / 台数 / t_max) は画面上端に貼り付ける。
+   84 条件を縦に並べると、下の行を見ているうちにどのマップ・何台の表なのか
+   分からなくなる。sticky なら次の見出しが来るまで残り、来たら押し出される。
+   margin-bottom を padding に移すのは、隙間から下の行が透けないようにするため */
+h3{font-size:13px;margin:18px 0 0;padding:4px 0 6px;font-weight:normal;
+   position:sticky;top:0;z-index:3;background:var(--bg)}
 /* 見出しを マップ / 台数 / t_max の 3 列に固定して、章をまたいでも揃うようにする */
 /* 差分を開くボタン。行の中に置くので文字サイズに合わせて小さくする */
 /* 終了時刻。ステップ数の隣に置くので控えめに、ただし読めるように */
 .fin{color:var(--mut);margin-left:6px;white-space:nowrap}
+/* train.py が予約済みの枠。未実行 (灰) とも実績 (白) とも区別する */
+.pend{color:var(--warn);opacity:.85}
 button.diffbtn{font:inherit;font-size:10px;line-height:1.4;margin-left:4px;
   padding:1px 6px;border:1px solid var(--line);border-radius:4px;
   background:var(--card);color:var(--fg);cursor:pointer;white-space:nowrap}
@@ -73,6 +80,19 @@ button.diffbtn:hover{border-color:var(--warn);color:var(--warn)}
 button.diffbtn[aria-expanded="true"]{border-color:var(--warn);color:var(--warn)}
 button.diffbtn[aria-expanded="true"]::after{content:" ▲"}
 button.diffbtn[aria-expanded="false"]::after{content:" ▼"}
+/* 「実行中」から計画表の該当行へ飛ぶ。ボタンを置くと行が騒がしくなるので
+   条件名そのものを押させる。ただの文字だと押せると気づけないため、
+   点線の下線で「押せる」ことだけ示し、ホバーで色を変える */
+.goto{cursor:pointer;border-bottom:1px dotted var(--mut)}
+.goto:hover,.goto:focus{color:var(--run);border-bottom-color:var(--run);
+  outline:none}
+.goto:focus-visible{outline:1px solid var(--run);outline-offset:2px}
+.gotomiss{font-size:11px}
+/* 飛んだ先の行を一瞬光らせる。中央に寄せても、どの行か分からないと意味がない */
+tr.flash td{animation:flash 2s ease-out}
+@keyframes flash{
+  0%,40%{background:var(--run);color:var(--bg)}
+  100%{background:transparent}}
 /* <tr> は display:table-row なので hidden を明示的に効かせる */
 tr[hidden]{display:none}
 table.pdiff{margin:6px 0;font-size:11px;border-collapse:collapse}

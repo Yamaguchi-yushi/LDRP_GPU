@@ -10,6 +10,7 @@ def neighbor_filter_obs(env, state_repre_flag):
     all_onehot_obs = np.array(env.obs_onehot)
     onehot_obs = all_onehot_obs[:,:n_act]
     G = env.ee_env.G
+    active = env.active if getattr(env, "use_dynamic_agents", False) else None
 
     state = [0] * n_act
     pos_list = []
@@ -24,7 +25,8 @@ def neighbor_filter_obs(env, state_repre_flag):
         else:
             edge = edge_or_node
             pos = {"type": "e", "pos": edge, "current_goal": env.current_goal[i], "current_start": env.current_start[i], "obs": obs_i}
-        state += obs_i
+        if active is None and active[i]:    
+            state += obs_i
         pos_list.append(pos)
     # print("state", state)
     # print("pos_list", pos_list)

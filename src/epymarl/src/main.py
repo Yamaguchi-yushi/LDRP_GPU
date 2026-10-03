@@ -12,6 +12,8 @@ from sacred import Experiment, SETTINGS
 from sacred.observers import FileStorageObserver, MongoObserver
 from sacred.utils import apply_backspaces_and_linefeeds
 import sys
+import faulthandler
+faulthandler.enable()
 import torch as th
 from utils.logging import get_logger
 import yaml

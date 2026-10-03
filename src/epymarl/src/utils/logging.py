@@ -38,12 +38,15 @@ class Logger:
             self.tb_logger(key, value, t)
 
         if self.use_sacred and to_sacred:
-            if key in self.sacred_info:
-                self.sacred_info["{}_T".format(key)].append(t)
-                self.sacred_info[key].append(value)
-            else:
-                self.sacred_info["{}_T".format(key)] = [t]
-                self.sacred_info[key] = [value]
+            # info.json への二重記録は止めた。同じ値は log_scalar で metrics.json に残る。
+            # 長い学習で info が巨大になり、heartbeat の書き出し中に Segmentation fault で
+            # 落ちたため (2026-10-02 GPU1 mappo aoba00 10 台 run 28/29)。戻さないこと
+            # if key in self.sacred_info:
+            #     self.sacred_info["{}_T".format(key)].append(t)
+            #     self.sacred_info[key].append(value)
+            # else:
+            #     self.sacred_info["{}_T".format(key)] = [t]
+            #     self.sacred_info[key] = [value]
 
             self._run_obj.log_scalar(key, value, t)
 

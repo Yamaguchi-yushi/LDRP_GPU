@@ -25,7 +25,7 @@ def neighbor_filter_obs(env, state_repre_flag):
         else:
             edge = edge_or_node
             pos = {"type": "e", "pos": edge, "current_goal": env.current_goal[i], "current_start": env.current_start[i], "obs": obs_i}
-        if active is None and active[i]:    
+        if active is None or active[i]:
             state += obs_i
         pos_list.append(pos)
     # print("state", state)

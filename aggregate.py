@@ -8,8 +8,15 @@ from collections import OrderedDict
 import numpy as np
 
 PREFIX = "[RESULT] "
-META_KEYS = ("condition", "model_seed", "n_ep")
+META_KEYS = ("condition", "model_seed", "n_ep", "model", "task_model")
 
+EVAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "src", "all_policy", "models", "safe")
+EXCLUDED_SUFFIX = ".excluded"
+
+def is_excluded(rec):
+    name = rec.get("model")
+    return bool(name) and os.path.exists(os.path.join(EVAL_DIR, name + EXCLUDED_SUFFIX))
 
 def parse_log(text):
     """テキストから [RESULT] 行を全部拾って dict のリストにする."""
@@ -28,11 +35,15 @@ def load_runs(root):
     """root 配下の *.txt を読み、条件 -> {seed: rec} にまとめる."""
     conditions = OrderedDict()
     mtimes = {}
+    skipped = []
     paths = sorted(glob.glob(os.path.join(root, "**", "*.txt"), recursive=True), key=lambda p: os.path.getmtime(p))
     for path in paths:
         mt = os.path.getmtime(path)
         with open(path, "r", errors="replace") as f:
             for rec in parse_log(f.read()):
+                if is_excluded(rec):
+                    skipped.append(rec)
+                    continue
                 cond = rec.get("condition", "(unknown)")
                 seed = rec.get("model_seed", "0")
                 bucket = conditions.setdefault(cond, OrderedDict())
@@ -47,6 +58,9 @@ def load_runs(root):
                           f"keeping the last one ({path})")
                 bucket[seed] = rec
                 mtimes[key] = mt
+    if skipped:
+        print(f"[aggregate] skipped {len(skipped)} result(s) of excluded models: "
+              + ", ".join(sorted({r["model"] for r in skipped})))
     return conditions
 
 

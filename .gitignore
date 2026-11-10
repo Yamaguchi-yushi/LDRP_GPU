@@ -16,6 +16,8 @@ train_results/
 # src/lare/{path,task}/checkpoints/ は autosave 出力. 大量蓄積されるので git 外.
 src/lare/path/checkpoints/
 src/lare/task/checkpoints/
+# 他のマシンから回収した LaRe-Path のモデル (tools/collect_runs.py の fetch_lare_models)
+src/lare/path/fetched/
 .claude/settings.local.json
 .claude/*.local.*
 # 旧パス saved_models/ も後方互換のためサポートしているが git 管理外
@@ -46,3 +48,13 @@ tools/.run_cache.jsonl.bak*
 # (gitignore は行末コメントを解釈しないので、説明は必ず独立行に書く)
 tmp_results/
 .claude/skills/
+
+# 解説用の HTML 教材 (手元で読むだけ。公開しない)
+design/walkthrough/*.html
+tools/.acked_runs.json
+tools/.param_dismissed.json
+tools/.run_excluded.json
+tools/.run_notes.json
+tools/.host_stats.json
+tools/.curve_cache.json
+tools/.autorun/

@@ -14,6 +14,7 @@ import yaml
 
 from src.policy import Policy
 from src.all_policy.policy_manager import PolicyManager
+from src.all_policy.policy import model_stem_form_args, resolve_model_path, TASK_MODELS_DIR
 from src.task_assign.task_manager import TaskManager
 
 
@@ -78,6 +79,12 @@ class Runner():
         self.task_manager = self.both_policy_manager.task_manager
 
         self.writer = None
+        self.task_model_path = None
+        if (not self.training and args.task_assigner == "ppo" and not getattr(args, "ppo_task_checkpoint_path", "")):
+            stem = model_stem_form_args(args, args.agent_num)
+            self.task_model_path = resolve_model_path(stem, self.model_seed, TASK_MODELS_DIR)
+            _asg.load_model_file(self.task_model_path)
+
         if self.training:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_dir = os.path.join("tmp_results", "task_ppo", f"{args.map_name}_{args.agent_num}_{args.path_planner}_{stamp}")
@@ -92,8 +99,16 @@ class Runner():
         env_re = "_envreassign" if getattr(a, "allow_reassign_before_pickup", False) else ""
         train_n = getattr(a, "mat_model_agent_num", None) if a.path_planner == "mat_dec" else None
         train = f"_train{train_n}" if train_n else ""
+        dyn = "_dyn" if getattr(a, "use_dynamic_agents", False) else ""
+        mode = getattr(a, "task_arrival", "fixed")
+        if mode == "fixed":
+            arr = ""
+        elif mode == "bernoulli":
+            arr = f"_bern{float(a.task_density):g}"
+        else:
+            arr = f"_{mode}" 
         return (f"{a.map_name}/{a.agent_num}agent/"
-                f"{env_tag}_{a.path_planner}{tag}_{reassign}_{a.task_assigner}{train}{env_re}")
+                f"{env_tag}_{a.path_planner}{tag}_{reassign}_{a.task_assigner}{train}{dyn}{arr}{env_re}")
 
     def _print_result_line(self, times):
         infos = list(self.info_buffer)
@@ -102,6 +117,14 @@ class Runner():
         m = {"condition": self._condition_id(),
              "model_seed": self.model_seed,
              "n_ep": len(infos)}
+
+        mp = getattr(getattr(self.path_planner, "path_planner", None), "resolved_model_path", None)
+        if mp:
+            m["model"] = os.path.basename(mp)
+
+        if self.task_model_path:
+            m["task_model"] = os.path.basename(self.task_model_path)
+
         for k in ("step", "goal_account", "task_completion", "task_completion_per_agent",
                   "n_active_mean", "busy_ratio", "deadhead_ratio",
                   "deadhead_steps_per_task", "agent_steps_per_task",

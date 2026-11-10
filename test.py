@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import yaml
+from itertools import product
 import gym
 import sys
 import numpy as np
@@ -9,6 +10,66 @@ from argparse import Namespace
 import argparse
 import torch
 from runner import Runner
+import os
+from src.all_policy.policy import model_stem_form_args, resolve_model_path, PATH_MODELS_DIR, TASK_MODELS_DIR
+
+
+def _model_file(config, models_dir):
+    """この条件で読むモデルのファイル名 (見出し用)。無ければ (not found) を付けて返す."""
+    if config.path_planner == "mat_dec" and getattr(config, "mat_model_agent_num", None):
+        model_n = config.mat_model_agent_num
+    else:
+        model_n = config.agent_num
+    stem = model_stem_form_args(config, model_n)
+    seed = int(getattr(config, "model_seed", 0) or 0)
+    try:
+        return os.path.basename(resolve_model_path(stem, seed, models_dir))
+    except (FileNotFoundError, ValueError):
+        return f"{stem}_seed{seed}.th (not found)"
+
+
+def print_condition_header(k, total, config, arrival, reassign_flag, model_tag, training):
+    """各条件の評価を始める前に、その条件を見やすく並べて出す."""
+    mode, _, p = arrival.partition(":")
+    if mode == "bernoulli":
+        arr = f"bernoulli (p={p})"
+    elif mode == "mmpp":
+        arr = (f"mmpp (p_high={config.task_p_high}, p_low={config.task_p_low}, "
+               f"switch_prob={config.task_switch_prob})")
+    elif mode == "fixed":
+        arr = "fixed (1 task / step)"
+    else:
+        arr = mode
+
+    if config.path_planner == "pbs":
+        path_model = "- (pbs: search-based, no model)"
+    else:
+        path_model = _model_file(config, PATH_MODELS_DIR)
+    if config.task_assigner != "ppo":
+        task_model = f"- ({config.task_assigner}: rule-based, no model)"
+    elif training:
+        task_model = "- (training from scratch)"
+    elif getattr(config, "ppo_task_checkpoint_path", ""):
+        task_model = f"{config.ppo_task_checkpoint_path} (ppo_task_checkpoint_path)"
+    else:
+        task_model = _model_file(config, TASK_MODELS_DIR)
+
+    line = "=" * 80
+    print(f"\n{line}", flush=True)
+    print(f"Condition {k}/{total}{'  [TRAINING]' if training else ''}")
+    print(f"  map / agents    : {config.map_name} / {config.agent_num}")
+    print(f"  path planner    : {config.path_planner}  (method_tag={getattr(config, 'method_tag', '') or '-'}, trained: {model_tag})")
+    print(f"  task assigner   : {config.task_assigner}")
+    print(f"  model seed      : {getattr(config, 'model_seed', 0)}")
+    print(f"  path model      : {path_model}")
+    print(f"  task model      : {task_model}")
+    print(f"  task arrival    : {arr}")
+    print(f"  reassign        : {'allowed' if reassign_flag else 'not allowed'} at execution")
+    print(f"  env             : safe={getattr(config, 'use_safe_env', True)}, "
+          f"dynamic_agents={getattr(config, 'use_dynamic_agents', False)}")
+    print(f"  episodes        : {config.test_num} x {config.time_limit} steps "
+          f"(eval_seed={config.eval_seed}, episode_seed_base={config.episode_seed_base})")
+    print(line, flush=True)
 
 
 if __name__ == "__main__":
@@ -37,7 +98,13 @@ if __name__ == "__main__":
                 if key == "model_seed":
                     config.model_seed = int(val)
                 elif key == "use_safe_env":
-                    config.use_safe_env = val.lower() in ("1", "true", "yes")
+                    config.use_safe_env = val.lower() in ("1", "true", "yes") 
+                elif key == "use_dynamic_agents":
+                    config.use_dynamic_agents = val.lower() in ("1", "true", "yes")
+                elif key == "arrival":
+                    config.eval_arrivals = val.split(",")
+                elif key == "allow_reassign":
+                    config.eval_allow_reassign = [v.lower() in ("1", "true", "yes") for v in val.split(",")]
                 else:
                     raise ValueError(f"Unknown key in argument: {key}")
             elif tok in ("base", "reassign"):
@@ -124,9 +191,27 @@ if __name__ == "__main__":
     training = bool(getattr(config, "train_task_assigner", False))
     if training and config.task_assigner != "ppo":
         raise ValueError("train_task_assigner is True but task_assigner is not 'ppo'.")
+    
+    if training:
+        arrivals = [config.task_arrival]
+        reassign_flags = [bool(config.allow_reassign_before_pickup)]
+    else:
+        arrivals = list(config.eval_arrivals)
+        reassign_flags = list(config.eval_allow_reassign)
+    for arrival in arrivals:
+        if arrival.startswith("bernoulli") and ":" not in arrival:
+            raise ValueError(f"'{arrival}' needs a probability, e.g. bernoulli:0.05")
 
-    for reassign_flag in (False,):
-        print(f"\n########## model={model_tag}  allow_reassign_before_pickup={reassign_flag} ##########", flush=True)
+    combos = list(product(arrivals, reassign_flags))
+    for k, (arrival, reassign_flag) in enumerate(combos, 1):
+        print_condition_header(k, len(combos), config, arrival, reassign_flag, model_tag, training)
+        mode, _, p = arrival.partition(":")
+        config.task_arrival = mode
+        if p:
+            config.task_density = float(p)
+        arrival_kwargs = {k: getattr(config, k) for k in 
+                          ("task_arrival", "task_density", "task_p_high", "task_p_low", "task_switch_prob")
+                          if hasattr(config, k)}
         config.allow_reassign_before_pickup = reassign_flag
         np.random.seed(config.seed if training else config.eval_seed)
         torch.manual_seed(config.seed)
@@ -141,6 +226,7 @@ if __name__ == "__main__":
             allow_reassign_before_pickup=reassign_flag,
             **lare_kwargs,
             **dynamic_agent_kwargs,
+            **arrival_kwargs
         )
         """
         with open("./config/algo/" + config.algo + ".yaml", 'r') as file:

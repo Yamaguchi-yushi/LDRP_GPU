@@ -31,12 +31,16 @@ DEFAULT_METRICS = ("task_completion", "time_sec")
 
 COND_HEAD_RE = re.compile(r"^map_(?P<map>.+?)/(?P<n>\d+)agent/(?P<rest>.+)$")
 TRAIN_RE = re.compile(r"^train(\d+)$")
+# 評価時のタスク到着 (runner.py _condition_id)。fixed は目印なし
+ARRIVAL_RE = re.compile(r"^(bern[0-9.e-]+|mmpp)$")
 
 
 def parse_condition(cond, planners=DEFAULT_PLANNERS):
     """runner.py の _condition_id() を分解する.
 
-        {map}/{N}agent/{env}_{planner}[_{tag}]_{reassign}_{assigner}[_train{N}][_envreassign]
+        {map}/{N}agent/{env}_{planner}[_{tag}]_{reassign}_{assigner}[_train{N}][_dyn][_{arrival}][_envreassign]
+
+    arrival は bern{p} / mmpp。無ければ fixed (毎ステップ 1 件 = 従来の評価)。
 
     古い summary.csv には reassign / tag が無い ({env}_{planner}_{assigner}) ので、
     "base"/"reassign" が見つかるかどうかで新旧を判定する。
@@ -46,7 +50,8 @@ def parse_condition(cond, planners=DEFAULT_PLANNERS):
         return None
     out = {"condition": cond, "map": "map_" + m.group("map"),
            "n": int(m.group("n")), "method_tag": "", "reassign": "",
-           "allocator": "", "train_n": None, "env_reassign": False}
+           "allocator": "", "train_n": None, "env_reassign": False,
+           "dynamic": False, "arrival": "fixed"}
     rest = m.group("rest")
 
     for env in ("unsafe", "safe"):
@@ -69,6 +74,11 @@ def parse_condition(cond, planners=DEFAULT_PLANNERS):
     tokens = [t for t in rest.split("_") if t]
     if tokens and tokens[-1] == "envreassign":
         out["env_reassign"] = True
+        tokens.pop()
+    if tokens and ARRIVAL_RE.match(tokens[-1]):
+        out["arrival"] = tokens.pop()
+    if tokens and tokens[-1] == "dyn":
+        out["dynamic"] = True
         tokens.pop()
     if tokens:
         tm = TRAIN_RE.match(tokens[-1])

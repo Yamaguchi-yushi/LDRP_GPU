@@ -17,9 +17,9 @@ map_name = [
 agent_num = [
     # 3,
     # 4,
-    # 5,
+     5,
     # 6,
-    7,
+    #7,
     # 8,
     # 9,
     10,
@@ -45,6 +45,7 @@ path_planner = [
 task_assigner = [
     "fifo",
     "tp",
+    "ppo"
 ]
 
 method_tag = [
@@ -54,9 +55,10 @@ method_tag = [
     # "dbct",
 ]
 
+# 学習時にタスク再割り当てを使用したモデルを使用するかどうか
 reassign_before_pickup = [
     "base",
-    #"reassign",
+    "reassign",
 ]
 
 mat_model_agent_num = [     # mat_decのモデルを学習した際のエージェント数を指定する．
@@ -72,7 +74,22 @@ use_safe_env = [
     #"False",
 ]
 
-model_seed = "auto"
+task_arrival = [
+    #"fixed",
+    "bernoulli:0.01",
+    "bernoulli:0.02",
+    "bernoulli:0.05",
+    "bernoulli:0.1",
+    "mmpp",
+]
+
+# 方策評価時にタスク再割り当てを使用するかどうか
+allow_reassign = [
+    "True",
+    "False",
+]
+
+model_seed = 0  #"auto" 
 
 measure_runtime = True
 maxpurocesses = 1 if measure_runtime else 5
@@ -89,15 +106,22 @@ for i, j, k, l, m, n, o, u in product(map_name, agent_num, path_planner, task_as
     if key in seen:
         continue
     seen.add(key)
-    stem = model_stem(i, model_n, k, m, n)
-    seeds = list_model_seeds(stem) if model_seed == "auto" else [int(model_seed)]
-    if not seeds:
-        skipped.append(stem)
-        continue
-    for s in seeds:
-        command.append([sys.executable, "-u", "test.py",
-                        str(i), str(j), str(k), str(l), str(m), str(n), str(o),
-                        f"model_seed={s}", f"use_safe_env={u}"])
+    found = False
+    for dyn in (False, True):
+        stem = model_stem(i, model_n, k, m, n, task_assigner=l, dynamic=dyn)
+        seeds = list_model_seeds(stem)
+        if model_seed != "auto":
+            seeds = [s for s in seeds if s == int(model_seed)]
+        for s in seeds:
+            command.append([sys.executable, "-u", "test.py",
+                            str(i), str(j), str(k), str(l), str(m), str(n), str(o),
+                            f"model_seed={s}", f"use_safe_env={u}", f"use_dynamic_agents={dyn}", 
+                            f"arrival={','.join(task_arrival)}",
+                            f"allow_reassign={','.join(allow_reassign)}"])
+        if seeds:
+            found = True
+    if not found:
+        skipped.append(model_stem(i, model_n, k, m, n, task_assigner=l))
 for stem in sorted(set(skipped)):
     print(f"Skipped: {stem} (no model found)")
 print(f"Total commands to run: {len(command)}")
@@ -124,7 +148,8 @@ for cmd in command:
     reassign_suffix = f"_{cmd[8]}" if len(cmd) > 8 and cmd[8] else ""
     train_n = cmd[9] if len(cmd) > 9 and cmd[9] else cmd[4]
     seed_suffix = f"_seed{named['model_seed']}" if "model_seed" in named else ""
-    log_name = f"{cmd[3]}_{cmd[4]}_{cmd[5]}_{cmd[6]}{method_suffix}{reassign_suffix}_{train_n}{seed_suffix}.txt"
+    dyn_suffix = "_dyn" if named.get("use_dynamic_agents", "False").lower() in ("1", "true", "yes") else ""
+    log_name = f"{cmd[3]}_{cmd[4]}_{cmd[5]}_{cmd[6]}{method_suffix}{reassign_suffix}_{train_n}{dyn_suffix}{seed_suffix}.txt"
     with open(os.path.join(log_dir, log_name), "w") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
     running_processes.append((proc ,cmd))

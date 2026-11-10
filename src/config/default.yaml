@@ -43,7 +43,24 @@ eval_seed: 0
 # True にするとエピソード毎に bernoulli(p ランダム) / mmpp を引き直す。
 # 1 つの方策を全シナリオで評価するために必要。評価時は False。
 randomize_task_arrival: False
-mmpp_ratio: 0.5          # MMPP を引く確率。残りが bernoulli
+mmpp_ratio: 0.5          # MMPP を引く確率。残りが bernoulli (MMPP 内部の値は固定)
+
+eval_arrivals:
+  - "bernoulli:0.02"
+  - "bernoulli:0.05"
+  - "bernoulli:0.10"
+  - "mmpp"
+eval_allow_reassign:
+  - False
+  - True
+task_arrival: "fixed"
+task_density: 0.3
+task_p_high: 0.10
+task_p_low: 0.01
+task_switch_prob: 0.01
+
+# 全マップ共通。マップで 1 タスクの所要ステップが 3.2 倍違うが、この範囲なら
+# どのマップも疎〜密を経験する (map_8x5: 0.32〜3.2 件/サイクル、aoba00: 1.0〜10.3)。
 rand_p_min: 0.01         # bernoulli p の下限
 rand_p_max: 0.10         # bernoulli p の上限
 

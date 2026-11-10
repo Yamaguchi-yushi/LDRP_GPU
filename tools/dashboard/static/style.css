@@ -118,3 +118,115 @@ table.cond td{vertical-align:middle}
 /* 表の中の補助表示 (収集経路など) */
 .sm{font-size:10px;opacity:.75}
 #t-mach td,#t-mach th{white-space:nowrap}
+
+/* 要確認リストの OK ボタン。見出しの「すべて OK」と行の OK で共用 */
+.ack{font-size:11px;padding:2px 10px;margin-left:8px;cursor:pointer;
+     border:1px solid var(--line);border-radius:4px;background:transparent;
+     color:inherit}
+.ack:hover:not(:disabled){border-color:var(--ok);color:var(--ok)}
+.ack:disabled{opacity:.4;cursor:default}
+#t-att td{white-space:nowrap;vertical-align:top}
+/* 条件セル: 主要部 (台数/map/algo) を強め、付帯条件は薄いラベル付きで並べる */
+.attmain{font-weight:600}
+#t-att .mut b,#t-att .wrn b{font-weight:normal;opacity:.65;margin-right:2px}
+#t-att td span+span{margin-left:8px}
+
+/* seed ごとのコメント欄。表の行を太らせないよう枠は薄く、幅は控えめに */
+/* 空欄でも「ここに書ける」と分かるよう、薄い破線の枠を常に出す。
+   (枠を透明にすると、placeholder を隠したときに欄ごと見えなくなる) */
+.note{width:200px;max-width:26vw;font:inherit;font-size:11px;padding:2px 5px;
+      color:inherit;background:transparent;border:1px dashed var(--line);
+      border-radius:4px}
+.note:hover{border-style:solid;border-color:var(--mut)}
+.note:focus{border-style:solid;border-color:var(--run);outline:none;background:var(--bg)}
+/* 空欄が何百行も並ぶので、普段は placeholder を出さず行にカーソルを乗せたときだけ出す */
+.note::placeholder{color:var(--mut);opacity:0}
+tr:hover .note::placeholder,.note:focus::placeholder{opacity:.55}
+.note.saved{border-color:var(--ok)}
+
+/* conditions 表の列を全表で揃える (列幅は app.js の COND_COLS)。
+   固定レイアウトにすると中身の長さで列幅が変わらなくなる代わりに、
+   はみ出した分は隣の列に食い込むので、状態以外は省略記号で切る */
+table.cond{table-layout:fixed;min-width:1020px}
+table.cond td{overflow:hidden;text-overflow:ellipsis}
+/* 状態は唯一の可変幅の列。長いときは切らずに折り返す */
+table.cond td.st{white-space:normal;overflow:visible}
+/* 差分の展開行は中に表を持つので切らない */
+table.cond tr.diffrow>td{white-space:normal;overflow:visible}
+/* コメント欄は列幅いっぱいに広げる (列幅側で固定しているので) */
+table.cond .note{width:100%;max-width:none}
+
+/* 「他と違う」: 条件内の params✗ (数から外す) と区別するため破線にする */
+button.gdiffbtn{border-style:dashed;color:var(--warn)}
+tr.gdiffrow table.pdiff td.wrn{font-weight:600}
+
+/* 手動除外した seed 行。本数には数えないが、どれを外したかは見たいので残す */
+tr.excl{opacity:.55}
+tr.excl:hover{opacity:1}
+tr.excl>td:first-child,tr.excl .exltxt{text-decoration:line-through}
+.exl{color:var(--mut);border:1px solid var(--line);border-radius:3px;
+     padding:0 4px;font-size:10px}
+/* 「除外」ボタンは普段は目立たせず、行にカーソルを乗せたときだけ出す
+   (238 行に常時並ぶと状態の列が読みにくくなる) */
+.exlbtn{visibility:hidden}
+tr:hover .exlbtn,.exlbtn:focus{visibility:visible}
+
+/* 評価タブの比較表。比較の選択欄のチェックボックスと、比べる列 (値の列) を見分けやすくする */
+#e-cmp label{margin-right:10px;color:var(--fg);cursor:pointer}
+#e-tbl th.cmpcol{color:var(--run)}
+#e-tbl td.cmpcell{text-align:right;font-variant-numeric:tabular-nums}
+#e-tbl td.best{font-weight:700}
+
+/* パラメータの警告 (一覧)。キーは 1 行に 1 つ */
+#t-warn td{vertical-align:top}
+#t-warn td:not(.wkeys){white-space:nowrap}
+#t-warn .mut b,#t-warn .wkeys b{font-weight:normal;opacity:.75;margin-right:4px}
+#t-warn td span+span{margin-left:8px}
+#t-warn .wkeys div+div{margin-top:2px}
+
+/* 稼働状況のメーター。.pb (進捗バー) を流用し、色だけ使用率で変える */
+#t-load td{white-space:nowrap}
+#t-load .pb i.c-ok{background:var(--ok)}
+#t-load .pb i.wrn{background:var(--warn)}
+#t-load .pb i.err{background:var(--bad)}
+
+/* 接続できず確認できない状態。異常 (赤) とは分け、灰色の破線で示す */
+.unk{display:inline-block;font-size:11px;padding:0 6px;border:1px dashed var(--mut);
+     border-radius:4px;color:var(--mut)}
+#t-load tr.unkrow td:not(:nth-child(2)){opacity:.45}
+#t-run tr.unkrow td{opacity:.6}
+#t-run tr.unkrow .unk{opacity:1}
+.grouphead{margin:18px 0 2px;padding:3px 8px;font-size:13px;font-weight:600;
+  border-left:4px solid var(--accent, #4a7bd0);background:var(--sub, rgba(127,127,127,.08))}
+/* 学習曲線タブ */
+.cchart{max-width:900px}
+.cleg{display:inline-flex;align-items:center;gap:4px;margin:0 12px 4px 0;cursor:pointer;font-size:12px}
+.cleg.off{opacity:.35;text-decoration:line-through}
+table.ctbl td,table.ctbl th{padding:2px 8px}
+table.ctbl td.cbest{font-weight:700}
+/* 学習曲線の章: 図 | 凡例、その下に評価表 */
+.cpair{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
+.cpair>.cchart{flex:1 1 560px;min-width:0}
+/* 図の横の凡例: 1 項目 1 行。行数 (app.js の LEG_ROWS) を超えたら列を右に足す */
+.vlegend{flex:0 0 auto;display:grid;grid-auto-flow:column;column-gap:14px;align-content:start}
+.vlegend .cleg{white-space:nowrap;margin:0 0 4px 0}
+/* 学習 | 評価 の 2 段見出しと、評価の列の前の区切り線 */
+table.ctbl th.grp{text-align:center;border-bottom:1px solid var(--line)}
+table.ctbl tr>.egap.egap{border-left:2px solid var(--mut)}
+table.ctbl tr>.agap.agap{border-left:1px solid var(--mut)}   /* 評価の到着率どうしの区切り (下に reassign off / on) */   /* 学習 | 評価、評価の指標どうしの区切り */
+.cdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle}
+table.etbl td{white-space:nowrap}
+#c-evopts{display:inline-flex;gap:10px;flex-wrap:wrap;align-items:center}
+#c-evopts[hidden]{display:none}
+table.ctbl .cst{text-align:center;padding:2px 4px;white-space:nowrap}
+table.ctbl{width:auto}   /* 中身の幅に詰める (全幅に広げると条件の列が伸びて間が空く) */
+/* 列ごとの細い縦線 (かたまりの境目は .egap の太い線) */
+table.ctbl td,table.ctbl th{border-left:1px solid var(--line)}
+table.ctbl tr>:first-child{border-left:none}
+
+/* 自動実行の依頼 */
+button.arbtn{font-size:11px;padding:0 6px;margin-left:6px;opacity:.7}
+button.arbtn:hover{opacity:1}
+tr.arrow td{background:var(--card)}
+.arform input.ar-n{width:3.5em}
+.arform > *{margin-right:6px}

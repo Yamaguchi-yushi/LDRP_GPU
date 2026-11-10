@@ -38,16 +38,11 @@ class Logger:
             self.tb_logger(key, value, t)
 
         if self.use_sacred and to_sacred:
-            # info.json への二重記録は止めた。同じ値は log_scalar で metrics.json に残る。
-            # 長い学習で info が巨大になり、heartbeat の書き出し中に Segmentation fault で
-            # 落ちたため (2026-10-02 GPU1 mappo aoba00 10 台 run 28/29)。戻さないこと
-            # if key in self.sacred_info:
-            #     self.sacred_info["{}_T".format(key)].append(t)
-            #     self.sacred_info[key].append(value)
-            # else:
-            #     self.sacred_info["{}_T".format(key)] = [t]
-            #     self.sacred_info[key] = [value]
-
+            # run.info (= info.json) には書かない。sacred の heartbeat スレッドが
+            # run.info を丸ごとシリアライズしている最中に、ここ (メインスレッド) が
+            # 同じ辞書・リストを書き換えると segfault する (2026-09-30 / 10-02 / 10-03 に GPU1 で確認:
+            # いずれも info.json 書き出し中に落ち、0 byte で残った)。同じ値は log_scalar で
+            # metrics.json に入るので情報は失われない
             self._run_obj.log_scalar(key, value, t)
 
     def print_recent_stats(self):

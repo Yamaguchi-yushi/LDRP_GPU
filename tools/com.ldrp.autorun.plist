@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  tools/autorun.py tick を 15 分おきに動かす (依頼された学習・評価を空いているマシンに投入する)。
+  登録:   cp tools/com.ldrp.autorun.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.ldrp.autorun.plist
+  解除:   launchctl unload ~/Library/LaunchAgents/com.ldrp.autorun.plist
+  ログ:   tools/.autorun/tick.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ldrp.autorun</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/anaconda3/envs/ldrp/bin/python</string>
+    <string>/Users/yamaguchiyuushi/LDRP/tools/autorun.py</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yamaguchiyuushi/LDRP</string>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/yamaguchiyuushi/LDRP/tools/.autorun/tick.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yamaguchiyuushi/LDRP/tools/.autorun/tick.log</string>
+</dict>
+</plist>

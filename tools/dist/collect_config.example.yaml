@@ -1,0 +1,88 @@
+# collect_runs.py / ダッシュボードの設定の見本 (研究室配布版)
+#
+#   cp tools/collect_config.example.yaml tools/collect_config.yaml
+#
+# としてから自分の環境に合わせて書き換える。
+#
+# ★ tools/collect_config.yaml は .gitignore 済み。**絶対に commit しない。**
+#    接続先 (IP アドレス・ユーザー名) が入るため。リポジトリは他の人からも見える。
+#    接続先はこのファイルにも直接書かず、~/.ssh/config に Host 名で登録して、
+#    ここにはその Host 名だけを書くのが安全 (下の hosts: を参照)。
+
+# 評価用モデルのファイル名の形式。
+#   template: src/all_policy/models/safe/{map}_{N}_{algo}.th  (このリポジトリの評価が読む形)
+#             seed が複数あるときは 0 番をこの名前、1 番以降を _seed1, _seed2, ... にする
+eval_naming: template
+
+# RUNNING なのに heartbeat がこの分数だけ止まっていたら「停止 (stalled)」とみなす。
+# Ctrl-Z の一時停止はプロセスの状態から別に見分けるので、ここには数えない
+stale_minutes: 90
+
+# t_max がこの値未満の run は表に出さない (動作確認用の短い run を除くため)。
+# 走っている間はこの値に関係なく表示する。0 で全件
+min_steps: 1000000
+
+# cout.txt の末尾から読むバイト数 (巨大なログでもここしか読まない)
+tail_bytes: 65536
+
+# SSH で届かないマシンから「共有フォルダ経由」で集めるときの置き場。
+# iCloud Drive / Dropbox / Google Drive / NFS など、両方のマシンから見えるフォルダなら何でもよい。
+# 相手のマシンでは、同じフォルダを指して定期的に --export する (README の「SSH が通らないマシン」)。
+# 使わなければ消してよい
+drop_root: ~/Library/Mobile Documents/com~apple~CloudDocs/LDRP_runs
+
+hosts:
+  # --- 集約するマシン (このダッシュボードを開くマシン) --------------------
+  - label: mac
+    ssh: local                     # local = ssh を使わずこのマシンのフォルダを読む
+    repos:
+      - ~/LDRP
+
+  # --- SSH で届くマシン (研究室の GPU など) -------------------------------
+  # ssh: には ~/.ssh/config に登録した **Host 名だけ**を書く (IP やユーザー名を書かない)。
+  #   ~/.ssh/config の例:
+  #     Host lab-gpu1
+  #       HostName <GPU のアドレス>
+  #       User <自分のユーザー名>
+  # 鍵認証でパスフレーズ無しに入れる状態にしておく (自動収集が止まるため)
+  - label: gpu1
+    ssh: lab-gpu1
+    python: python3                # リモートの python。標準ライブラリだけで動く
+    # connect_timeout: 15          # 接続の待ち時間 (既定 8 秒)。混んでいる GPU は長めに
+    repos:
+      - ~/LDRP
+
+  # --- SSH で届かないマシン (共有フォルダ経由) ---------------------------
+  # 相手のマシンで `--export <drop_root> --machine laptop` を回しておく
+  # - label: laptop
+  #   drop: true                   # true = 上の drop_root/laptop/ を読む
+  #   export_interval_min: 15      # 相手の書き出し間隔。「情報が古い」の判定に使う
+
+# repo ルートからの相対で sacred の出力を探す場所 (既定はこの 2 つ。書かなくてよい)
+# sacred_subdirs:
+#   - src/epymarl/results/sacred
+#   - src/epymarl/tmp_results/sacred
+
+# 条件ごとに想定している t_max。run の t_max がずれていたら表で知らせる (任意)。
+# 書かなければ照合しない
+# expected_t_max:
+#   map_8x5:
+#     5agent: 20.0M
+#     7agent: 30.0M
+
+# 実験計画の表 (tools/plans/*.md)。既定は tools/plans/ の中の .md すべて
+# plans: tools/plans/*.md
+
+# 学習曲線の書き出し (--export-curves)。make_graph で作図するときに使う (任意)
+curves:
+  max_points: 0                    # 1 指標あたりの点数の上限。0 で間引かない
+  metrics:
+    - {name: test_return_mean,    y_label: Return,          kind: value, better: up}
+    - {name: test_goal_mean,      y_label: Goals,           kind: count, better: up}
+    - {name: test_collision_mean, y_label: Collision Count, kind: count, better: down}
+  # 条件 -> 手法フォルダ。dir がフォルダ名と一致している必要がある。書かなければ自動で決まる
+  # methods:
+  #   - {dir: QMIX, label: QMIX, color: "#03AF7A", order: 0, match: {algo: qmix}}
+  #   - {dir: IQL,  label: IQL,  color: "#005AFF", order: 1, match: {algo: iql}}
+  grouping: [map, agents]
+  x_label: Training steps

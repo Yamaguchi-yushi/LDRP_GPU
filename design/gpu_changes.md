@@ -272,7 +272,7 @@ PC 版コミット `64aaa84` / `8d3e834` を取り込んだ際、**意図的に 
 
 ### `tools/collect_runs.py`: `t_env` の第 3 フォールバック追加 (GPU 版のみ)
 
-**症状**: GPU 機では `cout.txt` が **0 byte** (`train.py` が stdout をシェルでリダイレクトしているため)。
+**症状**: GPU 機では `cout.txt` が **0 byte**。原因は `src/epymarl/src/main.py` の `SETTINGS['CAPTURE_MODE'] = "no"` (sacred の `no_tee()` は誰も書き込まない `StringIO` を返すため、`--beat-interval` に関係なく常に空)。※ 当初「stdout のシェルリダイレクト」が原因と記録していたが誤り (2026-09-25 訂正。PC 由来の `tools/README.md` / `design/run_collector.md` / `collect_runs.py` のコメントも同じ誤解のまま)
 保険の `metrics.json` 末尾 256KB 読みも、このファイルが **pretty-print で 29MB** あるため
 末尾が最後の `values` 配列 (`0.0` の羅列) だけで埋まり、`steps` の整数に届かない。
 結果 `t_env` が `?` になり、進捗が出ない。
@@ -323,6 +323,89 @@ epymarl は `{local_results_path}/models/{unique_token}/{t_env}` に保存する
 
 - `f24d98d new model`: 同一バイナリが GPU 版に `239b4ac` で既にコミット済みのため空コミットになり skip
 - `df66cf5 add reward` (ステーション待機中の移動ペナルティ): 報酬まわりは取り込まない方針のため未適用のまま
+
+---
+
+## 2026-10-03 `logging.py`: sacred の `run.info` への二重記録を停止 (GPU 版のみ, `2d3af49`)
+
+**衝突時は GPU 側を採用** (PC 版は旧実装のまま)。
+
+| ファイル | PC 版 | GPU 版 |
+|---|---|---|
+| `src/epymarl/src/utils/logging.py` `log_stat()` | `self.sacred_info[key].append(value)` 等で `run.info` にも記録 | `run.info` への記録をコメントアウト。`log_scalar` (→ `metrics.json`) のみ |
+
+**理由**: sacred の heartbeat スレッドが `run.info` を丸ごと JSON 化して `info.json` に書く最中に、
+メインスレッドの `log_stat()` が同じ辞書・リストを書き換え、segfault していた (同期なし)。
+`info.json` が大きい aoba00 / 10agent でほぼ毎回発生。
+
+| run | 条件 | 症状 |
+|---|---|---|
+| `449919326` (9/30) | mat / aoba00 / 10agent / beat=60 | 最終 heartbeat 09:12:14.465 と segfault 09:12:14 が一致、`info.json` 0 KB |
+| `145137824` (10/2) | mappo / aoba00 / 10agent / beat=60 | 同上 (21:42:15 / 21:42:16) |
+| `121013450` (10/3) | mappo / aoba00 / 10agent / beat=60 | 同上 (00:45:32 / 00:45:33)。落ちた場所が `_json.cpython-39...so` の中 |
+
+`info.json` はどこからも読まれておらず、中身は `metrics.json` と同じデータの重複なので失う情報は無い。
+これにより `train.py` の `--beat-interval=60` (3600 → 60) が安全になる。3600 は過去にこのクラッシュの頻度を
+下げるために入れていた値 (理由の記録が無かったため、`train.py` にコメントで残した)。
+
+**未解決**: QMIX (CPU 実行) の segfault 群 (8/11〜9/2) と 9/29 の `libtorch_python.so` 内の segfault は
+heartbeat と時刻が一致せず、原因不明。
+
+---
+
+## 2026-10-28 PC コミット取り込み (`808b510` 〜 `b15ec22`, 18 件)
+
+`44e5d6d` を共通の祖先として、各ファイルに PC 側の差分だけを 3-way マージ (`git merge-file`) で適用した
+(cherry-pick ではなく、ファイル単位でまとめて取り込み)。
+
+### 適用ファイル (自動マージ / PC 版そのまま)
+
+`.gitignore`, `aggregate.py`, `runner.py`, `src/all_policy/policy.py`, `src/task_assign/task_policy/ppo.py`,
+`tools/` 一式 (新規: `tools/dist/`, `export_tools.py`, `lare_factor_check.py`, `lare_factor_smoke.py`,
+`lare_models.py`, `md_toc.py`, `setup_launchd.py`),
+新規モデル `FT_QMIX_PATH_Safe_map_8x5_5agents_10.0M_Safe_map_aoba00_5agents_10.0M_checkpoint.pth`
+
+### 衝突解決メモ
+
+| ファイル | 衝突内容 | 採用 |
+|---|---|---|
+| `run.py` | `agent_num` の `10,` の前の空白 | GPU 版 (条件の選択値は GPU 版を維持) |
+| `src/config/default.yaml` | PC が `eval_arrivals` / `eval_allow_reassign` / 到着分布の既定値を追加 | PC 側。重複キーなしを確認 |
+| `src/epymarl/src/utils/logging.py` | **PC 側も GPU の `info.json` 停止修正を取り込んだ** (コメントの文面だけ違う) | PC 側。TensorBoard の書き方 (`SummaryWriter`) は GPU 版のまま |
+| `test.py` | PC が評価ループを「到着分布 × reassign の全組み合わせ」に拡張、`use_dynamic_agents=` / `arrival=` / `allow_reassign=` 引数を追加 | PC 側 (残る差は空白とコメントのみ) |
+| `CLAUDE.md` | PC 側で削除 | GPU 版は残す (git 追跡を継続) |
+
+### 取り込みで挙動が変わる点
+
+- **評価 (`test.py` / `run.py`)**: 既定で `eval_arrivals` 4 種 × `eval_allow_reassign` 2 種 = **8 条件**を順に評価する
+  (従来は 1 条件)。評価時間が約 8 倍になる。絞るときは `arrival=` / `allow_reassign=` 引数か default.yaml で指定
+- **評価モデルの名前規則 (`policy.py` の `model_stem`)**: `task_assigner=ppo` なら `_ppo`、動的なら `_dyn` が
+  `reassign_tag` の前に入る。PPO タスク割当器のモデルは `src/task_assign/models/safe/` から自動で読む
+  (GPU 機には未作成)
+- GPU 固有の差分 (`collect_runs.py` の t_env 第 3 フォールバック、`runner.py` / `ppo.py` / `default.yaml` の
+  既存差分) は保持されていることを確認済み
+
+---
+
+## 2026-11-10 PC コミット取り込み (`a4930df` 〜 `16e4a0b`, 6 件)
+
+前回 (2026-10-28) と同じく、`b15ec22` を祖先として PC 側の差分だけをファイル単位で取り込んだ (未コミットの前回取り込み分の上に適用)。
+取り込み前の作業ツリーは `git stash` に `backup before PC import a4930df..16e4a0b` として保存 (作業ツリーは変更せず `stash store` のみ)。
+
+### 適用ファイル
+
+| 種別 | ファイル | 方法 |
+|---|---|---|
+| 新規 | `tools/autorun.py`, `tools/autorun_train.py`, `tools/com.ldrp.autorun.plist`, `tools/eval_lare_factor.py` | PC 版そのまま |
+| 新規モデル | `src/lare/path/models/QMIX_PATH_Safe_map_8x5_5agents_10.0M_checkpoint_waitedit.pth`, `..._map_8x5_7agents_10.0M_checkpoint.pth`, `..._map_aoba00_5agents_10.0M_checkpoint_waitedit.pth` | PC 版そのまま (`..._map_aoba00_5agents_10.0M_checkpoint.pth` は `3ab476a` で同一内容を追加済み) |
+| GPU 側が祖先と同一 | `tools/dashboard/{app.py, static/app.js, static/style.css, templates/index.html}` | PC 版で置換 |
+| 3-way マージ (衝突なし) | `.gitignore`, `tools/collect_runs.py`, `tools/lare_factor_smoke.py`, `tools/lare_models.py` | `git merge-file` |
+
+### GPU 固有差分の保持確認
+
+- `tools/collect_runs.py`: `t_env` 第 3 フォールバック (`t_source = "model"`) は残っている (PC 版との差はこの 8 行のみ)
+- `.gitignore`: PC 版にある `CLAUDE.md` 行は入れていない (GPU 版は CLAUDE.md を git 追跡)
+- `src/` のコア実装 (env / epymarl / LaRe) は今回の 6 件で変更なし
 
 ---
 

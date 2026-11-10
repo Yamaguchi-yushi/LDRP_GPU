@@ -7,13 +7,24 @@ Notion で管理している表を**そのまま貼り付けられる**形式に
     ## 5agent   80M                     <- 見出し: 台数と t_max
     | seed | machine | setting | algorithm | task arrival | task assign | reassign |
     | --- | --- | --- | --- | --- | --- | --- |
-    |  |  | safe | MAPPO | bernoulli, mmpp | TP |  |     <- 条件行 (seed が空)
+    |  |  | safe | MAPPO | bernoulli, mmpp p=0.01-0.10 | TP |  |     <- 条件行 (seed が空)
     | 337863318 | GPU1 |  |  |  |  |  |                  <- seed 行
     | 343618845 | GPU1 |  |  |  |  |  |
 
 マップは見出しに書いてもよいし (`## 5agent map_aoba00  80M`)、
 `<!-- map: map_aoba00 -->` で以降の既定を決めてもよい。
 **書かなければ「どのマップでも一致」**として扱う (推測しない)。
+
+`# LaRe モデル学習` のような **# 1 つの見出し**は「グループ」の区切り。
+LaRe のモデルを作る学習と方策学習のように、性質の違う学習を 1 枚に書くときに使う。
+ダッシュボードはグループを書いた順に並べ、その中をマップ -> 台数 -> t_max で並べる。
+グループの後はマップ名を書き直す (前のグループのマップは引き継がない)。
+グループの直後に `<!-- collect: lare -->` を置くと、そのグループの条件は
+**LaRe モデル (.pth) があるかどうか**で判定する (方策モデル・seed は見ない)。
+表の先頭列は seed / machine の代わりに `LaRe model` 1 列 (書いた時点の有無のメモ)。
+
+setting の末尾の ✅ は目印 (例: 使う LaRe モデルが揃っている)。照合では外し、
+ダッシュボードの表示にだけ付ける。
 """
 
 import glob
@@ -27,7 +38,14 @@ HEAD_RE = re.compile(
     r"^\s{0,3}#{1,6}\s+(?P<n>\d+)\s*agent\s*(?P<map>[A-Za-z0-9_]*?)\s*"
     r"(?P<t>[\d.]+)\s*M\s*(?:[（(][^)）]*[)）]\s*)?$", re.I)
 MAP_HINT_RE = re.compile(r"<!--\s*map:\s*([A-Za-z0-9_]+)\s*-->", re.I)
+# ファイル単位の既定値。`<!-- seeds: 1 -->` = 1 条件あたりの枠数 (既定 DEFAULT_SEEDS)、
+# `<!-- reassign: F -->` = reassign 列が空の条件をこの値として扱う (空のままだと「問わない」)
+SEEDS_HINT_RE = re.compile(r"<!--\s*seeds:\s*(\d+)\s*-->", re.I)
+REASSIGN_HINT_RE = re.compile(r"<!--\s*reassign:\s*([A-Za-z]+)\s*-->", re.I)
 # 章の前に置かれた裸のマップ名 (メモでは "aoba00" / "8x5" とだけ書かれている)
+# グループ見出し "# LaRe モデル学習" (# は 1 つだけ。## 以降は章の見出し)
+GROUP_RE = re.compile(r"^\s{0,3}#(?!#)\s+(\S.*?)\s*$")
+COLLECT_HINT_RE = re.compile(r"<!--\s*collect:\s*([A-Za-z_]+)\s*-->", re.I)
 BARE_MAP_RE = re.compile(r"^\s*(?:map_)?([A-Za-z0-9][A-Za-z0-9_]{0,19})\s*$")
 ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*")
 
@@ -111,8 +129,13 @@ def parse_plan(path):
     conds = []
     section = None            # (agents, map, t_max_m)
     default_map = None
+    want_seeds = DEFAULT_SEEDS
+    default_reassign = None
     cols = None
     cur = None
+    group = None              # "# ..." のグループ名 (無ければ None)
+    group_order = 0           # グループを書いた順番 (並べ替えに使う)
+    collect = None            # "lare" = LaRe モデルの有無で判定するグループ
 
     with open(path) as f:
         for lineno, raw in enumerate(f, 1):
@@ -121,6 +144,27 @@ def parse_plan(path):
             hint = MAP_HINT_RE.search(line)
             if hint:
                 default_map = norm_map(hint.group(1))
+                continue
+            hint = SEEDS_HINT_RE.search(line)
+            if hint:
+                want_seeds = max(1, int(hint.group(1)))
+                continue
+            hint = COLLECT_HINT_RE.search(line)
+            if hint:
+                collect = hint.group(1).lower()
+                continue
+            hint = REASSIGN_HINT_RE.search(line)
+            if hint:
+                default_reassign = norm_reassign(hint.group(1))
+                continue
+
+            g = GROUP_RE.match(line)
+            if g and not HEAD_RE.match(line):
+                group = g.group(1)
+                group_order += 1
+                collect = None
+                default_map = None
+                section, cols, cur = None, None, None
                 continue
 
             h = HEAD_RE.match(line)
@@ -145,7 +189,8 @@ def parse_plan(path):
             if SEP_RE.match(line.strip()):
                 continue
             if cols is None:
-                if any(c.lower() == "seed" for c in cells):
+                # LaRe モデル学習の表は seed 列の代わりに "LaRe model" 列 (中身はメモ。判定には使わない)
+                if any(c.lower() in ("seed", "lare model") for c in cells):
                     cols = [c.lower() for c in cells]
                 continue
 
@@ -164,6 +209,8 @@ def parse_plan(path):
                     [c for c in cols if c]) - 1 and len(cells) == len(cols):
                 reas_raw = cells[-1] if not cols[-1] else ""
 
+            mark = "✅" in setting
+            setting = setting.replace("✅", "").strip()
             if not seed and not machine and (setting or algo):
                 cur = {"agents": section[0], "map": section[1],
                        "t_max_m": section[2],
@@ -171,8 +218,13 @@ def parse_plan(path):
                        "algo": norm_algo(algo),
                        "task_arrival": get("task arrival") or None,
                        "task_assign": norm_assign(get("task assign")),
-                       "reassign": norm_reassign(reas_raw),
+                       "reassign": (norm_reassign(reas_raw)
+                                    if norm_reassign(reas_raw) is not None
+                                    else default_reassign),
                        "dynamic": norm_flag(get("dynamic")),
+                       "group": group, "group_order": group_order,
+                       "collect": collect, "mark": mark,
+                       "lare_note": get("lare model") or None,
                        "seeds": [], "source_line": lineno}
                 conds.append(cur)
             elif cur is not None:
@@ -185,7 +237,7 @@ def parse_plan(path):
 
     for c in conds:
         # 表の行数が枠数。ただし 5 seed 運用なので、少なければ 5 まで埋める
-        c["want"] = max(len(c["seeds"]), DEFAULT_SEEDS)
+        c["want"] = max(len(c["seeds"]), want_seeds)
         while len(c["seeds"]) < c["want"]:
             c["seeds"].append({"seed": None, "machine": None, "reassign": None})
     return conds
@@ -268,6 +320,10 @@ def run_key(d):
 
 def matches(cond, d):
     """計画の 1 条件が run d に一致するか. 計画側が None の項目は問わない."""
+    # 診断用などで label を付けた run (例: label=memdebug) は、条件が同じでも計画の枠に
+    # 数えない。通常の run の label は epymarl の既定値 "default_label"
+    if ((d.get("cfg") or {}).get("label")) not in (None, "", "default_label"):
+        return False
     if cond["agents"] != d.get("agents"):
         return False
     if cond["map"] and cond["map"] != d.get("map"):

@@ -13,6 +13,7 @@
   <div class="bar">
     <button id="tab-train" class="tab on">学習の進捗</button>
     <button id="tab-eval"  class="tab">評価結果</button>
+    <button id="tab-curve" class="tab">学習曲線</button>
     <span class="sep"></span>
     <button id="collect">今すぐ収集</button>
     <label><input type="checkbox" id="auto" checked> 自動更新</label>
@@ -28,7 +29,12 @@
     <span><label>machine</label><select id="t-machine"></select></span>
     <span><label>map</label><select id="t-map"></select></span>
     <span><label>N</label><select id="t-agents"></select></span>
+    <span><label>t_max</label><select id="t-tmax"></select></span>
+    <span><label>setting</label><select id="t-setting"></select></span>
     <span><label>algo</label><select id="t-algo"></select></span>
+    <span><label>arrival</label><select id="t-arrival"></select></span>
+    <span><label>assign</label><select id="t-assign"></select></span>
+    <span><label>reassign</label><select id="t-reassign"></select></span>
     <span><label>状態</label><select id="t-state">
       <option value="">(all)</option><option>done</option><option>running</option>
       <option>stalled</option><option>failed</option><option>short</option>
@@ -38,11 +44,25 @@
 
   <div id="t-stale"></div>
 
+  <!-- 条件の表に散っているパラメータの警告 (params✗ / 他と違う) を 1 か所に集めたもの -->
+  <h2 id="t-warn-h" hidden>パラメータの警告 <span class="mut sm" id="t-warn-n"></span></h2>
+  <div class="wrap"><table id="t-warn"></table></div>
+
   <h2>machines</h2>
   <div class="wrap"><table id="t-mach"></table></div>
 
+  <!-- マシン全体 (全アカウント合計) の使用状況。収集のたびに更新される -->
+  <h2>稼働状況 <span class="mut sm">全アカウントの合計</span></h2>
+  <div class="wrap"><table id="t-load"></table></div>
+
   <h2>running now</h2>
   <div class="wrap"><table id="t-run"></table></div>
+
+  <h2 id="t-att-h" hidden>要確認 <button id="t-att-all" class="ack">すべて OK</button></h2>
+  <div class="wrap"><table id="t-att"></table></div>
+
+  <h2>自動実行の依頼 <span class="mut sm">計画表の行の「依頼」から学習・評価を頼めます</span> <span id="ar-ctl"></span></h2>
+  <div class="wrap"><table id="ar-tbl"></table></div>
 
   <h2>conditions</h2>
   <div id="t-conds"></div>
@@ -51,18 +71,81 @@
 <!-- ── 評価結果 ─────────────────────────────────────────────── -->
 <section id="pane-eval" hidden>
   <div class="bar filters">
+    <span title="計画表 (tools/plans/*.md) で絞る。選ぶと、その計画の run から作ったモデル (seed) だけで平均を取り直す"><label>計画</label><select id="e-plan"></select></span>
     <span><label>map</label><select id="e-map"></select></span>
     <span><label>N</label><select id="e-n"></select></span>
     <span><label>env</label><select id="e-env"></select></span>
     <span><label>planner</label><select id="e-planner"></select></span>
     <span><label>tag</label><select id="e-tag"></select></span>
     <span><label>alloc</label><select id="e-alloc"></select></span>
+    <span><label>trained</label><select id="e-trained"></select></span>
+    <span><label>exec reassign</label><select id="e-exre"></select></span>
+    <span><label>arrival</label><select id="e-arrival"></select></span>
     <span><label>metric</label><select id="e-metric"></select></span>
     <span><label><input type="checkbox" id="e-log"> log 軸</label></span>
     <span class="right mut" id="e-counts"></span>
   </div>
+  <div class="bar filters">
+    <label>比較</label><span id="e-cmp"></span>
+    <span class="mut">選んだ要素の値を列に並べて比べる (複数選ぶと組み合わせ)。何も選ばなければ一覧</span>
+  </div>
   <div id="e-chart"></div>
   <div class="wrap"><table id="e-tbl"></table></div>
+</section>
+
+<!-- ── 学習曲線 ─────────────────────────────────────────────── -->
+<!-- 計画の章 (同じマップ・台数・t_max) ごとに、そこに入っている run の学習曲線を 1 枚に重ねる -->
+<section id="pane-curve" hidden>
+  <div class="bar filters">
+    <span><label>計画</label><select id="c-plan"></select></span>
+    <span><label>指標</label><select id="c-metric"></select></span>
+    <span><label>map</label><select id="c-map"></select></span>
+    <span><label>N</label><select id="c-n"></select></span>
+    <!-- 計画の中で値が 2 通り以上あるパラメータだけ、ここに絞り込みが並ぶ (app.js の CURVE_FIELDS) -->
+    <span id="c-dyn"></span>
+    <span class="right mut" id="c-counts"></span>
+  </div>
+  <div class="bar filters">
+    <span><label>色</label><select id="c-color"></select></span>
+    <span title="選んだパラメータの 1 つ目の値を実線、それ以外を破線にする"><label>線種</label><select id="c-dash"></select></span>
+    <span><label>平滑化</label><select id="c-smooth">
+      <option value="1">なし</option><option value="5" selected>5 点</option>
+      <option value="10">10 点</option><option value="20">20 点</option>
+    </select></span>
+    <span title="同じ条件の seed をまとめて 1 本にする (seed が 1 本なら変わらない)">
+      <label><input type="checkbox" id="c-mean" checked> 条件で平均</label></span>
+    <span title="条件で平均したとき、seed のばらつきを薄い色の帯で出す (seed が 2 本以上の条件だけ)">
+      <label>帯</label><select id="c-band">
+      <option value="range" selected>範囲 (最小〜最大)</option><option value="sd">平均 ± 標準偏差</option>
+      <option value="">なし</option></select></span>
+    <span><label><input type="checkbox" id="c-lare" checked> LaRe モデル学習の章も出す</label></span>
+    <span title="台数の違う LaRe モデル学習の run を、マップ・学習量 (t_max) ごとに 1 枚の図に重ねる。凡例はその run が作る LaRe モデルの名前">
+      <label><input type="checkbox" id="c-lare-merge"> LaRe モデル学習は台数をまとめる</label></span>
+    <span title="値を台数で割る (台数の違う run どうしを比べるとき)">
+      <label><input type="checkbox" id="c-per-agent"> 台数で割る</label></span>
+    <span class="mut">凡例をクリックすると、その線を消す / 戻す</span>
+  </div>
+  <!-- 章ごとの評価表 (results/ の評価ログを、run の評価用モデル名で結び付ける) -->
+  <div class="bar filters">
+    <span title="学習曲線だけ見たいときは外す (選んだ状態はこのブラウザに覚えておく)">
+      <label><input type="checkbox" id="c-evshow" checked> 評価表を出す</label></span>
+    <span id="c-evopts">
+    <span title="チェックした指標ごとに、到着率の列のかたまりを表の右に足す"><label>評価指標</label>
+      <label><input type="checkbox" class="c-em" value="task_completion" checked> task_completion</label>
+      <label><input type="checkbox" class="c-em" value="task_completion_per_agent"> per_agent</label>
+      <label><input type="checkbox" class="c-em" value="task_dropped"> task_dropped</label>
+      <label><input type="checkbox" class="c-em" value="goal_account"> goal_account</label>
+      <label><input type="checkbox" class="c-em" value="deadhead_ratio"> deadhead_ratio</label>
+    </span>
+    <span title="評価時に環境の reassign (タスクの再配布) を使うか。チェックした分だけ各到着率の下に列が並ぶ"><label>実行時 reassign</label>
+      <label><input type="checkbox" class="c-er" value="off" checked> off</label>
+      <label><input type="checkbox" class="c-er" value="on" checked> on</label></span>
+    <span title="評価時のタスク割当。既定は学習時と同じ (TP で学習した run は tp、PPO は ppo)"><label>評価の割当</label><select id="c-ealloc">
+      <option value="">学習と同じ</option><option value="tp">tp</option><option value="ppo">ppo</option>
+    </select></span>
+    </span>
+  </div>
+  <div id="c-body"></div>
 </section>
 
 <script src="/static/app.js"></script>

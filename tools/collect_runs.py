@@ -117,35 +117,51 @@ def _tail_text(path, nbytes):
     return data.decode("utf-8", "replace")
 
 
-# JSON 配列の要素になっている整数だけを拾う。
-# "[500, 1000, ...]" の形にだけ当てることで、文字列中の "2026-08-19T..." (年) や
-# 小数 (json は 1024.0 と必ず小数点付きで書く) を確実に除外する
-ARRAY_INT_RE = re.compile(r"[\[,]\s*(\d{4,})(?=\s*[,\]])")
+# metrics.json の "steps": [...] 配列。中身は素の整数 (= その記録の t_env) だけ。
+# values (小数) や timestamps (文字列) は見ない。以前は「配列要素の整数」を全部拾って
+# いたので、末尾に steps が無いと values の整数を t_env と取り違えるおそれがあった
+STEPS_ARRAY_RE = re.compile(r'"steps":\s*\[([^\]]*)\]')
+
+# 末尾を読む量の上限。記録が増えると、最後の指標 1 つ分 (steps / timestamps / values)
+# だけで 256KB を超え、末尾 256KB に steps が入らなくなる
+# (GPU1 の mappo aoba00 10 台、1.2 億ステップで 1 指標 332KB の実測)。
+# steps が見つかるまで 2 倍ずつ広げ、ここで打ち切る
+METRICS_TAIL_MAX = 8 * 1024 * 1024
 
 
 def _t_env_from_metrics(path, nbytes, cap):
     """cout.txt が空のときの保険。metrics.json の末尾だけを読み、
-    t_max を超えない最大の整数 (= 直近の t_env) を拾う。
+    steps 配列の中で t_max を超えない最大の整数 (= 直近の t_env) を拾う。
 
-    metrics.json は 1〜5MB あるので絶対に全体をロードしない。
-    steps 配列の値は素の整数、values は小数、timestamps は文字列なので、
-    「配列要素の整数」だけを見れば t_env に当たる。
+    metrics.json は数十 MB になるので全体はロードしない。末尾 nbytes に
+    steps 配列が 1 つも入っていなければ、読む量を 2 倍ずつ増やして読み直す
+    (上限 METRICS_TAIL_MAX)。
     """
-    text = _tail_text(path, nbytes)
-    if not text:
+    try:
+        size = os.path.getsize(path)
+    except OSError:
         return None
     try:
         limit = float(cap) * 1.01 if cap else None
     except (TypeError, ValueError):
         limit = None
-    best = None
-    for m in ARRAY_INT_RE.finditer(text):
-        v = int(m.group(1))
-        if limit is not None and v > limit:
-            continue
-        if best is None or v > best:
-            best = v
-    return best
+    n = nbytes
+    while True:
+        text = _tail_text(path, n)
+        best = None
+        for arr in STEPS_ARRAY_RE.finditer(text):
+            for tok in arr.group(1).split(","):
+                tok = tok.strip()
+                if not tok.isdigit():
+                    continue
+                v = int(tok)
+                if limit is not None and v > limit:
+                    continue
+                if best is None or v > best:
+                    best = v
+        if best is not None or n >= size or n >= METRICS_TAIL_MAX:
+            return best
+        n *= 2
 
 
 def _pick(d, keys):
@@ -159,6 +175,7 @@ HASH_EXCLUDE_TOP = frozenset((
     "seed", "checkpoint_path", "load_step", "local_results_path", "label",
     "repeat_id", "evaluate", "render", "save_replay", "use_tensorboard",
     "use_cuda", "save_model", "save_model_interval",
+    "test_interval",    # テストの間隔は学習曲線の点の間隔だけで、学習には効かない
 ))
 # lare_device は cpu / cuda の実行環境であって実験条件ではない。
 # GPU 機と Mac で同じ条件を回すと必ず割れるので外す
@@ -176,28 +193,109 @@ HASH_DEPENDENT = (
     ("use_finetuning_lare_path", ("finetuning_lare_path_model_name",)),
     ("use_dynamic_agents", ("randomize_initial_active", "min_active_agents",
                             "max_active_agents", "initial_active_num")),
+    ("use_lare_task", ("use_lare_task_training",)),
 )
 
 
-def param_fields(cfg_full, env_full):
+# drp_env.DrpEnv.__init__ の reward_list の既定値。train.py は reward_list を渡して
+# いないので、config にキーが無い run はこの値で学習している
+DEFAULT_REWARD_LIST = {"goal": 100, "collision": -10, "wait": -10, "move": -1}
+
+
+def _norm_reward_list(v):
+    """reward_list を比べられる形にする. 既定値と同じなら None (= キーが無い run と同一視).
+
+    sacred には書いたままの数が残るので、-10 と -10. を同じ値にするため float にそろえる。
+    """
+    if not isinstance(v, dict):
+        return v
+    try:
+        v = dict((k, float(x)) for k, x in v.items())
+    except (TypeError, ValueError):
+        return v
+    if v == dict((k, float(x)) for k, x in DEFAULT_REWARD_LIST.items()):
+        return None
+    return v
+
+
+def param_fields(cfg_full, env_full, dropped=None):
     """実験条件として意味を持つパラメータだけに正規化した dict を返す.
 
     param_hash も条件間の差分表示も**必ずこれを通す**。別々に正規化すると
     「ハッシュは同じなのに差分が出る」ような食い違いが起きる。
+
+    dropped に set を渡すと、「この run では使われない」として規則で外したキー
+    ("env.mmpp_ratio" など) を入れて返す。条件をまたいで比べるとき (dashboard の
+    global_param_diff)、外したキーを「値が無い」と比べて警告しないために使う。
     """
     top = dict((k, v) for k, v in (cfg_full or {}).items()
                if k not in HASH_EXCLUDE_TOP)
     env = dict((k, v) for k, v in (env_full or {}).items()
                if k not in HASH_EXCLUDE_ENV)
+
+    def drop(k):
+        # キーが無い古い run でも「この run では使われない」ことは同じなので記録する
+        if dropped is not None:
+            dropped.add("env." + k)
+        env.pop(k, None)
+
     # 有効化フラグが off のとき無視されるキーを落とす
     for flag, dependents in HASH_DEPENDENT:
         if not env.get(flag, False):
             for k in dependents:
-                env.pop(k, None)
+                drop(k)
+    # 事前学習 (固定) が指定されていると追加学習の指定は無視される
+    # (drp_env.py の _init_lare_path: finetuning = ... and not pretrained)
+    if env.get("use_pretrained_lare_path") and env.get("pretrained_lare_path_model_name"):
+        for k in ("use_finetuning_lare_path", "finetuning_lare_path_model_name"):
+            drop(k)
+    # 動的台数の初期台数: ランダムに引くなら max_active_agents、引かないなら
+    # initial_active_num だけが使われる (drp_env.py の reset)。min_active_agents は
+    # 稼働を止めてよい下限としても使う (ppo.py) ので残す
+    if env.get("use_dynamic_agents"):
+        drop("initial_active_num" if env.get("randomize_initial_active")
+             else "max_active_agents")
     # randomize_task_arrival が真なら固定値側は使われない
     if env.get("randomize_task_arrival"):
         for k in ("task_arrival", "task_density"):
-            env.pop(k, None)
+            drop(k)
+    # task_arrival="fixed" は毎ステップ 1 件で、task_density を使わない
+    # (EE_map.create_tasklist の mode == 'fixed' の分岐)
+    # mmpp も task_density を使わない (p_high / p_low だけ)
+    elif env.get("task_arrival", "fixed") in ("fixed", "mmpp"):
+        drop("task_density")
+    if not env.get("randomize_task_arrival"):
+        # ランダム化の範囲は、randomize_task_arrival=True のときだけ読まれる
+        # (drp_env.py の reset → _sample_task_arrival)
+        for k in ("mmpp_ratio", "rand_p_min", "rand_p_max"):
+            drop(k)
+        # MMPP の値は task_arrival="mmpp" のときだけ使う (EE_map.create_tasklist)。
+        # ランダム化ありでは MMPP が引かれうるので残す
+        if env.get("task_arrival", "fixed") != "mmpp":
+            for k in ("task_p_high", "task_p_low", "task_switch_prob"):
+                drop(k)
+    # 環境報酬 (goal / collision / wait / move)。既定値から変えた run だけキーが残り、
+    # 同じ条件の他の seed や他の条件と違えば params✗ / 他と違う の警告になる
+    if "reward_list" in env:
+        rl = _norm_reward_list(env.get("reward_list"))
+        if rl is None:
+            env.pop("reward_list")
+        else:
+            env["reward_list"] = rl
+    # max_active_agents は「開始時に稼働台数を引くときの上限」で、env が台数 N
+    # (環境名の drp_safe-{N}agent) に丸める。未指定 (None) も N 以上も挙動は同じ
+    # (drp_env.py の reset: hi = agent_num if max is None else min(agent_num, max))。
+    # 同じ値として扱わないと、行を消した run と max=N を書いた run が別条件に見える。
+    # N 未満のときだけ本当に条件が違うので残す
+    if "max_active_agents" in env:
+        m = ENV_KEY_RE.search(str(env.get("key") or ""))
+        n = int(m.group(2)) if m else None
+        mx = env.get("max_active_agents")
+        try:
+            if mx is None or (n is not None and int(mx) >= n):
+                env.pop("max_active_agents", None)
+        except (TypeError, ValueError):
+            pass
     # None / False は「キーが無い」と同一視する。config のスキーマは版ごとに増えており、
     # 古い run にはキー自体が存在しない。新設フラグの既定は False / None なので、
     # これを潰さないと「後から足したキーの有無」だけで差が出る。
@@ -423,6 +521,110 @@ def find_model(index, repo, algo, seed, env_key):
     }
 
 
+# ---- LaRe-Path のモデル (.pth) ------------------------------------------------
+# LaRe を学習した run (scratch / 追加学習) は、方策とは別に
+# src/lare/path/checkpoints/ へ LaRe のモデルを保存する (drp_env.py の autosave)。
+# ファイル名は run の設定から決まるので、名前の規則と更新時刻で run と結ぶ:
+#   scratch : {ALGO}_PATH_[F{v}_]{Safe_}{map}_{N}agents_{S}M_{checkpoint|final}.pth
+#   追加学習: FT_{元のモデル名}_{Safe_}{map}_{N}agents_{S}M_{checkpoint|final}.pth
+# 同じ条件を同じマシンで回し直すと同じ名前で上書きされるので、
+# 「run の開始から終了 (+10 分) の間に書かれたもの」だけをその run のものとみなす
+LARE_PATH_CKPT_DIR = os.path.join("src", "lare", "path", "checkpoints")
+LARE_STEP_RE = re.compile(r"_([\d.]+)M_(checkpoint|final)\.pth$")
+LARE_VER_RE = re.compile(r"_PATH_F(\d+)_")
+_LARE_LS = {}
+
+
+def _lare_listdir(d):
+    """checkpoints/ の一覧 (走査 1 回の中では使い回す)."""
+    if d not in _LARE_LS:
+        try:
+            _LARE_LS[d] = sorted(os.listdir(d))
+        except OSError:
+            _LARE_LS[d] = []
+    return _LARE_LS[d]
+
+
+def _lare_source_base(name):
+    """drp_env._lare_get_source_base_name と同じ: 拡張子・接尾辞・先頭の FT_ を外す."""
+    n = os.path.basename(str(name or ""))
+    if n.endswith(".pth"):
+        n = n[:-4]
+    n = n.replace("_final", "").replace("_checkpoint", "")
+    while n.startswith("FT_"):
+        n = n[3:]
+    return n
+
+
+def find_lare_model(repo, env, start_time, end_time):
+    """run が保存した LaRe-Path のモデルのうち最後のもの. 無ければ None.
+
+    返り値: {"name", "rel" (repo からの相対), "size", "mtime", "step_m"}
+    """
+    env = env or {}
+    if not repo or not env.get("use_lare_path"):
+        return None
+    if env.get("use_pretrained_lare_path") and env.get("pretrained_lare_path_model_name"):
+        return None                       # 固定して使うだけ。保存しない
+    if env.get("lare_path_autosave") is False:
+        return None
+    m = ENV_KEY_RE.search(str(env.get("key") or ""))
+    if not m:
+        return None
+    safe_seg = "Safe_" if m.group(1) else ""
+    stage = "%s%s_%sagents_" % (safe_seg, m.group(3), m.group(2))
+    fin = env.get("use_finetuning_lare_path") and env.get("finetuning_lare_path_model_name")
+    try:
+        version = int(env.get("lare_path_factor_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    explicit = env.get("lare_path_autosave_path")
+    if explicit:
+        d = os.path.dirname(os.path.join(repo, os.path.expanduser(str(explicit))))
+        names = [os.path.basename(str(explicit))]
+    else:
+        d = os.path.join(repo, LARE_PATH_CKPT_DIR)
+        names = _lare_listdir(d)
+    t0 = parse_dt(start_time)
+    t1 = parse_dt(end_time)
+    lo = t0.timestamp() - 60 if t0 else None
+    hi = t1.timestamp() + 600 if t1 else None
+    best = None
+    for n in names:
+        sm = LARE_STEP_RE.search(n)
+        if not sm:
+            continue
+        head = n[:sm.start() + 1]                     # "..._{N}agents_" まで
+        if not head.endswith(stage):
+            continue
+        if fin:
+            if not n.startswith("FT_%s_%s" % (_lare_source_base(fin), stage)):
+                continue
+        else:
+            if n.startswith("FT_") or "_PATH_" not in n:
+                continue
+            vm = LARE_VER_RE.search(n)
+            if (int(vm.group(1)) if vm else 1) != version:
+                continue
+        p = os.path.join(d, n)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if st.st_size == 0:
+            continue
+        if (lo is not None and st.st_mtime < lo) or (hi is not None and st.st_mtime > hi):
+            continue
+        key = (float(sm.group(1)), sm.group(2) == "final")
+        if best is None or key > best[0]:
+            best = (key, n, st)
+    if best is None:
+        return None
+    (step_m, _final), n, st = best
+    return {"name": n, "rel": os.path.relpath(os.path.join(d, n), repo),
+            "size": st.st_size, "mtime": st.st_mtime, "step_m": step_m}
+
+
 def scan_run_dir(run_dir, machine, root_tag, tail_bytes, repo=None, model_index=None):
     """sacred の run ディレクトリ 1 つを読んでレコード dict を返す."""
     cfg = _read_json(os.path.join(run_dir, "config.json"))
@@ -477,7 +679,7 @@ def scan_run_dir(run_dir, machine, root_tag, tail_bytes, repo=None, model_index=
         t_source = "model"
 
     host = run.get("host") or {}
-    return {
+    rec = {
         "repo": repo,
         "model": model,
         "uid": "%s:%s/%s/%s/%s" % (machine, root_tag, algo_dir, env_dir, run_id),
@@ -501,6 +703,21 @@ def scan_run_dir(run_dir, machine, root_tag, tail_bytes, repo=None, model_index=
         "env": env_full,
         "param_hash": param_hash(cfg_full, env_full),
     }
+    # 学習プロセスの状態。"stopped" = Ctrl-Z 等で一時停止中 / "running" / None = 不明
+    # train.py の予約から起動されていれば、その何本目か (batch_pos / batch_total) も付ける
+    # LaRe を学習した run は、LaRe のモデル (.pth) も run に結び付けておく
+    try:
+        rec["lare"] = find_lare_model(repo, env_full, run.get("start_time"),
+                                      run.get("stop_time") or run.get("heartbeat"))
+    except Exception:                      # 走査そのものは止めない
+        rec["lare"] = None
+    proc = (find_training_proc(cfg_full, env_full, run.get("start_time"))
+            if run.get("status") == "RUNNING" else None)
+    rec["proc_state"] = (None if proc is None else
+                         "stopped" if proc["stat"].startswith("T") else "running")
+    pos = batch_position(proc)
+    rec["batch_pos"], rec["batch_total"], rec["batch_pid"] = pos if pos else (None, None, None)
+    return rec
 
 
 def root_tag_of_run(run_dir):
@@ -508,6 +725,155 @@ def root_tag_of_run(run_dir):
     d = os.path.abspath(run_dir)
     sacred_root = os.path.dirname(os.path.dirname(os.path.dirname(d)))
     return _root_tag(sacred_root)
+
+
+# ---- 学習プロセスの状態 (一時停止の検出) -------------------------------------
+# Ctrl-Z で一時停止すると sacred の heartbeat も止まるので、90 分後には「停止 (stalled)」
+# と区別できなくなる。ps の状態 (T = stopped) を見て「一時停止中」と判定する。
+# sacred の run.json に pid は残らないので、起動時刻と起動引数で run とプロセスを結ぶ
+_PROC_CACHE = {"t": 0.0, "procs": None, "ppid": {}}
+PS_MAIN_RE = re.compile(r"^(?:\S*/)?python[0-9.]*\s+(?:-\S+\s+)*\S*main\.py\b")
+
+
+def _training_procs(ttl=30.0):
+    """epymarl の main.py (python 本体) のプロセス一覧。同じ走査中は使い回す."""
+    now = time.time()
+    if _PROC_CACHE["procs"] is not None and now - _PROC_CACHE["t"] < ttl:
+        return _PROC_CACHE["procs"]
+    procs = []
+    try:
+        # 日本語ロケールだと lstart の月・曜日が日本語になるので英語に固定する
+        # 共有 GPU では他のユーザーも学習を回しているので、自分のプロセスだけを見る
+        # (見ないと他人の run を自分の一時停止と取り違える。GPU1 で他ユーザーの main.py 6 本を確認)
+        out = subprocess.check_output(["ps", "-U", str(os.getuid()), "-o", "pid=,ppid=,stat=,lstart=,args="],
+                                      stderr=subprocess.DEVNULL,
+                                      env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.CalledProcessError):
+        out = b""
+    ppid_of = {}                  # 全プロセスの pid -> 親 pid (train.py までたどるため)
+    for line in out.decode("utf-8", "replace").splitlines():
+        tok = line.split(None, 8)
+        if len(tok) < 9:
+            continue
+        pid, ppid, stat, args = tok[0], tok[1], tok[2], tok[8]
+        ppid_of[pid] = ppid
+        # /bin/sh -c python ... のシェルは除き、python 本体だけを見る
+        if not PS_MAIN_RE.search(args):
+            continue
+        try:
+            started = time.mktime(time.strptime(" ".join(tok[3:8]), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            started = None
+        procs.append({"pid": pid, "stat": stat, "start": started, "args": args})
+    _PROC_CACHE.update(t=now, procs=procs, ppid=ppid_of)
+    return procs
+
+
+def _ancestors(pid, depth=4):
+    """pid 自身と、その親を depth 代までたどった pid の列 (文字列)."""
+    ppid_of = _PROC_CACHE.get("ppid") or {}
+    out, cur = [], str(pid)
+    for _ in range(depth + 1):
+        if not cur or cur in out or cur in ("0", "1"):
+            break
+        out.append(cur)
+        cur = ppid_of.get(cur)
+    return out
+
+
+def batch_position(proc):
+    """学習プロセスが train.py の予約の何本目かを返す. (本目, 総本数, バッチ pid) か None.
+
+    main.py の親 (shell=True なら /bin/sh -c、その親) をたどり、~/.ldrp/batch_<pid>.json
+    を書いた train.py を探す。
+    - 予約ファイルに "pids" (起動順の Popen の pid) があれば、その並びの位置がそのまま答え
+    - 無ければ (古い train.py)、起動済み本数 started から「自分より後に起動して
+      まだ動いている同じバッチの run」の数を引く。後から起動した run が先に終わって
+      いると数え落とすので、その場合だけ 1 つ大きく出る
+    """
+    if not proc:
+        return None
+    chain = _ancestors(proc["pid"])
+    d = os.path.expanduser(BATCH_DIR)
+    for anc in chain[1:]:
+        info = _read_json(os.path.join(d, "batch_%s.json" % anc))
+        if not info or not info.get("total"):
+            continue
+        total = int(info["total"])
+        pids = [str(x) for x in info.get("pids") or []]
+        for c in chain[:chain.index(anc)]:
+            if c in pids:
+                return pids.index(c) + 1, total, int(anc)
+        started = int(info.get("started") or 0)
+        if not started:
+            return None
+        later = 0
+        for p in _training_procs():
+            if p is proc or p["start"] is None or proc["start"] is None:
+                continue
+            if anc in _ancestors(p["pid"])[1:] and p["start"] > proc["start"]:
+                later += 1
+        return max(1, started - later), total, int(anc)
+    return None
+
+
+def match_training_proc(cfg, env, start_time):
+    """sacred の run に対応する学習プロセスの状態を返す.
+
+    "stopped" = 一時停止中 (ps の STAT が T) / "running" / None = 見つからない。
+    """
+    best = find_training_proc(cfg, env, start_time)
+    if best is None:
+        return None
+    return "stopped" if best["stat"].startswith("T") else "running"
+
+
+def find_training_proc(cfg, env, start_time):
+    """sacred の run に対応する学習プロセス (_training_procs の 1 要素) を探す. 無ければ None.
+
+    起動引数 (アルゴリズム・環境名・t_max) が合うプロセスのうち、起動時刻が sacred の
+    start_time に最も近いものを採る。同じ条件を同時に回していても取り違えない。
+    """
+    algo = (cfg or {}).get("name")
+    key = (env or {}).get("key")
+    if not algo or not key:
+        return None
+    t_max = (cfg or {}).get("t_max")
+    cand = []
+    for p in _training_procs():
+        a = p["args"]
+        if not re.search(r"--config=%s(\s|$)" % re.escape(str(algo)), a):
+            continue
+        if str(key) not in a.replace('"', "").replace("'", ""):
+            continue
+        if t_max and not re.search(r"(^|\s)t_max=%s(\s|$)" % int(t_max), a):
+            continue
+        cand.append(p)
+    if not cand:
+        return None
+    best = cand[0]
+    t0 = None
+    if start_time:
+        import calendar
+        dt = parse_dt(start_time)
+        if dt is not None:
+            t0 = calendar.timegm(dt.utctimetuple())
+    if t0 is not None:
+        timed = [p for p in cand if p["start"] is not None]
+        if timed:
+            # 学習プロセスは sacred の run より**先に**起動する。環境の準備に時間がかかると
+            # 差が大きくなる (GPU2 の mappo aoba00 7 台 32 並列で 51 分の実測、2026-10-07)。
+            # 以前は「前後 15 分以内」で判定していて、この run を見落としていた。
+            # run より後に起動したプロセス (= 別の run) を除き、その中で一番遅く起動したもの
+            # (= run の開始に一番近いもの) を採る
+            before = [p for p in timed if p["start"] <= t0 + 60]
+            if not before:
+                return None
+            best = max(before, key=lambda p: p["start"])
+            if t0 - best["start"] > 6 * 3600:
+                # 6 時間以上前に起動したプロセス = 別の run のもの。当て推量はしない
+                return None
+    return best
 
 
 BATCH_DIR = "~/.ldrp"
@@ -585,7 +951,9 @@ def scan_batches(machine):
     """
     live = {}
     try:
-        out = subprocess.check_output(["ps", "-eo", "pid,etime,args"],
+        # 自分のプロセスだけを見る。共有 GPU で他のユーザーの train.py を
+        # 自分の「実行予定」に数えないため
+        out = subprocess.check_output(["ps", "-U", str(os.getuid()), "-o", "pid,etime,args"],
                                       stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError):
         out = b""
@@ -635,6 +1003,200 @@ def scan_batches(machine):
     return out
 
 
+def _run_text(cmd, timeout=10):
+    """コマンドの標準出力を文字列で返す. 無い・失敗したら None (止まらない)."""
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
+                                       timeout=timeout).decode("utf-8", "replace")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+
+def _cpu_times():
+    """/proc/stat の全 CPU 合計 (busy, total). Linux 以外は None."""
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+    except (IOError, OSError, ValueError):
+        return None
+    idle = v[3] + (v[4] if len(v) > 4 else 0)          # idle + iowait
+    return sum(v) - idle, sum(v)
+
+
+def _my_train_pids(repos):
+    """このリポジトリで動いている学習 (epymarl の main.py) と、その子プロセスの PID.
+
+    GPU2 は研究室で 1 つのアカウントを共有しているので、ユーザー名では
+    自分の学習を見分けられない。**作業ディレクトリがこのリポジトリの中**かで判定する。
+    子プロセス (parallel runner の環境ワーカー) も CPU を食うので一緒に数える。
+    Linux (/proc) 以外では、自分のユーザーの main.py を数えるだけにする。
+    返り値: (main.py の PID の集合, 子も含めた PID の集合)
+    """
+    roots = [os.path.realpath(os.path.expanduser(r)) for r in repos or []]
+    if not os.path.isdir("/proc"):
+        out = _run_text(["ps", "-U", str(os.getuid()), "-o", "pid=,args="]) or ""
+        mains = set()
+        for ln in out.splitlines():
+            f = ln.split(None, 1)
+            if len(f) == 2 and "main.py" in f[1] and "epymarl" in f[1]:
+                mains.add(int(f[0]))
+        return mains, set(mains)
+    parent, mains = {}, set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                st = f.read()
+            parent[pid] = int(st[st.rfind(")") + 2:].split()[1])
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                argv = f.read().decode("utf-8", "replace").split("\0")
+            # train.py は "/bin/sh -c python ... main.py" で起動するので、
+            # sh ではなく python 本体だけを数える
+            if not (os.path.basename(argv[0]).startswith("python")
+                    and any(a.endswith("main.py") for a in argv[1:3])):
+                continue
+            cwd = os.path.realpath("/proc/%d/cwd" % pid)
+        except (IOError, OSError, ValueError, IndexError):
+            continue
+        if any(cwd == r or cwd.startswith(r + os.sep) for r in roots):
+            mains.add(pid)
+    # fork した環境ワーカーも親と同じ cmdline (main.py) を持つ。
+    # 親が main.py でないものだけを「学習 1 本」と数える
+    allp = set(mains)
+    mains = set(p for p in mains if parent.get(p) not in mains)
+    for pid in parent:
+        q, seen = pid, 0
+        while q in parent and q not in allp and seen < 50:
+            q, seen = parent[q], seen + 1
+        if q in allp:
+            allp.add(pid)
+    return mains, allp
+
+
+def host_stats(machine, repos=None):
+    """このマシンの CPU / メモリ / GPU の使用状況 ({"kind": "host"} レコード).
+
+    測り方は GPU 側にある sysstat.sh と同じ (nvidia-smi / /proc/stat / meminfo)。
+    共有マシンなので「このリポジトリの学習」とそれ以外を分けて数える。
+    これがあると「あと何本回せるか」を白のダッシュボードで見積もれる。
+    どの値も取れなければ None のまま返す (収集そのものは止めない)。
+    """
+    mains, mine = _my_train_pids(repos)
+    st = {"kind": "host", "uid": "host:%s" % machine, "machine": machine,
+          "at": datetime.utcnow().isoformat() + "+00:00",
+          "cpu_count": os.cpu_count(), "load1": None, "cpu_pct": None,
+          "cpu_pct_mine": None, "mem_total_mb": None, "mem_used_mb": None,
+          "train_procs": len(mains), "gpus": [],
+          "gpu_mem_mine_mb": None, "gpu_mem_others_mb": None}
+    try:
+        st["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass
+
+    # CPU 使用率 (全体): /proc/stat を 0.5 秒あけて 2 回読んだ差 (その瞬間の値)
+    a = _cpu_times()
+    if a:
+        time.sleep(0.5)
+        b = _cpu_times()
+        if b and b[1] > a[1]:
+            st["cpu_pct"] = round(100.0 * (b[0] - a[0]) / (b[1] - a[1]), 1)
+    # 自分の学習の CPU。top の 2 回目の表示 (= 直近 0.5 秒の値) を使う。
+    # ps の %CPU は起動からの平均なので、長く回している学習では実態とずれる
+    out = _run_text(["top", "-b", "-n", "2", "-d", "0.5", "-w", "200"]) if mine else None
+    if out and "PID" in out:
+        lines = out[out.rfind("PID"):].splitlines()
+        head = lines[0].split()
+        if "%CPU" in head and head[0] == "PID":
+            i = head.index("%CPU")
+            tot = 0.0
+            for ln in lines[1:]:
+                f = ln.split()
+                try:
+                    if len(f) > i and int(f[0]) in mine:
+                        tot += float(f[i].replace(",", "."))
+                except ValueError:
+                    pass
+            if st["cpu_count"]:
+                st["cpu_pct_mine"] = round(tot / st["cpu_count"], 1)   # 全体比の %
+
+    # mac には /proc も top -b も無い。ps の %CPU (mac では直近の減衰平均) で代える
+    if st["cpu_pct"] is None and st["cpu_count"]:
+        out = _run_text(["ps", "-A", "-o", "pid=,%cpu="])
+        if out:
+            tot = mtot = 0.0
+            for ln in out.splitlines():
+                f = ln.split()
+                try:
+                    v = float(f[1].replace(",", "."))
+                except (ValueError, IndexError):
+                    continue
+                tot += v
+                if int(f[0]) in mine:
+                    mtot += v
+            st["cpu_pct"] = round(min(100.0, tot / st["cpu_count"]), 1)
+            st["cpu_pct_mine"] = round(mtot / st["cpu_count"], 1)
+
+    # メモリ: Linux は /proc/meminfo、mac は sysctl + vm_stat
+    try:
+        with open("/proc/meminfo") as f:
+            mi = dict((l.split(":")[0], int(l.split()[1])) for l in f if ":" in l)
+        st["mem_total_mb"] = mi["MemTotal"] // 1024
+        st["mem_used_mb"] = (mi["MemTotal"] - mi.get("MemAvailable", mi.get("MemFree", 0))) // 1024
+    except (IOError, OSError, KeyError, ValueError, IndexError):
+        tot = _run_text(["sysctl", "-n", "hw.memsize"])
+        vm = _run_text(["vm_stat"])
+        if tot and vm:
+            try:
+                page = int(re.search(r"page size of (\d+)", vm).group(1))
+                cnt = dict((k.strip(), int(v.strip().rstrip(".")))
+                           for k, v in (l.split(":") for l in vm.splitlines()[1:] if ":" in l))
+                free = (cnt.get("Pages free", 0) + cnt.get("Pages inactive", 0)
+                        + cnt.get("Pages speculative", 0)) * page
+                st["mem_total_mb"] = int(tot) // (1 << 20)
+                st["mem_used_mb"] = (int(tot) - free) // (1 << 20)
+            except (AttributeError, ValueError):
+                pass
+
+    # GPU: 全体の使用率と VRAM。WSL2 (GPU2) では nvidia-smi が PATH に無いので、
+    # sysstat.sh と同じ場所を見る
+    nvsmi = "nvidia-smi"
+    if os.path.exists("/usr/lib/wsl/lib/nvidia-smi"):
+        nvsmi = "/usr/lib/wsl/lib/nvidia-smi"
+    out = _run_text([nvsmi, "--query-gpu=index,name,utilization.gpu,"
+                     "memory.used,memory.total,temperature.gpu",
+                     "--format=csv,noheader,nounits"])
+    for ln in (out or "").splitlines():
+        f = [x.strip() for x in ln.split(",")]
+        if len(f) < 6:
+            continue
+        try:
+            st["gpus"].append({"index": int(f[0]), "name": f[1], "util": float(f[2]),
+                               "mem_used_mb": float(f[3]), "mem_total_mb": float(f[4]),
+                               "temp": float(f[5])})
+        except ValueError:
+            continue
+    # プロセスごとの VRAM。WSL2 では "[N/A]" になり分けられない (その場合は None のまま)
+    out = _run_text([nvsmi, "--query-compute-apps=pid,used_memory",
+                     "--format=csv,noheader,nounits"])
+    mine_mb, others_mb, ok = 0.0, 0.0, False
+    for ln in (out or "").splitlines():
+        f = [x.strip() for x in ln.split(",")]
+        try:
+            pid, mb = int(f[0]), float(f[1])
+        except (ValueError, IndexError):
+            continue
+        ok = True
+        if pid in mine:
+            mine_mb += mb
+        else:
+            others_mb += mb
+    if ok:
+        st["gpu_mem_mine_mb"], st["gpu_mem_others_mb"] = mine_mb, others_mb
+    return st
+
+
 def iter_run_dirs(sacred_root):
     """<sacred_root>/<algo>/<env_key>/<run_id>/ を列挙する."""
     if not os.path.isdir(sacred_root):
@@ -655,7 +1217,7 @@ def iter_run_dirs(sacred_root):
 
 
 def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None,
-         curve_metrics=None, curve_max_points=0, tb_subdirs=None):
+         curve_metrics=None, curve_max_points=0, tb_subdirs=None, with_host=True):
     """repos 配下を走査し、レコードを 1 件ずつ emit に渡す (溜め込まない).
 
     curve_metrics を渡すと、学習曲線も {"kind":"curve"} レコードとして emit する。
@@ -664,6 +1226,11 @@ def scan(repos, sacred_subdirs, machine, tail_bytes, emit, model_subdirs=None,
     """
     for b in scan_batches(machine):
         emit(b)
+    try:
+        if with_host:
+            emit(host_stats(machine, repos))
+    except Exception as e:                    # 稼働率が取れなくても run の収集は続ける
+        sys.stderr.write("[host] %s: %s\n" % (type(e).__name__, e))
     n = 0
     for repo in repos:
         repo = os.path.abspath(os.path.expanduser(repo))
@@ -790,11 +1357,27 @@ def pretty_lare_models(name):
     if not name:
         return ""
     parts = []
+    last = None
     for m in LARE_SEG_RE.finditer(str(name)):
         steps = float(m.group(3))
         parts.append("%s_%s %gM" % (m.group(1), m.group(2), steps))
+        last = m
+    if not parts:
+        return str(name)
     # 元の管理表の表記に合わせて矢印で繋ぐ (例: "8x5_2 10M→aoba00_2 5M")
-    return "→".join(parts) if parts else str(name)
+    out = "→".join(parts)
+    # 手で編集したモデルの印 (例: ..._checkpoint_waitedit.pth -> "8x5_5 10M waitedit")。
+    # 付けないと元のモデルの run と同じ setting・同じ評価用モデル名になる
+    mark = lare_edit_mark(str(name)[last.end():])
+    return "%s %s" % (out, mark) if mark else out
+
+
+def lare_edit_mark(tail):
+    """LaRe のファイル名の最後の段より後ろ ("_checkpoint_waitedit.pth" など) から、
+    編集の印 ("waitedit") を取り出す。印が無ければ ""."""
+    t = re.sub(r"\.pth$", "", str(tail or ""))
+    t = re.sub(r"^_(?:checkpoint|final)", "", t)
+    return t.strip("_ ")
 
 
 def parse_steps(v):
@@ -850,6 +1433,50 @@ def norm_chain(text):
     return " ".join(t.split())
 
 
+def recent_rate(rec, t_ref, t_last):
+    """記録点から直近 15 分ぶんのペース (step/sec) を出す。区間が 1 つも無ければ None.
+
+    最新の点から古い方へ区間をたどり、合計が RATE_WINDOW_SEC (15 分) に届くまで
+    ステップ数と秒数を足し合わせて割る。
+    - 2 分おきの quick-check だと 1 区間が短く、t_env は log 間隔 (5 万 step) 刻みでしか
+      進まないので、区間 1 つずつのペースは 0 と 2 倍を行き来する。15 分束ねればならされる
+    - 学習マシン側が止まっていた (蓋を閉じた / Ctrl-Z) 区間は heartbeat が飛ぶので、
+      「長くて (PAUSE_GAP_SEC 以上) 遅い (普段のペースの半分未満)」区間として飛ばし、
+      その前の区間で 15 分を埋める。収集側 (白) が閉じていただけの長い区間は
+      ペースが普段どおりなので飛ばさない
+    """
+    pts = []
+    for b, t in rec.get("progress_samples") or []:
+        dt = parse_dt(b)
+        if dt is not None:
+            pts.append((dt, int(t)))
+    if t_ref is not None and t_last:
+        pts.append((t_ref, int(t_last)))
+    pts = sorted(set(pts))
+    iv = []                                   # (秒, ステップ) 古い順
+    for (b0, t0), (b1, t1) in zip(pts, pts[1:]):
+        sec = (b1 - b0).total_seconds()
+        if sec > 0 and t1 >= t0:
+            iv.append((sec, t1 - t0))
+    if not iv:
+        return None
+    # 普段のペース = 短い区間をまとめたペース。短い区間が無ければ停止の判定はしない
+    short = [(s, n) for s, n in iv if s < PAUSE_GAP_SEC]
+    s_sum = sum(s for s, _n in short)
+    base = (sum(n for _s, n in short) / s_sum) if s_sum > 0 else None
+    acc_sec = acc_steps = 0
+    for sec, n in reversed(iv):
+        if base and sec >= PAUSE_GAP_SEC and n / sec < 0.5 * base:
+            continue                          # 学習マシンが止まっていた区間
+        acc_sec += sec
+        acc_steps += n
+        if acc_sec >= RATE_WINDOW_SEC:
+            break
+    if acc_sec <= 0 or acc_steps <= 0:
+        return None
+    return acc_steps / acc_sec
+
+
 def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
            data_stale_sec=DATA_STALE_SEC, lare_chain=None):
     """スキャン結果から Notion 列に対応する派生フィールドを作る."""
@@ -893,10 +1520,31 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         d["setting"] = env_label
         d["lare_mode"] = ("scratch" if env.get("use_lare_path_training")
                           else "scratch(frozen)")
+    # LaRe-Path の評価関数の版 (env_args.lare_path_factor_version)。版 1 (今まで) は
+    # 表記を変えない。2 以降は setting に " F2" のように付け、LaRe なしの run や
+    # 版 1 の run と同じ条件に数えられないようにする (design/lare_factor_versions.md)
+    fver = int(env.get("lare_path_factor_version") or 1) if env.get("use_lare_path") else 1
+    d["lare_factor_version"] = fver
+    if fver != 1:
+        d["setting"] = "%s F%d" % (d["setting"], fver)
+    elif d["lare_mode"] in ("scratch", "scratch(frozen)"):
+        # 版 1 の scratch (LaRe を run の中で一から学習) も " F1" を付ける。
+        # 付けないと LaRe なしの run と同じ "safe" になり、計画表で区別できない。
+        # use_lare_path_training=False (= "scratch(frozen)") でも LaRe のデコーダは学習される
+        # (このフラグは方策の報酬を LaRe に差し替えるかだけ)。LaRe モデル学習の run は
+        # この設定で回すので、同じく F1 を付ける (2026-10-27)
+        d["setting"] = "%s F1" % d["setting"]
 
     # task arrival 列
     if env.get("randomize_task_arrival"):
-        d["task_arrival"] = "bernoulli, mmpp"
+        # 学習時の bernoulli p の範囲 U(rand_p_min, rand_p_max) を必ず付ける。
+        # 範囲を変えた学習 (plan_arrival_range.md) と区別するため。
+        # キーが無い古い run は drp_env の既定 (0.01, 0.10) で回っている
+        lo = env.get("rand_p_min")
+        hi = env.get("rand_p_max")
+        lo = 0.01 if lo is None else float(lo)
+        hi = 0.10 if hi is None else float(hi)
+        d["task_arrival"] = "bernoulli, mmpp p=%.2f-%.2f" % (lo, hi)
     else:
         d["task_arrival"] = str(env.get("task_arrival") or "")
 
@@ -954,6 +1602,11 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         # 遅れたぶんだけ heartbeat が古く見え、走っている run が stalled に化ける
         stale = (last is None) or (obs - last > timedelta(minutes=stale_minutes))
         d["state"] = "stalled" if stale else "running"
+        # Ctrl-Z 等で一時停止中なら heartbeat が止まっていても「実行中」のまま扱う。
+        # 再開すれば続きから進むので、止まった (stalled) と同じにすると枠が空いて見え、
+        # 同じ条件を二重に投入してしまう
+        if rec.get("proc_state") == "stopped":
+            d["state"] = "running"
     else:
         d["state"] = "unknown"
 
@@ -981,6 +1634,24 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
             if norm_chain(d.get("setting")) != norm_chain(canon):
                 d["method_tag"] = "%s_%s" % (d["method_tag"] or "dbct",
                                              _slug(d.get("setting"), "alt"))
+    # LaRe-Path の評価関数の版 2 以降は、評価用モデルの名前のタグにも版を付ける
+    # (例: safe -> safe_f2)。付けないと LaRe なし / 版 1 のモデルと同じ名前になる
+    # 版 1 の scratch も _f1 を付ける (LaRe なしの評価用モデルと同じ名前にしないため)
+    if (d.get("lare_factor_version", 1) != 1
+            or d.get("lare_mode") in ("scratch", "scratch(frozen)")):
+        d["method_tag"] = "%s_f%d" % (d["method_tag"] or "safe", d.get("lare_factor_version", 1))
+    # 学習時の到着率の範囲が既定 U(0.01, 0.10) と違う run は、タグに範囲を足す
+    # (例: safe -> safe_p0.01-0.15)。足さないと評価用のファイル名が既定の run と
+    # 同じ stem になり、範囲の違いが seed の番号でしか区別できない。評価の条件名にも
+    # タグが入るので、集計で別の範囲の結果が同じ条件の seed として平均されなくなる
+    # (tools/plans/plan_arrival_range.md)
+    if env.get("randomize_task_arrival"):
+        lo = env.get("rand_p_min")
+        hi = env.get("rand_p_max")
+        lo = 0.01 if lo is None else float(lo)
+        hi = 0.10 if hi is None else float(hi)
+        if (lo, hi) != (0.01, 0.10):
+            d["method_tag"] = "%s_p%g-%g" % (d["method_tag"] or "safe", lo, hi)
 
     # 想定 t_max との照合. モデルの選択には使わない (使うのは run の t_max) が、
     # 「30M 回すつもりだったのに 10M で止めた run」を取り違えないための確認用
@@ -992,8 +1663,13 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         # t_max は 20050000 のように +50000 されている運用なので M 単位で丸めて比べる
         d["t_max_ok"] = round(t_max / 1e6) == round(exp / 1e6)
 
-    d["param_hash"] = rec.get("param_hash")
+    # ハッシュは手元の param_fields で計算し直す。drop のホストは自分の (古いかもしれない)
+    # collect_runs.py で計算して書き出すので、照合の規則を変えたときに食い違う
+    d["param_hash"] = (param_hash(rec.get("cfg"), rec.get("env"))
+                       if rec.get("cfg") is not None else rec.get("param_hash"))
     d["model"] = rec.get("model")
+    d["lare"] = rec.get("lare")
+    d["curve_file"] = rec.get("curve_file")      # 共有フォルダ経由の学習曲線 (export_curves_drop)
     d["repo"] = rec.get("repo")
     d["duration"] = fmt_dur((stop or beat or now_utc()) - start) if start else ""
     d["last_seen"] = beat or stop or start
@@ -1005,20 +1681,36 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
     d["rate"] = None            # step/sec
     d["remaining_sec"] = None
     d["eta"] = None
+    d["rate_source"] = None     # "recent" = 直近の区間 / "average" = 開始からの平均
+    d["paused"] = bool(rec.get("proc_state") == "stopped" and d["state"] == "running")
     t_ref = beat or stop
     if d["state"] == "running" and start and t_ref and t_last and t_max:
         elapsed = (t_ref - start).total_seconds()
         if elapsed > 0 and t_last > 0 and t_last < t_max:
-            rate = t_last / elapsed
+            # 直近の区間ペースを優先する。開始からの平均は、一時停止やスリープで
+            # 止まっていた時間まで含むので、終了予定が何日も先に出てしまう
+            rate = recent_rate(rec, t_ref, t_last)
+            d["rate_source"] = "recent" if rate else None
+            if not rate:
+                rate = t_last / elapsed
+                d["rate_source"] = "average"
             if rate > 0:
                 d["rate"] = rate
                 d["remaining_sec"] = (t_max - t_last) / rate
-                d["eta"] = t_ref + timedelta(seconds=d["remaining_sec"])
+                # 一時停止中は「いつ再開するか」が分からないので時刻は出さない
+                # (残り時間だけ出す。再開すればその時点から残り時間で終わる)
+                if not d["paused"]:
+                    d["eta"] = t_ref + timedelta(seconds=d["remaining_sec"])
     # map を必ず含める。入れないと 3agent 8M iql が map_5x4 / map_8x5 / map_aoba01 を
     # 1 条件に混ぜてしまい、「done seeds」が別マップ混在の一覧になる
     d["condition"] = "%sagent %s %sM | %s | %s | %s | %s" % (
         d["agents"], d["map"], d["group_m"], d["algo"], d["setting"],
         d["task_arrival"], d["task_assign"] or "-")
+    # 再割当ありは別条件。入れないと、再割当なしで 5 seed そろった条件に
+    # 再割当ありの run が混ざり、params✗ (同じ条件なのに設定が違う) の判定で
+    # どちらかが少数派扱いになる。なしのときは何も足さない (既存の条件名と互換)
+    if d["reassign"]:
+        d["condition"] += " | reassign"
     return d
 
 
@@ -1037,6 +1729,203 @@ def _script_source():
         return f.read()
 
 
+# ---- 学習曲線 (sacred の metrics.json) -----------------------------------------
+# ダッシュボードの「学習曲線」タブ用。TensorBoard の event ファイルは読まない
+# (リモートに tensorboard が無いと黙って空になる)。sacred の metrics.json は
+# 1 run 数十 MB あるので、**読むのは変わった run だけ**にする (fetch_metric_curves の
+# キャッシュ、export_drop の状態ファイル)。持ち帰るのは間引いた点列だけ
+CURVE_KEYS = ("test_task_completion_mean", "test_goal_mean",
+              "test_collision_mean", "test_return_mean")
+CURVE_MAX_POINTS = 600
+CURVE_CACHE_NAME = ".curve_cache.json"
+
+
+def _curve_val(v):
+    """metrics.json の値は普通は float。numpy が jsonpickle された形 ({"value": ...}) も受ける."""
+    if isinstance(v, dict):
+        v = v.get("value", v.get("py/reduce"))
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_metric_curves(run_dir, keys=CURVE_KEYS, max_points=CURVE_MAX_POINTS):
+    """{指標: [[t_env, ...], [値, ...]]} を返す. metrics.json が読めなければ None."""
+    try:
+        with open(os.path.join(run_dir, "metrics.json")) as f:
+            m = json.load(f)
+    except (OSError, IOError, ValueError):
+        return None
+    out = {}
+    for k in keys:
+        e = m.get(k)
+        if not isinstance(e, dict):
+            continue
+        st, va = e.get("steps") or [], e.get("values") or []
+        n = min(len(st), len(va))
+        if not n:
+            continue
+        if n > max_points > 1:
+            idx = sorted(set(int(round(i * (n - 1) / float(max_points - 1)))
+                             for i in range(max_points)))
+        else:
+            idx = range(n)
+        out[k] = [[st[i] for i in idx], [_curve_val(va[i]) for i in idx]]
+    return out
+
+
+def cmd_dump_curves(dirs):
+    """--dump-curves: run ディレクトリごとに 1 行の JSON を吐く (ssh 越しに呼ぶ)."""
+    for d in dirs:
+        d = os.path.expanduser(d)
+        sys.stdout.write(json.dumps({"run_dir": d, "m": read_metric_curves(d)},
+                                    ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def _curve_file_name(uid):
+    import hashlib
+    return "curves/%s.json" % hashlib.sha1(uid.encode("utf-8")).hexdigest()[:16]
+
+
+def export_curves_drop(records, drop_dir, state_path=None, dry_run=False):
+    """共有フォルダのホスト (黒) 側: 学習曲線を drop_dir/curves/ に書き出す.
+
+    metrics.json の更新時刻が前回の書き出しから変わった run だけを読み直す
+    (状態は state_path に持つ)。書き出した場所は rec["curve_file"] に入れ、
+    runs.jsonl に載せて集約側 (白) に伝える。
+    """
+    state_path = os.path.expanduser(state_path or "~/.ldrp/curve_export_state.json")
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (OSError, IOError, ValueError):
+        state = {}
+    n_new = 0
+    for rec in records:
+        if rec.get("kind") in ("batch", "host") or not rec.get("run_dir"):
+            continue
+        p = os.path.join(rec["run_dir"], "metrics.json")
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        rel = _curve_file_name(rec["uid"])
+        dst = os.path.join(drop_dir, rel)
+        if state.get(rec["uid"]) == mt and os.path.exists(dst):
+            rec["curve_file"] = rel
+            continue
+        if dry_run:
+            n_new += 1
+            continue
+        m = read_metric_curves(rec["run_dir"])
+        if not m:
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst))
+        except OSError:
+            pass
+        tmp = dst + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"uid": rec["uid"], "m": m}, f)
+        os.replace(tmp, dst)
+        state[rec["uid"]] = mt
+        rec["curve_file"] = rel
+        n_new += 1
+    if not dry_run:
+        try:
+            os.makedirs(os.path.dirname(state_path))
+        except OSError:
+            pass
+        with open(state_path + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.replace(state_path + ".tmp", state_path)
+    sys.stderr.write("[export] %d learning curve(s) updated%s\n"
+                     % (n_new, " (dry run)" if dry_run else ""))
+    return n_new
+
+
+def fetch_metric_curves(hosts, rows, cache_path, drop_root=None, timeout=600):
+    """集約側 (白): rows の run の学習曲線を集めて cache_path に貯める.
+
+    取り直すのは「まだ無い」「前回から進んだ (t_last が変わった)」「状態が変わった」run だけ。
+    返り値: キャッシュ全体 {uid: {"t": t_last, "state": 状態, "m": {指標: [[x], [y]]}}}
+    """
+    try:
+        with open(cache_path) as f:
+            cache = json.load(f)
+    except (OSError, IOError, ValueError):
+        cache = {}
+    host_by_label = dict((h["label"], h) for h in hosts)
+    need = {}
+    for d in rows:
+        if d.get("state") not in ("done", "running", "stalled") or not d.get("run_dir"):
+            continue
+        c = cache.get(d["uid"])
+        if c and c.get("t") == d.get("t_last") and c.get("state") == d.get("state"):
+            continue
+        need.setdefault(d.get("machine"), []).append(d)
+    got = 0
+    for label, ds in need.items():
+        host = host_by_label.get(label)
+        if host is None:
+            continue
+        res = {}                                   # uid -> m
+        if host.get("drop"):
+            base = drop_dir_for(host, drop_root)
+            for d in ds:
+                if not base or not d.get("curve_file"):
+                    continue                       # 相手のスクリプトが旧版 (まだ書き出していない)
+                p = os.path.join(base, d["curve_file"])
+                try:
+                    tmp = p + ".read"
+                    copy_cloud_file(p, tmp)
+                    with open(tmp) as f:
+                        res[d["uid"]] = json.load(f).get("m")
+                    os.remove(tmp)
+                except (OSError, IOError, ValueError):
+                    continue
+        elif host.get("ssh") in (None, "", "local"):
+            for d in ds:
+                res[d["uid"]] = read_metric_curves(d["run_dir"])
+        else:
+            by_dir = dict((d["run_dir"], d["uid"]) for d in ds)
+            dirs = list(by_dir)
+            for i in range(0, len(dirs), 40):      # 引数が長くなりすぎないよう分ける
+                args = []
+                for d in dirs[i:i + 40]:
+                    args += ["--dump-curves", d]     # action="append" なので 1 つずつ付ける
+                recs, err = _collect_ssh_run(host, host.get("python") or "python3",
+                                             args, timeout, False, False)
+                if err:
+                    sys.stderr.write("[curves] %s: %s\n" % (label, err[:300]))
+                    break
+                for r in recs:
+                    if r.get("run_dir") in by_dir:
+                        res[by_dir[r["run_dir"]]] = r.get("m")
+        for d in ds:
+            if d["uid"] not in res:
+                continue                           # 届かなかった。次の収集で取り直す
+            if not res[d["uid"]] and d.get("state") == "running":
+                continue                           # 書き込み中の metrics.json を読んだだけ。次で取り直す
+            # metrics.json が無い・壊れている run も「読んだ」と覚える (毎回取りに行かない)。
+            # 進めば t_last が変わるので取り直される
+            cache[d["uid"]] = {"t": d.get("t_last"), "state": d.get("state"),
+                               "m": res[d["uid"]] or {}}
+            got += 1
+    if got:
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, cache_path)
+    if need:
+        sys.stderr.write("[curves] updated %d / %d run(s)\n"
+                         % (got, sum(len(v) for v in need.values())))
+    return cache
+
+
 def collect_local(host, tail_bytes, curves=None, curve_max_points=0):
     recs = []
     scan(host.get("repos") or ["."],
@@ -1044,7 +1933,10 @@ def collect_local(host, tail_bytes, curves=None, curve_max_points=0):
          host["label"], tail_bytes, recs.append,
          model_subdirs=host.get("model_subdirs") or list(DEFAULT_MODEL_SUBDIRS),
          curve_metrics=curves, curve_max_points=curve_max_points,
-         tb_subdirs=host.get("tb_subdirs") or list(DEFAULT_TB_SUBDIRS))
+         tb_subdirs=host.get("tb_subdirs") or list(DEFAULT_TB_SUBDIRS),
+         # 返却済みマシンのバックアップ (M2) を白で読むときは、白の稼働率を
+         # M2 の値として出さない
+         with_host=host.get("host_stats", True))
     return recs, None
 
 
@@ -1087,6 +1979,56 @@ def collect_ssh(host, tail_bytes, timeout, verbose=False, only_dirs=None,
     for sub in host.get("model_subdirs") or []:
         remote_args += ["--model-subdir", sub]
     return _collect_ssh_run(host, py, remote_args, timeout, verbose, multiplex)
+
+
+def pull_eval_logs(hosts, repo=None, timeout=120, verbose=False):
+    """別マシンで回した方策評価のログ (*.txt) を手元の logs/ に取ってくる.
+
+    collect_config.yaml の host に `eval_logs: ~/LDRP_eval/logs` のように書いたものだけが対象。
+    ダッシュボードは手元の logs/ の [RESULT] 行しか読まないので、取ってくれば評価表に出る。
+    何か新しく届いたときだけ aggregate.py --csv で results/summary.csv を作り直す。
+    返り値: [(host label, エラー文)]
+    """
+    repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    errors, changed = [], False
+    for h in hosts:
+        src = h.get("eval_logs")
+        if not src or h.get("ssh") in (None, "", "local"):
+            continue
+        rel = src[2:] if src.startswith("~/") else src       # rsync のリモート側は ~ を展開しない
+        ssh = ["ssh", "-o", "BatchMode=yes"]
+        for opt in h.get("ssh_options") or []:
+            ssh += ["-o", opt]
+        ssh += ["-o", "ConnectTimeout=%d" % int(h.get("connect_timeout", 8))]
+        if h.get("port"):
+            ssh += ["-p", str(h["port"])]
+        cmd = ["rsync", "-az", "--itemize-changes", "-e", " ".join(ssh),
+               "--include", "*/", "--include", "*.txt", "--exclude", "*",
+               "%s:%s/" % (h["ssh"], rel.rstrip("/")), os.path.join(repo, "logs") + "/"]
+        if verbose:
+            sys.stderr.write("  $ %s\n" % " ".join(cmd))
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            errors.append((h.get("label"), "eval log pull: %s" % e))
+            continue
+        if p.returncode == 23 and "No such file or directory" in p.stderr:
+            continue                        # まだ一度も評価を回していないマシン
+        if p.returncode != 0:
+            errors.append((h.get("label"), "eval log pull: rsync rc=%d %s"
+                           % (p.returncode, p.stderr.strip()[-200:])))
+            continue
+        # 届いたファイルは "<f+++" / ">f.st" のように f で始まる行になる
+        got = [l for l in p.stdout.splitlines() if l[1:2] == "f"]
+        if got:
+            changed = True
+            sys.stderr.write("[eval-logs] %s: %d file(s) updated\n" % (h.get("label"), len(got)))
+    if changed:
+        subprocess.run([sys.executable, os.path.join(repo, "aggregate.py"),
+                        "--root", os.path.join(repo, "logs"),
+                        "--csv", os.path.join(repo, "results", "summary.csv")],
+                       cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return errors
 
 
 def _collect_ssh_run(host, py, remote_args, timeout, verbose, multiplex):
@@ -1158,15 +2100,28 @@ def collect_drop(host, drop_root, stale_hours=24):
     except OSError:
         pass
 
-    recs = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    recs.append(json.loads(line))
-                except ValueError:
-                    pass
+    # iCloud が同期している最中のファイルを読むと Errno 11 (Resource deadlock avoided)
+    # で落ちる。以前はこれで収集全体が止まっていた (launchd のログに 334 回)。
+    # 少し待って読み直し、それでもだめならこのホストだけ諦めて次の回に回す
+    recs = None
+    for attempt in range(3):
+        try:
+            got = []
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("{"):
+                        try:
+                            got.append(json.loads(line))
+                        except ValueError:
+                            pass
+            recs = got
+            break
+        except OSError as e:
+            err = e
+            time.sleep(2 * (attempt + 1))
+    if recs is None:
+        return [], "cannot read %s (iCloud busy?): %s" % (path, err)
     mtime = os.path.getmtime(path)
     # 書き出された時刻をそのまま観測時刻にする。相手が --export した瞬間の
     # スナップショットなので、それ以降の経過は「情報が届いていない」であって
@@ -1219,6 +2174,30 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
         copied += 1
         todo.append((rec, out_dir, files))
 
+    # LaRe-Path のモデル (.pth)。1 本 25KB 程度なので容量の上限には数えない。
+    # ファイル名に条件が全部入っているので、共有フォルダでは lare/ の下に平らに置く。
+    # export_path は runs.jsonl に載せるので、進捗ファイルより先に決める
+    lare_todo = []
+    for rec in records:
+        lr = rec.get("lare")
+        if not lr or rec.get("uid") not in by_uid:
+            continue
+        lr["export_path"] = os.path.join("lare", lr["name"])
+        dst = os.path.join(drop_dir, lr["export_path"])
+        try:
+            if os.path.getsize(dst) == lr.get("size"):
+                continue                      # 同じものが置いてある
+        except OSError:
+            pass
+        lare_todo.append((os.path.join(rec.get("repo") or ".", lr["rel"]), dst))
+
+    # 学習曲線 (ダッシュボードの「学習曲線」タブ用)。書き出した場所を runs.jsonl に
+    # 載せるので、進捗ファイルより先に済ませる。変わった run だけ読むので 2 回目以降は軽い
+    try:
+        export_curves_drop(records, drop_dir, dry_run=dry_run)
+    except Exception as e:                    # 曲線が書けなくても進捗は必ず届ける
+        sys.stderr.write("[export] curves: %s: %s\n" % (type(e).__name__, e))
+
     # --- 進捗ファイルを **先に** 書く ---------------------------------------
     # 440KB の runs.jsonl を 90MB のモデル転送の後ろに置くと、iCloud の
     # アップロードが詰まったときに進捗だけ先に届けられない。実測で
@@ -1254,9 +2233,25 @@ def export_drop(records, rows, drop_dir, what="path", with_optimizer=False,
                 sys.stderr.write("[export] skipped %s: %s\n"
                                  % (os.path.basename(out_dir), e))
 
-    sys.stderr.write("[export] %d run(s), %d model dir(s) newly copied (%.1f MB) -> %s%s\n"
+    lare_moved = 0
+    if not dry_run:
+        for src, dst in lare_todo:
+            try:
+                try:
+                    os.makedirs(os.path.dirname(dst))
+                except OSError:
+                    pass
+                shutil.copy2(src, dst)
+                lare_moved += 1
+            except (OSError, IOError) as e:
+                sys.stderr.write("[export] skipped LaRe %s: %s\n"
+                                 % (os.path.basename(dst), e))
+
+    sys.stderr.write("[export] %d run(s), %d model dir(s) newly copied (%.1f MB), "
+                     "%d LaRe model(s) -> %s%s\n"
                      % (len(records), moved if not dry_run else copied,
-                        total, drop_dir, " (dry run)" if dry_run else ""))
+                        total, lare_moved if not dry_run else len(lare_todo),
+                        drop_dir, " (dry run)" if dry_run else ""))
     return copied
 
 
@@ -1612,6 +2607,9 @@ def dashboard_data(rows, batches, errors, saved=None, cadence=None):
             "duration": d.get("duration"),
             "eta": d["eta"].isoformat() if d.get("eta") else None,
             "remaining_sec": d.get("remaining_sec"),
+            "paused": d.get("paused"),
+            # train.py の予約の何本目か (例: 2 / 5)。予約から起動していなければ None
+            "batch_pos": d.get("batch_pos"), "batch_total": d.get("batch_total"),
             "last_seen": d["last_seen"].isoformat() if d.get("last_seen") else None,
             # 実際に終わった / 止まった時刻。last_seen は heartbeat 優先なので、
             # 「いつ完了したか」を出すには stop_time そのものが要る
@@ -1950,8 +2948,8 @@ def eval_model_stem(d):
       + task_assign                       72 通り (衝突 12)
       + dynamic                           84 通り (衝突 0)  <- これ
     入れない軸と理由:
-      task_arrival  計画内は "bernoulli, mmpp" の 1 種しかない
-      reassign      今回の計画から除外。枠 (_base) は残してある
+      task_arrival  計画内は "bernoulli, mmpp p=<下限>-<上限>" (学習時の p の範囲)
+      reassign      末尾の reassign_tag で区別する (再割当ありで学習 = reassign / なし = base)
       LaRe 系列     map + N が系列を一意に決めるので method_tag で足りる
                     (計画外の系列は manifest.jsonl 側で判別する)
       t_max         map + N から決まる
@@ -1966,21 +2964,48 @@ def eval_model_stem(d):
         parts.append(assign.lower())
     if d.get("dynamic_agents"):
         parts.append("dyn")
-    parts.append("base")                        # reassign_tag
+    # reassign_tag。再割当ありで学習した run は "reassign" にして、再割当なしの
+    # モデル (…_base_seedK.th) を上書きしないようにする (test.py の引数 reassign で読み分ける)
+    parts.append("reassign" if d.get("reassign") else "base")
     return "_".join(parts)
 
 
+# 評価用モデルのファイル名の形式。collect_config.yaml の `eval_naming` で切り替える。
+#   "template" (既定): テンプレートの LDRP (研究室配布版) の評価が読む形。
+#                      src/all_policy/policy.py が models/safe/{map}_{N}_{algo}.th を開くので、
+#                      seed 番号 0 はその名前、1 以降は _seed{i} を付けて並べる
+#   "ldrp":            この LDRP の評価 (policy.py の model_stem / resolve_model_path) が読む形。
+#                      {map}_{N}_{algo}[_{tag}][_{assign}][_dyn]_base_seed{i}.th
+# どちらでも「どの run を同じ条件として seed 番号を振るか」は eval_model_stem() で決める
+# (ファイル名の形式だけが変わる)。
+EVAL_NAMINGS = ("template", "ldrp")
+EVAL_NAMING = "template"
+
+
+def set_eval_naming(name):
+    """設定の eval_naming を反映する。未知の値は既定のまま警告する."""
+    global EVAL_NAMING
+    name = str(name or "template").strip().lower()
+    if name not in EVAL_NAMINGS:
+        sys.stderr.write("[config] unknown eval_naming %r; using 'template' (choose from %s)\n"
+                         % (name, ", ".join(EVAL_NAMINGS)))
+        name = "template"
+    EVAL_NAMING = name
+    return name
+
+
 def eval_model_filename(d, seed_index=None):
-    """評価側がそのまま読めるファイル名。
+    """評価側がそのまま読めるファイル名。形式は EVAL_NAMING で決まる.
 
     末尾の seed は **学習時の生 seed ではなく 0 始まりの通し番号**。
-    policy.py の resolve_model_path(stem, model_seed=0) が
-    "{stem}_seed{model_seed}.th" を探し、model_seed の既定が 0 だから。
-    生 seed (9 桁) を入れると test.py に --model-seed 113162076 と
-    打つことになり噛み合わない。生 seed は manifest.jsonl に残す。
+    評価側は model_seed=0 (= 番号 0) を既定で読むので、生 seed (9 桁) を入れると
+    噛み合わない。生 seed は manifest.jsonl に残す。
     """
     n = d.get("seed") if seed_index is None else seed_index
-    return "%s_seed%s.th" % (eval_model_stem(d), n)
+    if EVAL_NAMING == "ldrp":
+        return "%s_seed%s.th" % (eval_model_stem(d), n)
+    base = "%s_%s_%s" % (d.get("map"), d.get("agents"), d.get("algo"))
+    return (base + ".th") if str(n) == "0" else "%s_seed%s.th" % (base, n)
 
 
 def assign_seed_indexes(planned, repo_dir=None, conds=None, planned_only=True):
@@ -2086,6 +3111,19 @@ def check_seed_order(planned, conds, seed_idx):
 
 
 SEEN_PATH = "tools/.host_seen.json"
+
+# ダッシュボードで「5 seed に数えない」にした run。{uid: 除外した時刻}。
+# tools/dashboard/app.py の EXCLUDE_PATH と同じファイル (書くのはあちら、読むのはこちら)。
+# launchd から呼ばれても場所がずれないよう、このファイルの場所から決める
+EXCLUDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".run_excluded.json")
+
+
+def load_excluded(path=EXCLUDE_PATH):
+    try:
+        with open(path, "r") as f:
+            return json.load(f) or {}
+    except (IOError, OSError, ValueError):
+        return {}
 SEEN_KEEP = 40
 
 
@@ -2183,12 +3221,21 @@ def load_saved_models(repo_dir):
     return out
 
 
-def load_seed_index(repo_dir):
+def load_seed_index(repo_dir, excluded=None):
     """manifest.jsonl から stem -> {生 seed: 通し番号} を復元する。
 
     **一度振った番号は変えない**。評価スクリプトの --model-seed も論文の表も
     その番号を指しているので、後から詰め直すと過去の記録とずれる。
+
+    ただし**ダッシュボードで除外した run の番号は空き番号として返す**。
+    除外した run は使わないので、その番号 (= 計画表の行) を回し直した run に
+    引き継がせる。こうすると評価用のモデル (…_seed3.th) も評価ログ
+    (…_seed3.txt) も同じ名前で上書きされ、集計に古い結果が残らない。
+    除外していない run の番号は動かないので、上の原則とは矛盾しない。
+    excluded を渡さなければ EXCLUDE_PATH を読む。
     """
+    if excluded is None:
+        excluded = load_excluded()
     table = {}
     path = os.path.join(repo_dir, "manifest.jsonl")
     if not os.path.exists(path):
@@ -2205,6 +3252,8 @@ def load_seed_index(repo_dir):
             stem, idx = rec.get("eval_stem"), rec.get("seed_index")
             if stem is None or idx is None:
                 continue
+            if rec.get("uid") in excluded:
+                continue                  # この番号は空き扱い (回し直した run が入る)
             table.setdefault(stem, {})[str(rec.get("seed"))] = int(idx)
     return table
 
@@ -2345,6 +3394,41 @@ def copy_cloud_file(src, dst):
         pass
 
 
+def copy_cloud_file_checked(src, dst, tries=3, wait=5.0):
+    """copy_cloud_file の後で大きさを確かめ、合わなければやり直す.
+
+    同期の途中 (実体がまだ届いていない) のファイルをコピーすると、例外を出さずに
+    **0 バイトのファイル**ができることがある (実測: 黒 24 件・M2 5 件)。
+    回収済みの判定は「ディレクトリが空でないか」なので、0 バイトのまま残ると
+    二度と取り直されない。合わなければ消して False を返す (次の回で取り直す)。
+    """
+    import time
+    want = os.path.getsize(src)
+    for k in range(tries):
+        try:
+            copy_cloud_file(src, dst)
+        except OSError:
+            pass
+        if os.path.exists(dst) and os.path.getsize(dst) == want and want > 0:
+            return True
+        if k + 1 < tries:
+            time.sleep(wait)
+    try:
+        os.remove(dst)
+    except OSError:
+        pass
+    return False
+
+
+def local_copy_ok(path, size=None):
+    """回収済みのファイルが使える状態か (0 バイトでない・大きさが記録と一致)."""
+    try:
+        got = os.path.getsize(path)
+    except OSError:
+        return False
+    return got > 0 and (not size or got == size)
+
+
 def _fetch_drop(host, drop_root, items):
     """共有フォルダに置かれたモデルをコピーする (--export 済みのホスト用)."""
     import shutil
@@ -2364,7 +3448,10 @@ def _fetch_drop(host, drop_root, items):
                 os.makedirs(os.path.dirname(dst))
             except OSError:
                 pass
-            copy_cloud_file(src, dst)
+            if not copy_cloud_file_checked(src, dst):
+                sys.stderr.write("[fetch] %s: %s/%s did not copy completely "
+                                 "(still syncing?); will retry next round\n"
+                                 % (host["label"], export_dir, sub))
     return None
 
 
@@ -2847,7 +3934,7 @@ def purge_drop_models(planned, hosts, drop_root, dry_run=False):
         b = drop_dir_for(h, drop_root)
         if b:
             bases[h["label"]] = b
-    removed, freed, kept = 0, 0, 0
+    removed, freed, kept, already = 0, 0, 0, 0
     for d, out_dir, files in planned:
         base = bases.get(d.get("machine"))
         export_dir = (d.get("model") or {}).get("export_dir")
@@ -2867,8 +3954,11 @@ def purge_drop_models(planned, hosts, drop_root, dry_run=False):
                 ok = False
                 break
             targets.append(src)
-        if not ok or not targets:
+        if not ok:
             kept += 1
+            continue
+        if not targets:
+            already += 1                      # 前の回で消し済み (.fetched だけ残っている)
             continue
         for t in targets:
             freed += os.path.getsize(t)
@@ -2885,8 +3975,8 @@ def purge_drop_models(planned, hosts, drop_root, dry_run=False):
             except OSError:
                 pass
     sys.stderr.write("[purge] %d model dir(s) cleared (%.1f MB freed), "
-                     "%d kept because the local copy did not match%s\n"
-                     % (removed, freed / 1e6, kept,
+                     "%d already cleared, %d kept because the local copy did not match%s\n"
+                     % (removed, freed / 1e6, already, kept,
                         " (dry run)" if dry_run else ""))
     return removed
 
@@ -2913,10 +4003,18 @@ def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
         out_dir = os.path.join(dest, str(d.get("machine")), model_dest_name(d))
         files = select_model_files(model, what, with_optimizer, with_mixer,
                                    with_critic)
-        if os.path.isdir(out_dir) and os.listdir(out_dir):
+        # 置いてあるファイルが 0 バイト・大きさ違いなら取り直す (上書きになる)。
+        # 置いていないファイルは問わない (送信側で欠けている run を毎回取りに行かないため)
+        broken = [sub for _r, sub, z in files
+                  if os.path.exists(os.path.join(out_dir, sub))
+                  and not local_copy_ok(os.path.join(out_dir, sub), z)]
+        if os.path.isdir(out_dir) and os.listdir(out_dir) and not broken:
             skipped += 1
             present.append((d, out_dir, files))
             continue
+        if broken:
+            sys.stderr.write("[fetch] re-fetching %s: incomplete local copy (%s)\n"
+                             % (os.path.relpath(out_dir, dest), ", ".join(broken)))
         if not files:
             continue
         size_mb = sum(z for _r, _s, z in files) / 1e6
@@ -2993,6 +4091,108 @@ def fetch_models(hosts, rows, dest, what="path", with_optimizer=False,
             shutil.rmtree(tmp_dir, ignore_errors=True)
     sys.stderr.write("[fetch] fetched %d run(s) into %s\n" % (fetched, dest))
     return present + planned, fetched
+
+
+# 他のマシンで学習した LaRe-Path のモデルの置き場 (gitignore)。
+# 使うときは src/lare/path/models/ へコピーする (pretrained / finetuning は models/ から読む)。
+# checkpoints/ に混ぜないのは、この Mac で同じ条件を回したときの autosave と
+# 同じ名前になって上書きし合うため
+LARE_FETCH_DIR = os.path.join("src", "lare", "path", "fetched")
+
+
+def fetch_lare_models(hosts, rows, dest_repo, timeout=300, dry_run=False, drop_root=None):
+    """完了した run の LaRe-Path のモデルを {dest_repo}/src/lare/path/fetched/{マシン}/ に集める.
+
+    共有フォルダのホスト (黒) は lare/ に書き出されたものを、ssh のホスト (GPU) は
+    tar で取る。この Mac (local) で同じリポジトリのものは手元にあるので取らない。
+    """
+    import shutil
+    import tempfile
+    dest_repo = os.path.abspath(os.path.expanduser(dest_repo))
+    host_by_label = dict((h["label"], h) for h in hosts)
+    todo = {}
+    for d in rows:
+        lr = d.get("lare")
+        if d.get("state") != "done" or not lr:
+            continue
+        host = host_by_label.get(d.get("machine"))
+        if host is None:
+            continue
+        local = not host.get("drop") and host.get("ssh") in (None, "", "local")
+        if local and os.path.abspath(os.path.expanduser(d.get("repo") or "")) == dest_repo:
+            continue                              # この Mac の checkpoints/ にある
+        dst = os.path.join(dest_repo, LARE_FETCH_DIR, str(d.get("machine")), lr["name"])
+        try:
+            if os.path.getsize(dst) == lr.get("size"):
+                continue                          # 取得済み
+        except OSError:
+            pass
+        todo.setdefault(d.get("machine"), []).append((d, lr, dst))
+    n_want = sum(len(v) for v in todo.values())
+    if dry_run or not n_want:
+        for label, items in todo.items():
+            for _d, lr, _dst in items:
+                sys.stderr.write("  would fetch LaRe %s from %s\n" % (lr["name"], label))
+        if n_want:
+            sys.stderr.write("[lare] %d LaRe model(s) to fetch (dry run)\n" % n_want)
+        return 0
+
+    def _put(src, dst, copy):
+        try:
+            os.makedirs(os.path.dirname(dst))
+        except OSError:
+            pass
+        copy(src, dst)
+
+    got = 0
+    for label, items in todo.items():
+        host = host_by_label[label]
+        if host.get("drop"):
+            base = drop_dir_for(host, drop_root)
+            for _d, lr, dst in items:
+                # 相手のスクリプトが旧版だと export_path が無い (まだ書き出されていない)
+                src = os.path.join(base or "", lr.get("export_path") or "")
+                if not base or not lr.get("export_path") or not os.path.exists(src):
+                    continue
+                try:
+                    _put(src, dst, copy_cloud_file)
+                    got += 1
+                except (OSError, IOError) as e:
+                    sys.stderr.write("[lare] %s: %s: %s\n" % (label, lr["name"], e))
+            continue
+        if host.get("ssh") in (None, "", "local"):
+            for d, lr, dst in items:
+                src = os.path.join(os.path.expanduser(d.get("repo") or ""), lr["rel"])
+                try:
+                    _put(src, dst, shutil.copy2)
+                    got += 1
+                except (OSError, IOError) as e:
+                    sys.stderr.write("[lare] %s: %s: %s\n" % (label, lr["name"], e))
+            continue
+        # ssh: リポジトリごとに tar 1 本で受ける
+        by_repo = {}
+        for d, lr, dst in items:
+            repo = d.get("repo") or (host.get("repos") or ["."])[0]
+            by_repo.setdefault(repo, []).append((lr, dst))
+        for repo, its in by_repo.items():
+            tmp_dir = tempfile.mkdtemp(prefix=".lare_fetch_")
+            try:
+                err = _fetch_ssh(host, repo,
+                                 [(lr["rel"], lr["rel"], lr["size"]) for lr, _dst in its],
+                                 tmp_dir, timeout)
+                if err:
+                    sys.stderr.write("[lare] %s: %s\n" % (label, err))
+                    continue
+                for lr, dst in its:
+                    src = os.path.join(tmp_dir, lr["rel"])
+                    if os.path.exists(src):
+                        _put(src, dst, shutil.move)
+                        got += 1
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    sys.stderr.write("[lare] fetched %d / %d LaRe model(s) into %s\n"
+                     % (got, n_want, os.path.join(dest_repo, LARE_FETCH_DIR)))
+    return got
 
 
 SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -3088,10 +4288,30 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
     repo_dir = os.path.abspath(os.path.expanduser(repo_dir))
     published = skipped = 0
     lines = []
-    refused, tmax_warn, unplanned = 0, 0, 0
+    refused, tmax_warn, unplanned, lare_only, broken_src = 0, 0, 0, 0, 0
+    # 「LaRe モデル学習」の条件 (計画表の <!-- collect: lare -->) は LaRe の .pth が
+    # 目当てで、方策モデルは使わない。そこにしか一致しない run の方策は保管しない
+    lare_conds = [c for c in (conds or []) if c.get("collect") == "lare"]
+    conds = [c for c in (conds or []) if c.get("collect") != "lare"] if lare_conds else conds
 
     if seed_idx is None:
         seed_idx = assign_seed_indexes(planned, repo_dir, conds, planned_only)
+    # 保管済みのファイルが、どの run のものか (manifest の files -> uid)。
+    # 除外した run の番号は空き番号として回し直した run に引き継がれる (load_seed_index)。
+    # そのとき同じ名前のファイルが「除外した run のもの」として残っているので、
+    # 名前があるだけで「保管済み」とみなすと、回し直した run がいつまでも保管されない
+    owner = {}
+    excluded_uids = set(load_excluded())
+    mpath = os.path.join(repo_dir, "manifest.jsonl")
+    if os.path.exists(mpath):
+        with open(mpath) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                for rel in rec.get("files") or []:
+                    owner[rel] = rec.get("uid")
     if planned_only and not conds:
         # 計画が 1 条件も読めていないのに planned_only で走らせると、
         # 「計画に無い」と判定されて **1 つも保管されない**。
@@ -3114,6 +4334,9 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
         # この run が属する計画。複数に一致したらそれぞれへ置く
         # (ファイルの中身は同じなので git は 1 blob しか持たない)
         names = plans_of(d, conds)
+        if not names and lare_conds and plans_of(d, lare_conds):
+            lare_only += 1
+            continue
         if planned_only and not names:
             unplanned += 1
             continue
@@ -3125,6 +4348,10 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
             if os.path.basename(sub).endswith("opt.th"):
                 continue
             src = os.path.join(out_dir, sub)
+            # 0 バイト (回収が途中で切れたもの) は置かない。次の回収で取り直される
+            if os.path.exists(src) and not local_copy_ok(src):
+                broken_src += 1
+                continue
             # dry run では回収前なのでファイルがまだ無い。配置先だけ見せる
             if os.path.exists(src) or dry_run:
                 for pn in targets:
@@ -3132,7 +4359,13 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
                                  publish_names(d, sub, s_idx)))
         if not srcs:
             continue
-        if all(os.path.exists(os.path.join(repo_dir, r, n)) for _s, r, n in srcs):
+        # 置き換えるのは「同じ名前のファイルの持ち主が除外した run」のときと、
+        # 置いてあるものが回収元と大きさが違う (0 バイトで置かれた) ときだけ
+        if all(os.path.exists(os.path.join(repo_dir, r, n))
+               and owner.get("%s/%s" % (r, n)) not in excluded_uids
+               and (dry_run or not os.path.exists(s)
+                    or os.path.getsize(os.path.join(repo_dir, r, n)) == os.path.getsize(s))
+               for s, r, n in srcs):
             skipped += 1
             continue
         for _s, r, n in srcs:
@@ -3196,8 +4429,14 @@ def publish_models(planned, repo_dir, dry_run=False, hint=True, seed_idx=None,
     sys.stderr.write("[publish] %d placed, %d already there -> %s%s\n"
                      % (published, skipped, repo_dir,
                         " (dry run)" if dry_run else ""))
+    if broken_src:
+        sys.stderr.write("[publish] %d file(s) skipped: empty local copy "
+                         "(will be placed after it is re-fetched)\n" % broken_src)
     if unplanned:
         sys.stderr.write("[publish] %d run(s) skipped: not in any plan\n" % unplanned)
+    if lare_only:
+        sys.stderr.write("[publish] %d run(s) skipped: LaRe-model runs (policy not kept)\n"
+                         % lare_only)
     if refused:
         sys.stderr.write("[publish] %d run(s) skipped: not finished cleanly\n" % refused)
     if tmax_warn:
@@ -3785,12 +5024,14 @@ def quick_check(conf, hosts, cache_path, tail_bytes, timeout, stale, tag_map,
     if not fresh:
         return 0
 
-    # 軽い問い合わせでは repo / model を取らないので、キャッシュの値を残す
+    # 軽い問い合わせでは repo / model を取らないので、キャッシュの値を残す。
+    # 終了予定の記録点も derive() より先に引き継ぐ (直近ペースで予定を出すため)
     for r in fresh:
         old_rec = by_uid.get(r.get("uid")) or {}
         for k in ("repo", "model"):
             if not r.get(k) and old_rec.get(k):
                 r[k] = old_rec[k]
+        carry_progress_samples(r, old_rec)
 
     rows = [derive(r, stale, tag_map, lare_chain=conf.get("lare_chain"))
             for r in fresh]
@@ -3845,7 +5086,7 @@ NOTIFY_PROBLEM_STATES = ("failed", "stalled", "short")
 
 
 def one_line(d):
-    return "seed %s @%s (%sagent %s %sM %s)" % (
+    return "seed %s @%s (%s台 %s %sM %s)" % (
         d.get("seed"), d.get("machine"), d.get("agents"), d.get("map"),
         d.get("group_m"), d.get("algo"))
 
@@ -3871,14 +5112,16 @@ def notify_transitions(rows, prev_states, max_lines=3):
     def summary(items):
         head = [one_line(d) for d in items[:max_lines]]
         if len(items) > max_lines:
-            head.append("+%d more" % (len(items) - max_lines))
+            head.append("他 %d 件" % (len(items) - max_lines))
         return " / ".join(head)
 
+    # デスクトップ通知は自分だけが見るものなので日本語で出す
+    # (CLAUDE.md の「出力は英語」はログ・例外・CLI ヘルプが対象)
     if finished:
-        notify("LDRP", "Training finished (%d)" % len(finished),
+        notify("LDRP", "学習が終了しました (%d 件)" % len(finished),
                summary(finished), sound="Glass")
     if problems:
-        notify("LDRP", "Runs need attention (%d)" % len(problems),
+        notify("LDRP", "要確認の run があります (%d 件)" % len(problems),
                summary(problems), sound="Basso")
     return len(finished) + len(problems)
 
@@ -3904,10 +5147,12 @@ def load_config(path):
         # ここで黙って {} を返すと、呼び出し側が「設定が無い」と判断して
         # ホスト定義ごと失われる (実測: ラベルが os.uname()[1] に化けて
         # 同じ run が二重にキャッシュへ入った)。落ちないが必ず知らせる
+        # 案内に特定の環境のパスを書かない (配布先ではパスが人ごとに違う)
         sys.stderr.write(
             "[error] PyYAML is missing, so %s cannot be read.\n"
-            "[error]   run with the conda python: "
-            "/opt/anaconda3/envs/ldrp/bin/python\n" % path)
+            "[error]   this python is %s. Run with a python that has PyYAML\n"
+            "[error]   (e.g. the conda env you train with), or: pip install pyyaml\n"
+            % (path, sys.executable))
         return {}
     return yaml.safe_load(text) or {}
 
@@ -3950,10 +5195,64 @@ def build_hosts(conf, args):
     return hosts
 
 
+# 終了予定を出すための「(heartbeat 時刻, t_env)」の記録点。収集のたびに 1 点ずつ増える
+PROGRESS_SAMPLES_MAX = 120      # 1 run あたり保持する点数の上限 (2 分おきの quick-check で約 4 時間分)
+PROGRESS_SAMPLES_KEEP_SEC = 3 * 3600   # 最新の点からこれより古い点は捨てる (heartbeat 基準)
+PROGRESS_SAMPLES_MIN = 12       # ただし直近のこの点数は古くても残す (停止より前の区間で 15 分を埋めるため)
+RATE_WINDOW_SEC = 15 * 60       # 終了予定のペースを出す区間の長さ
+PAUSE_GAP_SEC = 30 * 60         # この長さ以上で遅い区間は「学習マシンが止まっていた」とみなす
+
+
+def _progress_point(rec):
+    """このレコードが示す (heartbeat, t_env) の 1 点。どちらかが無ければ None."""
+    beat = (rec or {}).get("heartbeat")
+    t = (rec or {}).get("t_last")
+    if not beat or t in (None, ""):
+        return None
+    try:
+        return [str(beat), int(t)]
+    except (TypeError, ValueError):
+        return None
+
+
+def carry_progress_samples(new, old):
+    """古いレコードの記録点を新しいレコードへ引き継ぎ、今回の 1 点を足す.
+
+    終了予定を「開始からの平均ペース」で出すと、一時停止 (Ctrl-Z) やスリープで
+    止まっていた時間まで平均に入り、何日も先の予定になる (白で 5.5 時間 → 65 時間と
+    出ていた)。直近の区間のペースを使えるように、収集のたびに点を残しておく。
+    一時停止中は heartbeat も止まるので、止まっていた時間に点は増えない。
+    """
+    if new is None:
+        return new
+    pts = {}
+    for b, t in list((old or {}).get("progress_samples") or []) + \
+            list(new.get("progress_samples") or []):
+        pts[str(b)] = int(t)
+    for rec in (old, new):
+        pt = _progress_point(rec)
+        if pt:
+            pts[pt[0]] = pt[1]
+    if pts:
+        seq = [[b, t] for b, t in sorted(pts.items())][-PROGRESS_SAMPLES_MAX:]
+        # heartbeat 基準で古い点を捨てる (壁時計ではないので、停止中に点が消えることはない)
+        newest = parse_dt(seq[-1][0])
+        if newest is not None:
+            cut = newest - timedelta(seconds=PROGRESS_SAMPLES_KEEP_SEC)
+            keep = [p for p in seq[:-PROGRESS_SAMPLES_MIN]
+                    if (parse_dt(p[0]) or newest) >= cut]
+            seq = keep + seq[-PROGRESS_SAMPLES_MIN:]
+        new["progress_samples"] = seq
+    return new
+
+
 def dedupe(rows):
-    """同じ uid が複数回来たら最後の 1 件を残す."""
+    """同じ uid が複数回来たら最後の 1 件を残す (記録点は古い方から引き継ぐ)."""
     seen = {}
     for d in rows:
+        prev = seen.get(d["uid"])
+        if prev is not None and prev is not d:
+            carry_progress_samples(d, prev)
         seen[d["uid"]] = d
     return list(seen.values())
 
@@ -3968,6 +5267,9 @@ def main(argv=None):
         description="Collect LDRP training runs across machines and sync them to Notion.")
     p.add_argument("--scan", action="store_true",
                    help="scanner mode: emit one JSON line per run to stdout (used over ssh)")
+    p.add_argument("--dump-curves", action="append", default=None, metavar="RUN_DIR",
+                   help="emit the learning curves (metrics.json) of these sacred run "
+                        "directories as JSON lines (used over ssh by the dashboard)")
     p.add_argument("--repo", action="append", default=None,
                    help="repository root to scan (repeatable)")
     p.add_argument("--sacred-subdir", action="append", default=None,
@@ -4112,6 +5414,8 @@ def main(argv=None):
                    help="how often the pushed cron entry runs (default: 60 min)")
     args = p.parse_args(argv)
 
+    if args.dump_curves:
+        return cmd_dump_curves(args.dump_curves)
     if args.scan:
         args.machine = args.machine or os.uname()[1]
         args.repo = args.repo or [os.getcwd()]
@@ -4181,7 +5485,7 @@ def main(argv=None):
             # (これが無いと黒 / M2 の「あと何本回すか」が白から一切見えない)
             keep = set(d["uid"] for d in rows
                        if (d.get("t_max") or 0) >= min_steps
-                       or d.get("kind") == "batch")
+                       or d.get("kind") in ("batch", "host"))
             records = [r for r in records if r["uid"] in keep]
             rows = [d for d in rows if d["uid"] in keep]
         want = set(x.strip() for x in (args.fetch_state or "done").split(",") if x.strip())
@@ -4209,12 +5513,17 @@ def main(argv=None):
                                   ".run_cache.jsonl")
 
     stale = args.stale_minutes or conf.get("stale_minutes") or 90
+    set_eval_naming(conf.get("eval_naming"))
     tail_bytes = args.tail_bytes or conf.get("tail_bytes") or 65536
     hosts = build_hosts(conf, args)
     if not hosts:
         p.error("no hosts to visit")
 
     drop_root = args.drop_root or conf.get("drop_root")
+
+    # 別マシンで回した方策評価のログを logs/ に取ってくる (host に eval_logs: があるときだけ)
+    for label, err in pull_eval_logs(hosts, verbose=args.verbose):
+        sys.stderr.write("[eval-logs] %s: %s\n" % (label, err))
 
     # 学習曲線の仕様。--curve-spec (make_graph が書く) が優先、無ければ config
     spec = {}
@@ -4246,7 +5555,7 @@ def main(argv=None):
     # 古い予約が残ると、終わったバッチの枠がいつまでも埋まって見える
     batches = [r for r in raw if r.get("kind") == "batch"]
     curves = [r for r in raw if r.get("kind") == "curve"]
-    raw = [r for r in raw if r.get("kind") not in ("batch", "curve")]
+    raw = [r for r in raw if r.get("kind") not in ("batch", "curve", "host")]
 
     prev_states = {}
     cache_path = os.path.expanduser(args.cache) if args.cache else None
@@ -4365,7 +5674,31 @@ def main(argv=None):
 
     if args.fetch_models or args.fetch_dry_run:
         want = set(x.strip() for x in (args.fetch_state or "done").split(",") if x.strip())
-        targets = [d for d in rows if d["state"] in want]
+        # 除外した run は取ってこない。ここで外せば保管 (publish)・評価用フォルダへの
+        # 配置 (install)・共有フォルダの後始末 (purge) もすべて対象から外れる
+        excl = load_excluded()
+        targets = [d for d in rows if d["state"] in want and d["uid"] not in excl]
+        n_skip = sum(1 for d in rows if d["state"] in want and d["uid"] in excl)
+        if n_skip:
+            sys.stderr.write("[fetch] skipping %d excluded run(s) listed in %s\n"
+                             % (n_skip, EXCLUDE_PATH))
+        # LaRe-Path のモデルは方策と別の置き場 (このリポジトリの src/lare/path/fetched/)
+        try:
+            fetch_lare_models(hosts, targets,
+                              os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              timeout=args.fetch_timeout,
+                              dry_run=args.fetch_dry_run or not args.fetch_models,
+                              drop_root=drop_root)
+            # 計画内の LaRe モデル学習が完了していれば、できたモデルを models/ に置く
+            # (tools/lare_models.py の auto_install。models/ にあるものは上書きしない)
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import plan as _PLAN
+            import lare_models as _LM
+            _LM.auto_install(_PLAN.parse_plans(_PLAN.find_plans(args.plan)), targets,
+                             _PLAN.matches,
+                             dry_run=args.fetch_dry_run or not args.fetch_models)
+        except Exception as e:
+            sys.stderr.write("[lare] %s: %s\n" % (type(e).__name__, e))
         planned, _n = fetch_models(
             hosts, targets, args.fetch_models or "models_inbox",
             what=args.fetch_what, with_optimizer=args.fetch_optimizer,

@@ -6,13 +6,28 @@ import numpy as np
 
 runner = None
 
-MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "safe")
+PATH_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "safe")
+TASK_MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "task_assign", "models", "safe")
 
-def model_stem(map_name, model_n, path_planner, method_tag="", reassign_tag="base"):
-    suffix = f"_{method_tag}" if method_tag else ""
-    return f"{map_name}_{model_n}_{path_planner}{suffix}_{reassign_tag}"
+def model_stem(map_name, model_n, path_planner, method_tag="", reassign_tag="base", task_assigner="", dynamic=False):
+    parts = [f"{map_name}_{model_n}_{path_planner}"]
+    if method_tag:
+        parts.append(method_tag)
+    if (task_assigner or "").lower() == "ppo":
+        parts.append("ppo")
+    if dynamic:
+        parts.append("dyn")
+    parts.append(reassign_tag)
+    return "_".join(parts)
 
-def list_model_seeds(stem, models_dir=MODELS_DIR):
+def model_stem_form_args(args, model_n):
+    return model_stem(args.map_name, model_n, args.path_planner,
+                      getattr(args, "method_tag", "") or "",
+                      getattr(args, "reassign_before_pickup", "base"),
+                      getattr(args, "task_assigner", "") or "",
+                      getattr(args, "use_dynamic_agents", False))
+
+def list_model_seeds(stem, models_dir=PATH_MODELS_DIR):
     if not os.path.isdir(models_dir):
         return []
     pat = re.compile(rf"^{re.escape(stem)}_seed(\d+)\.th$")
@@ -21,7 +36,7 @@ def list_model_seeds(stem, models_dir=MODELS_DIR):
         seeds = [0]
     return sorted(seeds)
 
-def resolve_model_path(stem, model_seed=0, models_dir=MODELS_DIR):
+def resolve_model_path(stem, model_seed=0, models_dir=PATH_MODELS_DIR):
     cand = os.path.join(models_dir, f"{stem}_seed{model_seed}.th")
     if os.path.exists(cand):
         return cand
@@ -75,8 +90,7 @@ class MARLPolicy():
             model_n = self.mat_model_agent_num
         else:
             model_n = env.agent_num
-        return model_stem(env.map_name, model_n, self.path_planner,
-                          self.method_tag, self.model_reassign_tag)
+        return model_stem_form_args(self.args, model_n)
     
     def get_model_path(self, env):
         self.resolved_model_path = resolve_model_path(self.get_model_stem(env), self.model_seed)

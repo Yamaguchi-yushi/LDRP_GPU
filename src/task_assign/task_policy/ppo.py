@@ -506,6 +506,15 @@ class PPOAgent():
         print(f"[PPOAgent] Saved model and optimizer state to {path}")
         return path
 
+    def load_model_file(self, path):
+        """評価用のモデルをロード"""
+        payload = self.model.load_model(path)
+        self.model.to(self.device)
+        self.update_count = int(payload.get("update_count", 0))
+        self.total_steps = int(payload.get("total_steps", 0))
+        print(f"[PPO-Task] Loaded model from {path}")
+        return payload
+
     def load_models(self, path, load_optimizer=True):
         """path から復元する"""
         payload = self.model.load_model(os.path.join(path, "agent.th"))

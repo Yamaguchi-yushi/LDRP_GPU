@@ -247,10 +247,12 @@ class Panel(object):
         subprocess.Popen(["open", self.url])
 
     def start_server(self):
-        """落ちていたら起動する。conda の python を使う (PyYAML が要る)."""
-        py = "/opt/anaconda3/envs/ldrp/bin/python"
-        if not os.path.exists(py):
-            py = sys.executable
+        """落ちていたら起動する.
+
+        パネル自身を動かしている python で起動する (PyYAML が要るので、パネルも
+        設定を読める python で起動しておくこと)。環境ごとのパスを直書きしない
+        """
+        py = os.environ.get("LDRP_TOOLS_PYTHON") or sys.executable
         try:
             subprocess.Popen([py, os.path.join(HERE, "app.py")],
                              cwd=REPO, stdout=subprocess.DEVNULL,
@@ -286,12 +288,29 @@ class Panel(object):
             l_run.config(text=("▶%d" % n) if n else "—",
                          fg=OK if n else MUT)
             ago = since(m.get("last_done"))
-            if ago is None:
+            np_ = m.get("paused") or 0
+            tail = ("  (⏸ %d 本停止中)" % np_) if np_ and m.get("next_eta") else ""
+            if np_ and not m.get("next_eta"):
+                # 全部が一時停止中 (Ctrl-Z)。再開の時刻は分からないので残り時間だけ出す
+                rem = m.get("paused_remaining")
+                l_when.config(text="⏸ 一時停止中  %s%s" % (
+                                  ("再開すれば残り %s  " % dur(rem)) if rem else "",
+                                  m.get("paused_what") or ""),
+                              fg=WARN)
+            elif n and m.get("next_eta"):
+                # 実行中なら「次にいつ終わるか」を出す (リマインダーとして一番知りたいこと)。
+                # 情報が古いホストの予定は当てにならないので、その旨を添える
+                l_when.config(text="%s 終了予定  %s%s%s" % (when(m.get("next_eta")),
+                                                          m.get("next_what") or "",
+                                                          "  (情報が古い)" if m.get("stale") else "",
+                                                          tail),
+                              fg=WARN if m.get("stale") else FG)
+            elif ago is None:
                 l_when.config(text="完了なし", fg=MUT)
             else:
-                # 直前の完了が古いほど「遊んでいる」。3 日以上は黄色で示す
-                l_when.config(text="%s  %s" % (when(m.get("last_done")),
-                                               m.get("last_what") or ""),
+                # 実行中が無ければ最後の完了。古いほど「遊んでいる」。3 日以上は黄色で示す
+                l_when.config(text="%s 完了  %s" % (when(m.get("last_done")),
+                                                   m.get("last_what") or ""),
                               fg=WARN if (not n and ago > 3 * 86400) else MUT)
 
     def refresh(self):

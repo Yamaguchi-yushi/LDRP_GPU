@@ -531,7 +531,7 @@ use_lare_path_training: false   # 学習はする, 環境の報酬は元のま�
   - 新ツール `tools/collect_runs.py` (run 収集・状態判定)、`tools/eval_report.py` (評価結果の集計)、`tools/plan.py` (実験計画のパース)、`tools/dashboard/` (ローカル Web UI) を追加。**学習・実行系 (`train.py` / `test.py` / `run.py` / `src/`) には一切触っていない** — sacred が既に吐いている `config.json` / `run.json` / `cout.txt` / `metrics.json` と `results/summary.csv` を読むだけ
   - このマシン (GPU 機) は **「収集される側」** に該当する。手順は [tools/SETUP_export_machine.md](tools/SETUP_export_machine.md) を参照。`python3 tools/collect_runs.py --hosts local --export DIR` で共有フォルダに書き出す運用 (drop モード)
   - 状態判定: `OK` (t_max 完遂) / `SHORT` (COMPLETED だが t_max 未達) / `RUN` (学習中) / `STALL` (heartbeat 停止 = プロセス落ち) / `FAIL`
-  - `cout.txt` が 0 byte の環境 (stdout をシェルでリダイレクトしている本 GPU 機が該当) では `metrics.json` の末尾 256KB から最後の `t_env` を拾う
+  - `cout.txt` が 0 byte の環境 (本 GPU 機が該当。`src/epymarl/src/main.py` の `CAPTURE_MODE = "no"` により sacred が stdout を捕捉しないため) では `metrics.json` の末尾 256KB から最後の `t_env` を拾う
   - リモート側の要件は `python3` (標準ライブラリのみ)
   - 接続先 `tools/collect_config.yaml` と実験計画 `tools/plan.md` は `.gitignore` 済み (見本は `.example` として公開)。**このマシンでは `plan.md` を触らない / `--notion` `--publish-models` を使わない** (実験計画は集約マシンが master)
 - **触ったファイル**: 新規 `tools/` 一式, `design/run_collector.md` / 改修 `.gitignore` (`tools/.run_cache.jsonl`, `models_inbox/`, `tools/.notion_token`, `tools/collect_config.yaml`, `tools/plan.md` を追加)

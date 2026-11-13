@@ -35,11 +35,14 @@ from .encoder import (
 )
 from .decoder import PathRewardDecoder
 from .transformer import TimeAgentTransformer
+from .factor_versions import get_factor_version
 
 
 @dataclass
 class LaRePathConfig:
     factor_dim: int = FACTOR_NUMBER
+    # 評価関数 (因子) の版。観測の作り方と評価関数の組を factor_versions.py から選ぶ
+    factor_version: int = 1
     decoder_hidden_dim: int = 64
     decoder_n_layers: int = 3
     use_transformer: bool = False
@@ -78,7 +81,11 @@ class LaRePathModule:
 
         self.apsp, self.graph_diameter = self.compute_apsp(env)
 
-        self.factor_dim = self.cfg.factor_dim
+        self.factor_version = int(self.cfg.factor_version)
+        self._factor_spec = get_factor_version(self.factor_version)
+        self.factor_dim = self._factor_spec["n_factors"]
+        # 版 3 以降の評価関数は辺の長さの表 (adj) も使う
+        self.adj = self.compute_adj(env) if self._factor_spec.get("needs_adj") else None
         self.n_agents = env.agent_num
         self.seq_length = self.cfg.seq_length
 
@@ -137,6 +144,19 @@ class LaRePathModule:
         self._evaluation_active = False
         self._evaluation_count = 0
 
+    def compute_adj(self, env):
+        """辺の長さの表. adj[u, v] = 辺 (u, v) の長さ (ノード座標の距離)、辺が無ければ 0.
+
+        compute_apsp と同じく、辺の長さはノード座標のユークリッド距離で測る。
+        """
+        n_nodes = len(env.G.nodes())
+        adj = np.zeros((n_nodes, n_nodes), dtype=np.float32)
+        for u, v in env.G.edges():
+            w = float(np.linalg.norm(np.array(env.pos[u]) - np.array(env.pos[v])))
+            adj[u, v] = w
+            adj[v, u] = w
+        return adj
+
     def compute_apsp(self, env):
         """All-pairs shortest-path distance table via Dijkstra from every node.
 
@@ -184,13 +204,16 @@ class LaRePathModule:
         """
         rows = []
         for i in range(self.n_agents):
-            obs_row = build_lare_obs_for_agent(
+            obs_row = self._factor_spec["build_obs"](
                 self.env, i, self.graph_diameter,
                 prev_onehot_position, current_colliding_pairs,
             )
             rows.append(obs_row)
         batch_obs = np.stack(rows, axis=0)
-        factor_list = evaluation_func(batch_obs, self.apsp)
+        if self.adj is not None:
+            factor_list = self._factor_spec["evaluate"](batch_obs, self.apsp, self.adj)
+        else:
+            factor_list = self._factor_spec["evaluate"](batch_obs, self.apsp)
         factor_arr = np.concatenate(factor_list, axis=-1).astype(np.float32)
         return factor_arr
 
@@ -303,6 +326,7 @@ class LaRePathModule:
                 self.transformer.state_dict() if self.transformer is not None else None
             ),
             "factor_dim": self.factor_dim,
+            "factor_version": self.factor_version,
             "n_agents": self.n_agents,
             "use_transformer": self.use_transformer,
             "update_count": self.update_count,
@@ -324,13 +348,23 @@ class LaRePathModule:
                 raise ValueError(
                     f"factor_dim mismatch: model={saved_factor_dim}, current={self.factor_dim}"
                 )
+            # 版が違うデコーダは因子の意味が違うので使えない (古いファイルは版 1)
+            saved_version = int(payload.get("factor_version", 1))
+            if saved_version != self.factor_version:
+                raise ValueError(
+                    f"factor_version mismatch: model={saved_version}, current={self.factor_version}"
+                )
             decoder_sd = payload["decoder_state_dict"]
             transformer_sd = payload.get("transformer_state_dict")
             update_count = int(payload.get("update_count", 0))
             last_loss = payload.get("last_loss", None)
             source = "LDRP"
         elif "model_state_dict" in payload:
-            # -- MARL4DRP format --
+            # -- MARL4DRP format -- (MARL4DRP の評価関数 = 版 1 のデコーダ)
+            if self.factor_version != 1:
+                raise ValueError(
+                    f"factor_version mismatch: MARL4DRP model is version 1, current={self.factor_version}"
+                )
             decoder_sd = self._convert_marl4drp_state_dict(payload["model_state_dict"])
             transformer_sd = None
             update_count = int(payload.get("total_training_steps", 0))

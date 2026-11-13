@@ -18,15 +18,25 @@
 
 状態は tools/.autorun/ に置く (queue.json = 依頼、ledger.jsonl = 投入の記録、PAUSE = 一時停止)。
 マシンごとの設定は tools/collect_config.yaml の各 host の `autorun:` (enabled: true のマシンにだけ投入する)。
+
+ssh で届かないマシン (黒) は共有フォルダ (collect_config.yaml の drop_root) でつなぐ:
+  投入   司令塔が <drop_root>/<label>/autorun/inbox/ にジョブを置き、そのマシンの
+         tools/autorun_worker.py (launchd) が拾って起動する。空き具合は worker が status.json に書く
+  依頼   司令塔でないマシン (collect_config.yaml の autorun_commander が自分でない) で add / cancel /
+         pause を実行すると <drop_root>/_autorun/requests/ に置かれ、司令塔の次の tick で取り込まれる。
+         find / status / hosts は司令塔が tick ごとに書き出す _autorun/ の写しを読む
+使い方の全体: tools/AUTORUN.md
 """
 
 import argparse
 import datetime
+import glob
 import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -61,6 +71,11 @@ EVAL_CODE = ["test.py", "runner.py", "src/main/drp_env/drp_env.py",
 EVAL_SEC_PER_COND = 720.0       # 1 条件 (1000 ep x 1000 step) の時間。2026-11 の実測 (Mac・GPU1 とも 11〜12 分)
 DEFAULT_RATE = 500.0            # 学習の速さの実績が無いときの仮の値 (steps/秒)
 LAUNCH_GRACE_SEC = 45 * 60      # 投入してから run が見えるまでの猶予 (この間は「動いている」に数える)
+# 共有フォルダのマシンは、worker が拾う (launchd 5 分おき) + 共有フォルダの同期 + run の書き出し (15 分おき)
+# のぶん遅れて見えるので、猶予を長くとる
+DROP_GRACE_SEC = 120 * 60
+DROP_STALE_SEC = 40 * 60        # worker の status.json がこれより古ければ、そのマシンには投入しない
+COMMANDER_DIR = "_autorun"      # <drop_root>/_autorun/ = 司令塔が書き出す写し + 他のマシンからの依頼
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +163,47 @@ def hosts_of(conf):
             continue
         d = {k: h.get(k) for k in ("label", "ssh", "port", "connect_timeout", "ssh_options")}
         d.update(a)
-        d["local"] = h.get("ssh") in (None, "", "local")
+        dd = CR.drop_dir_for(h, conf.get("drop_root"))
+        d["drop"] = bool(dd) and h.get("ssh") in (None, "")
+        d["local"] = not d["drop"] and h.get("ssh") in (None, "", "local")
+        if d["drop"]:
+            # python・リポジトリの場所は、そのマシンの worker が status.json に書いたものを使う
+            d["drop_dir"] = os.path.join(dd, "autorun")
+            ds = drop_status(d)
+            for k in ("python", "train_repo", "eval_repo"):
+                if not d.get(k):
+                    d[k] = ds.get(k)
         out.append(d)
     return out
+
+
+def drop_status(h):
+    """共有フォルダのマシンの worker が書いた status.json ({} なら未設置)."""
+    return load_json(os.path.join(h["drop_dir"], "status.json"), {})
+
+
+def drop_fresh(ds):
+    at = parse_dt(ds.get("at"))
+    return at is not None and (now_utc() - at).total_seconds() < DROP_STALE_SEC
+
+
+def drop_put(h, sub, name, obj=None, src=None):
+    """共有フォルダのマシンへファイルを置く (書きかけを拾われないよう、.tmp に書いてから名前を変える)."""
+    d = os.path.join(h["drop_dir"], sub)
+    os.makedirs(d, exist_ok=True)
+    dst = os.path.join(d, name)
+    tmp = os.path.join(d, "." + name + ".tmp")
+    if src is not None:
+        shutil.copyfile(src, tmp)
+    else:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, dst)
+    return dst
+
+
+def grace_of(x):
+    return float(x.get("grace") or LAUNCH_GRACE_SEC)
 
 
 def ssh_base(h):
@@ -258,16 +311,25 @@ def host_state(h, dash, led, matched=None):
         run = (matched or {}).get(x.get("job"))
         if run is None:
             age = (now_utc() - parse_dt(x.get("at"))).total_seconds()
-            if age < LAUNCH_GRACE_SEC:
+            if age < grace_of(x):
                 st["pending_train"] += 1
                 st["train_eta"].append(now_utc() + datetime.timedelta(seconds=float(x.get("est_sec") or 0)))
         elif run.get("state") == "running" and (run.get("progress") or 0) > 0.01:
             mine_running.append(x)
     st["n_train"] = len(st["train_eta"])
-    rc, out, _ = run_on(h, PROBE, timeout=60)
-    if rc == 255:
-        st["reachable"] = False
-        return st
+    if h.get("drop"):
+        # ssh で届かないマシン: worker が数分おきに PROBE と同じものを status.json に書いている
+        ds = drop_status(h)
+        st["reachable"] = drop_fresh(ds)
+        st["drop_errors"] = ds.get("errors") or []
+        if not st["reachable"]:
+            return st
+        out = ds.get("probe") or ""
+    else:
+        rc, out, _ = run_on(h, PROBE, timeout=60)
+        if rc == 255:
+            st["reachable"] = False
+            return st
     sec = _sections(out)
     num = lambda xs, k=0: float(xs[k]) if len(xs) > k else None
     try:
@@ -502,6 +564,34 @@ def pick_template(cond, dash, recs):
     return recs[cands[0]["uid"]]
 
 
+LARE_NAME_KEYS = ("pretrained_lare_path_model_name", "finetuning_lare_path_model_name")
+
+
+def template_for(req, cond, dash, recs, by_id):
+    """依頼の雛形. 同じ条件の実績が無く、依頼に like (別の条件の id) と lare_model (ファイル名) があれば、
+    その条件の雛形の LaRe モデル名だけを差し替えたものを使う (新しい LaRe モデルの最初の 1 本用).
+
+    差し替えた結果が依頼した条件に判定されるかは launch_train の check_command_condition で確かめる。
+    """
+    rec = pick_template(cond, dash, recs)
+    if rec is not None or not req.get("like") or not req.get("lare_model"):
+        return rec
+    base_cond = by_id.get(req["like"])
+    base = pick_template(base_cond, dash, recs) if base_cond is not None else None
+    if base is None:
+        return None
+    env = dict(base.get("env") or {})
+    if not env.get("use_lare_path"):
+        return None
+    for k in LARE_NAME_KEYS:
+        if env.get(k):
+            env[k] = req["lare_model"]
+    # GPU 版にだけある装置の指定。cpu なら外しても同じ (Mac のコードには無く、残すと env の生成で落ちる)
+    if env.get("lare_device") in (None, "cpu"):
+        env.pop("lare_device", None)
+    return dict(base, env=env, uid=None)
+
+
 _YAML_CACHE = {}
 
 
@@ -511,6 +601,16 @@ def remote_defaults(h, algo):
     key = (h["label"], algo)
     if key in _YAML_CACHE:
         return _YAML_CACHE[key]
+    if h.get("drop"):
+        ec = drop_status(h).get("epymarl_config") or {}
+        texts = [ec.get("default"), ec.get("gymma"), (ec.get("algs") or {}).get(algo)]
+        if any(t is None for t in texts):
+            raise RuntimeError("epymarl config for %s is not in %s's status.json" % (algo, h["label"]))
+        d = {}
+        for t in texts:
+            d.update(yaml.safe_load(t) or {})
+        _YAML_CACHE[key] = d
+        return d
     base = "%s/src/epymarl/src/config" % h["train_repo"]
     sep = "\n---8<---\n"
     script = "cat %s/default.yaml; printf %s; cat %s/envs/gymma.yaml; printf %s; cat %s/algs/%s.yaml" % (
@@ -535,6 +635,20 @@ def _fmt(v):
     if re.search(r"[\s\"'$`\\]", s):
         raise ValueError("value with spaces or quotes cannot be passed safely: %r" % s)
     return '"%s"' % s
+
+
+def cpu_only(h, rec):
+    """この host ではこのアルゴリズムを CPU だけで学習するか (autorun: の cpu_algos: [mappo] など)."""
+    algo = ((rec.get("cfg") or {}).get("name") or "").lower()
+    return algo in [str(a).lower() for a in (h.get("cpu_algos") or [])]
+
+
+def host_footprint(h, rec, db):
+    """footprint() に、CPU だけで学習する host では GPU を使わないことを反映したもの."""
+    fp = footprint(rec, db)
+    if cpu_only(h, rec):
+        fp = dict(fp, gpu=0.0)
+    return fp
 
 
 def build_train_command(h, rec):
@@ -571,6 +685,10 @@ def build_train_command(h, rec):
     toks = ["%s=%s" % (k, _fmt(v)) for k, v in over] + ["env_args.%s=%s" % (k, _fmt(v)) for k, v in eover]
     cmd = "%s src/epymarl/src/main.py --config=%s --env-config=gymma with %s" % (
         h["python"], algo, " ".join(toks))
+    if cpu_only(h, rec):
+        # GPU を見せずに起動する (train.py のコメントにある CPU 実行と同じ)。epymarl は GPU が無いと CPU で動く。
+        # host の cpu_algos を消せば元に戻る (一時的な処置, 2026-11-12)
+        cmd = 'CUDA_VISIBLE_DEVICES="" ' + cmd
     return cmd
 
 
@@ -584,12 +702,26 @@ def check_command_condition(cmd, cond, conf):
 
 
 def ensure_lare_model(h, env):
-    """事前学習した LaRe のモデルを使う学習なら、そのファイルを host に置く (手元の models/ から送る)."""
+    """事前学習した LaRe のモデルを使う学習なら、そのファイルを host に置く (手元の models/ から送る).
+
+    共有フォルダのマシンには直接置けないので、共有フォルダの files/ に置き、
+    worker に「train_repo のどこへ写すか」を渡す。返り値: その一覧 (ssh のマシンでは空)
+    """
     names = []
     if env.get("use_lare_path") and env.get("use_pretrained_lare_path"):
         names.append(env.get("pretrained_lare_path_model_name"))
     if env.get("use_lare_path") and env.get("use_finetuning_lare_path"):
         names.append(env.get("finetuning_lare_path_model_name"))
+    attach = []
+    if h.get("drop"):
+        have = set(drop_status(h).get("lare_models") or [])
+        for n in [x for x in names if x and x not in have]:
+            local = os.path.join(REPO, "src", "lare", "path", "models", n)
+            if not os.path.exists(local):
+                raise RuntimeError("LaRe model %s is not on %s nor in this Mac's models/" % (n, h["label"]))
+            drop_put(h, "files", n, src=local)
+            attach.append({"src": "files/" + n, "dest": "src/lare/path/models/" + n})
+        return attach
     for n in [x for x in names if x]:
         script = "ls %s/src/lare/path/models/%s %s/src/lare/path/checkpoints/%s 2>/dev/null | head -1" % (
             h["train_repo"], shlex.quote(n), h["train_repo"], shlex.quote(n))
@@ -600,6 +732,7 @@ def ensure_lare_model(h, env):
         if not os.path.exists(local):
             raise RuntimeError("LaRe model %s is not on %s nor in this Mac's models/" % (n, h["label"]))
         rsync_to(h, [local], "%s/src/lare/path/models/" % h["train_repo"])
+    return attach
 
 
 def launch_train(h, req, cond, rec, conf, dry_run):
@@ -609,7 +742,12 @@ def launch_train(h, req, cond, rec, conf, dry_run):
     job_id = "%s_%s_%s" % (req["id"], h["label"], time.strftime("%m%d%H%M%S"))
     if dry_run:
         return {"cmd": cmd, "job": job_id}
-    ensure_lare_model(h, rec.get("env") or {})
+    attach = ensure_lare_model(h, rec.get("env") or {})
+    if h.get("drop"):
+        # worker が拾って autorun_train.py で起動する (ssh のマシンと同じ ~/.ldrp/autorun/jobs/<id>.json に写す)
+        drop_put(h, "inbox", job_id + ".json", {"id": job_id, "kind": "train", "commands": [cmd],
+                                                "max_processes": 1, "files": attach})
+        return {"cmd": cmd, "job": job_id, "code": drop_status(h).get("train_head")}
     run_on(h, "mkdir -p ~/%s/jobs ~/%s/logs" % (REMOTE_DIR, REMOTE_DIR))
     rsync_to(h, [os.path.join(TOOLS, "autorun_train.py")], "~/%s/" % REMOTE_DIR if not h["local"]
              else os.path.expanduser("~/%s/" % REMOTE_DIR))
@@ -617,7 +755,9 @@ def launch_train(h, req, cond, rec, conf, dry_run):
     rc, _, err = run_on(h, "cat > ~/%s/jobs/%s.json" % (REMOTE_DIR, job_id), stdin=json.dumps(job))
     if rc != 0:
         raise RuntimeError("cannot write job on %s: %s" % (h["label"], err.strip()))
-    script = ("cd %s && nohup %s ~/%s/autorun_train.py ~/%s/jobs/%s.json > ~/%s/logs/%s.out 2>&1 < /dev/null &"
+    # { ... & } で nohup だけを背後に回す。`a && b > out &` と書くと && の列全体が背後のシェルになり、
+    # そのシェルが ssh の出力をつかんだまま残るので、ssh がジョブの終わりまで戻らない (2026-11-11 GPU1 で実測)
+    script = ("cd %s && { nohup %s ~/%s/autorun_train.py ~/%s/jobs/%s.json > ~/%s/logs/%s.out 2>&1 < /dev/null & }"
               % (shlex.quote(h["train_repo"]), h["python"], REMOTE_DIR, REMOTE_DIR, job_id, REMOTE_DIR, job_id))
     rc, _, err = run_on(h, script)
     if rc != 0:
@@ -664,10 +804,7 @@ def sync_eval_code(h):
     for e in SYNC_EXCLUDES:
         ex += ["--exclude", e]
     rsync_to(h, [REPO + "/"], h["eval_repo"] + "/", extra=ex)
-    local = {}
-    for p in EVAL_CODE:
-        with open(os.path.join(REPO, p), "rb") as f:
-            local[p] = hashlib.md5(f.read()).hexdigest()
+    local = eval_code_hashes()
     rc, out, _ = run_on(h, "cd %s && md5sum %s" % (shlex.quote(h["eval_repo"]), " ".join(EVAL_CODE)))
     remote = dict((l.split()[1], l.split()[0]) for l in out.splitlines() if len(l.split()) == 2)
     bad = [p for p in EVAL_CODE if remote.get(p) != local[p]]
@@ -675,9 +812,64 @@ def sync_eval_code(h):
         raise RuntimeError("evaluation code differs on %s after sync: %s" % (h["label"], ", ".join(bad)))
 
 
+def eval_code_hashes(root=REPO):
+    out = {}
+    for p in EVAL_CODE:
+        with open(os.path.join(root, p), "rb") as f:
+            out[p] = hashlib.md5(f.read()).hexdigest()
+    return out
+
+
+def code_bundle(h):
+    """評価のコード (ssh のマシンに rsync するのと同じ範囲) を tar.gz にして共有フォルダの files/ に置く.
+
+    中身が同じなら作り直さない (名前 = 中身のハッシュ)。古い束は 2 つだけ残して消す。返り値: files/ からの名前
+    """
+    stage = os.path.join(STATE, "code_stage")
+    ex = []
+    for e in SYNC_EXCLUDES:
+        ex += ["--exclude", e]
+    subprocess.run(["rsync", "-a", "--delete"] + ex + [REPO + "/", stage + "/"], check=True,
+                   capture_output=True, timeout=600)
+    m = hashlib.md5()
+    for dp, dns, fns in sorted(os.walk(stage)):
+        dns.sort()
+        for fn in sorted(fns):
+            p = os.path.join(dp, fn)
+            m.update(os.path.relpath(p, stage).encode("utf-8"))
+            with open(p, "rb") as f:
+                m.update(hashlib.md5(f.read()).digest())
+    name = "code_%s.tar.gz" % m.hexdigest()[:12]
+    files = os.path.join(h["drop_dir"], "files")
+    if not os.path.exists(os.path.join(files, name)):
+        tmp = os.path.join(STATE, name)
+        # COPYFILE_DISABLE: Mac の tar が ._ で始まる属性ファイルを混ぜないようにする
+        subprocess.run(["tar", "-czf", tmp, "-C", stage, "."], check=True, capture_output=True,
+                       env=dict(os.environ, COPYFILE_DISABLE="1"), timeout=600)
+        drop_put(h, "files", name, src=tmp)
+        os.remove(tmp)
+        olds = sorted(glob.glob(os.path.join(files, "code_*.tar.gz")), key=os.path.getmtime)[:-2]
+        for p in olds:
+            os.remove(p)
+    return name
+
+
 def launch_eval(h, req, jobs, n_par, dry_run):
     job_id = "%s_%s_%s" % (req["id"], h["label"], time.strftime("%m%d%H%M"))
     if dry_run:
+        return {"job": job_id, "models": [j["name"] for j in jobs]}
+    if h.get("drop"):
+        # コードの束・モデル・ジョブを共有フォルダに置き、worker に展開と起動を任せる
+        code = code_bundle(h)
+        place = []
+        for j in jobs:
+            for (src, _d), rel in zip(j["files"], j["dirs"]):
+                sub = "files/models/" + rel.replace("/", "_")
+                drop_put(h, sub, j["name"], src=src)
+                place.append({"src": sub + "/" + j["name"], "dest": rel + "/" + j["name"]})
+        drop_put(h, "inbox", job_id + ".json", {
+            "id": job_id, "kind": "eval", "code": "files/" + code, "eval_hashes": eval_code_hashes(),
+            "files": place, "jobs": [dict(j, files=[]) for j in jobs], "n_par": n_par, "host": h["label"]})
         return {"job": job_id, "models": [j["name"] for j in jobs]}
     sync_eval_code(h)
     for j in jobs:                                          # モデルを評価側の名前のまま置く
@@ -692,8 +884,8 @@ def launch_eval(h, req, jobs, n_par, dry_run):
                         stdin=json.dumps(payload))
     if rc != 0:
         raise RuntimeError("cannot write job on %s: %s" % (h["label"], err.strip()))
-    script = ("cd %s && mkdir -p logs && CUDA_VISIBLE_DEVICES= nohup %s -u tools/eval_lare_factor.py "
-              "--jobs-file ~/%s/jobs/%s.json -j %d --tag %s --host %s > logs/autorun_%s.out 2>&1 < /dev/null &"
+    script = ("cd %s && mkdir -p logs && { CUDA_VISIBLE_DEVICES= nohup %s -u tools/eval_lare_factor.py "
+              "--jobs-file ~/%s/jobs/%s.json -j %d --tag %s --host %s > logs/autorun_%s.out 2>&1 < /dev/null & }"
               % (shlex.quote(h["eval_repo"]), h["python"], REMOTE_DIR, job_id, n_par, job_id,
                  shlex.quote(h["label"]), job_id))
     rc, _, err = run_on(h, script)
@@ -760,6 +952,24 @@ def take(st, fp):
 
 def tick(dry_run=False, verbose=True):
     say = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
+    if is_client():
+        say("[autorun] this machine is not the commander (%s). requests are forwarded; "
+            "jobs for this machine are started by tools/autorun_worker.py." % commander_label())
+        return
+    if not dry_run:
+        ingest_requests(say)
+        drop_cancelled()
+    try:
+        _tick(dry_run, say)
+    finally:
+        if not dry_run:
+            publish(say)
+
+
+LAST_STATES = {}        # 直近の tick で測ったマシンの状態 (publish で他のマシンに見せる)
+
+
+def _tick(dry_run, say):
     if os.path.exists(PAUSE) and not dry_run:
         say("[autorun] paused (%s). nothing launched." % PAUSE)
         return
@@ -779,13 +989,14 @@ def tick(dry_run=False, verbose=True):
         return
     matched = match_launches(led, dash, by_id)
     states = dict((h["label"], host_state(h, dash, led, matched)) for h in hosts)
+    LAST_STATES.update(states)
     rates = train_rates(dash)
     # 測った「1 本が使う量」を記録 (投入の記録 -> その条件の雛形 config)
     recs_by_job = {}
     for x in led:
         c = by_id.get(x.get("cond"))
         if x.get("kind") == "train" and c is not None:
-            r = pick_template(c, dash, recs)
+            r = template_for(next((y for y in q if y.get("id") == x.get("req")), {}), c, dash, recs, by_id)
             if r is not None:
                 recs_by_job[x["job"]] = r
     fpdb = update_footprints(states, led, recs_by_job, dry_run)
@@ -817,9 +1028,11 @@ def tick(dry_run=False, verbose=True):
                         say("[autorun] %s finished training -> evaluation request %s" % (req["id"], ev["id"]))
                     req["status"] = "done"
                 continue
-            rec = pick_template(cond, dash, recs)
+            rec = template_for(req, cond, dash, recs, by_id)
             if rec is None:
-                req["note"] = "no finished/running run of this condition to copy parameters from"
+                req["note"] = ("no finished/running run of this condition to copy parameters from"
+                               + (" (nor of the --like condition)" if req.get("like") else
+                                  "; use --like <id> --lare-model <file> for a new LaRe model"))
                 continue
             req.pop("note", None)
             for _ in range(req["count"] - len(launched)):
@@ -839,11 +1052,26 @@ def tick(dry_run=False, verbose=True):
                 req["note"] = "no finished run to evaluate yet"
             else:
                 req.pop("note", None)
-            if not jobs and not inflight and not unpublished and targets:
+            # 全条件の結果 ([RESULT]) が手元に揃ったら完了。投入からの経過時間 (inflight) は待たない
+            # (待つと、評価が終わってもダッシュボードの依頼欄に「受付中」が見積もりの 2 倍の時間残る)
+            all_done = (targets and not unpublished
+                        and not eval_jobs(req, conds, dash, EV.evaluated(os.path.join(REPO, "logs")), None))
+            if all_done or (not jobs and not inflight and not unpublished and targets):
                 req["status"] = "done"
                 continue
             if todo:
                 units.append({"kind": "eval", "req": req, "jobs": todo})
+
+    # 共有フォルダのマシンで起動に失敗したジョブは、その依頼の note に出す (上で消した note より後に書く)
+    open_by_id = dict((r["id"], r) for r in q if r.get("status") == "open")
+    for st in states.values():
+        for e in st.get("drop_errors") or []:
+            at = parse_dt(e.get("at"))
+            if at is None or (now_utc() - at).total_seconds() > 86400:
+                continue
+            r = open_by_id.get(str(e.get("job", "")).split("_")[0])
+            if r is not None:
+                r["note"] = "%s: %s" % (st["label"], str(e.get("error"))[:300])
 
     # --- 並べる: 長い連鎖 (学習 + 続く評価) から ---
     def est(u, label):
@@ -871,44 +1099,65 @@ def tick(dry_run=False, verbose=True):
         else:
             free_at[h["label"]] = [now_utc()] * (cap - len(busy)) + busy
     eval_free = dict((h["label"], max(0, int(h.get("max_eval") or 0) - states[h["label"]]["n_eval"])) for h in hosts)
+    n_train = dict((h["label"], len(states[h["label"]]["train_eta"])) for h in hosts)   # 今動いている学習の本数
 
-    # GPU は他の人と共有しているので、autorun が同時に動かす学習の総数に上限を置く
+    # 他の人と共有している GPU マシン (autorun の shared: true) では、autorun が同時に動かす学習の総数に
+    # 上限を置く。占有できるマシン (黒など) は数えない
     total_cap = int(conf.get("autorun_max_train_total") or 2)
-    n_auto = sum(1 for x in led if x.get("kind") == "train"
+    shared = set(h["label"] for h in hosts if h.get("shared"))
+    n_auto = sum(1 for x in led if x.get("kind") == "train" and x.get("host") in shared
                  and ((matched.get(x["job"]) or {}).get("state") == "running"
                       or (x["job"] not in matched
-                          and (now_utc() - parse_dt(x["at"])).total_seconds() < LAUNCH_GRACE_SEC)))
+                          and (now_utc() - parse_dt(x["at"])).total_seconds() < grace_of(x))))
+    # マシンの優先順位 (小さいほど先)。学習は train_priority、評価は eval_priority
+    prio = lambda h, k: int(h.get(k) or 0)
     launched_any = False
     for u in units:
         allowed = [h for h in hosts if states[h["label"]]["reachable"]
                    and (not u["req"].get("machines") or h["label"] in u["req"]["machines"])]
         if u["kind"] == "train":
-            best = None
+            cands = []
             for h in allowed:
                 if not free_at[h["label"]]:
                     continue
                 start = free_at[h["label"]][0]
                 fin = max(start, now_utc()) + datetime.timedelta(seconds=train_sec(rates, h["label"], u["rec"]))
-                # 今すぐ入れる枠なら、1 本が使う量がマシンの空きに収まるかを見る (収まらなければ今は入れない)
-                st = states[h["label"]]
-                fp = footprint(u["rec"], fpdb)
-                if start <= now_utc() and not fits(st, fp, h):
-                    continue
-                # 他の人が GPU を使っている (使用率が高い) ときは今は入れない
-                gutil, umax = states[h["label"]].get("gpu_util"), h.get("max_gpu_util")
-                if start <= now_utc() and umax is not None and gutil is not None and gutil > float(umax):
-                    continue
-                if best is None or fin < best[1]:
-                    best = (h, fin, start)
-            if best is None:
+                if start <= now_utc():
+                    # 今すぐ入れる枠なら、1 本が使う量がマシンの空きに収まるかを見る (収まらなければ今は入れない)
+                    # trust_max_train: true の host は空きの見積もりを見ず、max_train の本数だけで決める
+                    # (黒・M2 は MAPPO を 2 本確実に回せるが、見積もり (1 本 9.5 コア) では 1 本も入らないため)
+                    if (not h.get("trust_max_train")
+                            and not fits(states[h["label"]], host_footprint(h, u["rec"], fpdb), h)):
+                        continue
+                    # 他の人が GPU を使っている (使用率が高い) ときは今は入れない (CPU だけで学習するなら見ない)
+                    gutil, umax = states[h["label"]].get("gpu_util"), h.get("max_gpu_util")
+                    if (umax is not None and gutil is not None and gutil > float(umax)
+                            and not cpu_only(h, u["rec"])):
+                        continue
+                    if h["label"] in shared and n_auto >= total_cap:
+                        say("[autorun] %s: %s skipped, %d training run(s) by autorun already on shared machines "
+                            "(autorun_max_train_total=%d)" % (u["req"]["id"], h["label"], n_auto, total_cap))
+                        continue
+                cands.append((h, fin, start))
+            if not cands:
                 continue
-            h, fin, start = best
+            # 今すぐ入れられるマシンのうち最も優先度の高い段 (top) と、それより優先度の高いマシンの「後で空く枠」
+            # の中から、終わる時刻が最も早いものを選ぶ。黒 (train_priority 0) が空いていれば黒、黒が埋まって
+            # いても黒で待つほうが早く終わるなら待つ、そうでなければ GPU マシン (1) に入れる
+            # = 学習が多くて黒だけでは遅くなるときだけ GPU マシンも使う
+            # 同じ段に今すぐ入れられるマシンが複数あるときは、動いている学習が少ないマシンへ (同数なら設定ファイルで
+            # 先に書かれたマシン)。黒と M2 を同じ段にすると 黒 1 → M2 1 → 黒 2 の順に埋まる
+            # (MAPPO の CPU 学習は 1 本で多くのコアを使うので、1 台に 2 本より 2 台に 1 本ずつのほうが速い)
+            now_c = [c for c in cands if c[2] <= now_utc()]
+            if now_c:
+                top = min(prio(c[0], "train_priority") for c in now_c)
+                order = [x["label"] for x in hosts]
+                best = min((c for c in now_c if prio(c[0], "train_priority") == top),
+                           key=lambda c: (n_train[c[0]["label"]], order.index(c[0]["label"]), c[1]))
+                # それより優先度の高いマシンで待つほうが早く終わるなら待つ (今までどおり)
+                cands = [best] + [c for c in cands if prio(c[0], "train_priority") < top]
+            h, fin, start = min(cands, key=lambda c: c[1])
             free_at[h["label"]].pop(0)
-            if start <= now_utc() and n_auto >= total_cap:
-                say("[autorun] %s waits: %d training run(s) by autorun already running (autorun_max_train_total=%d)"
-                    % (u["req"]["id"], n_auto, total_cap))
-                free_at[h["label"]].insert(0, start)
-                continue
             if start > now_utc():                       # 速いマシンが空くのを待つほうが早く終わる
                 free_at[h["label"]].append(fin)
                 free_at[h["label"]].sort()
@@ -923,9 +1172,11 @@ def tick(dry_run=False, verbose=True):
                 continue
             free_at[h["label"]].append(fin)
             free_at[h["label"]].sort()
-            n_auto += 1
-            take(states[h["label"]], footprint(u["rec"], fpdb))
-            fp = footprint(u["rec"], fpdb)
+            n_train[h["label"]] += 1
+            if h["label"] in shared:
+                n_auto += 1
+            fp = host_footprint(h, u["rec"], fpdb)
+            take(states[h["label"]], fp)
             say("[autorun] %s train %s on %s  (est. finish %s; needs %.1f cores, %.1f GB RAM, %.1f GB GPU%s)%s" % (
                 u["req"]["id"], cond_text(u["cond"]), h["label"], fmt_dt(fin), fp["cpu"], fp["mem"] / 1024,
                 fp["gpu"] / 1024, ", measured" if fp.get("measured") else ", estimated",
@@ -935,7 +1186,8 @@ def tick(dry_run=False, verbose=True):
             else:
                 ledger_add({"kind": "train", "req": u["req"]["id"], "host": h["label"], "cond": u["cond"]["id"],
                             "job": info["job"], "cmd": info["cmd"], "code": info.get("code"),
-                            "est_sec": (fin - now_utc()).total_seconds()})
+                            "est_sec": (fin - now_utc()).total_seconds(),
+                            "grace": DROP_GRACE_SEC if h.get("drop") else LAUNCH_GRACE_SEC})
                 launched_any = True
         else:
             # 評価は 1 本 = 1 コア。設定の上限 (max_eval) と CPU の空きの小さいほうまで並列にする
@@ -950,6 +1202,9 @@ def tick(dry_run=False, verbose=True):
             cand = [h for h in allowed if eval_room(h) > 0]
             if not cand:
                 continue
+            # 優先度 (eval_priority) の最も高い段の中で、空きが多く速いマシン
+            top = min(prio(x, "eval_priority") for x in cand)
+            cand = [x for x in cand if prio(x, "eval_priority") == top]
             h = max(cand, key=lambda x: eval_room(x) * float(x.get("eval_speed") or 1.0))
             n_par = min(eval_room(h), len(u["jobs"]))
             jobs = [dict(j, cmd=[h["python"]] + j["cmd"][1:]) for j in u["jobs"]]
@@ -979,9 +1234,20 @@ def tick(dry_run=False, verbose=True):
 # CLI
 # ---------------------------------------------------------------------------
 
+def client_conds():
+    conds = published("conds.json")
+    if not conds:
+        raise SystemExit("no conds.json from the commander yet (%s/conds.json). "
+                         "has the commander run `autorun.py tick`?" % shared_dir())
+    return conds
+
+
 def cmd_find(args):
-    dash = dashboard()
-    conds = load_conds(dash)
+    if is_client():
+        dash, conds = None, client_conds()
+    else:
+        dash = dashboard()
+        conds = load_conds(dash)
     hits = find_conds(conds, args.words)
     if args.policy_only:
         hits = [c for c in hits if c.get("collect") != "lare"]
@@ -989,10 +1255,14 @@ def cmd_find(args):
         print("no condition matches: %s" % " ".join(args.words))
         return 1
     for c in hits[:args.limit]:
-        rs = runs_of(c, dash)
-        cnt = lambda s: sum(1 for r in rs if r.get("state") == s)
-        print("%s  %s  [done %d, running %d, failed %d]" % (c["id"], cond_text(c), cnt("done"), cnt("running"),
-                                                           cnt("failed") + cnt("stalled")))
+        if dash is None:
+            k = c.get("counts") or {}
+            n = (k.get("done", 0), k.get("running", 0), k.get("failed", 0))
+        else:
+            rs = runs_of(c, dash)
+            cnt = lambda s: sum(1 for r in rs if r.get("state") == s)
+            n = (cnt("done"), cnt("running"), cnt("failed") + cnt("stalled"))
+        print("%s  %s  [done %d, running %d, failed %d]" % ((c["id"], cond_text(c)) + n))
     if len(hits) > args.limit:
         print("... %d more (add words to narrow down)" % (len(hits) - args.limit))
     return 0
@@ -1009,8 +1279,143 @@ def _arrivals_arg(text):
     return out
 
 
-def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None, reassign=None):
-    """依頼を足す (コマンドとダッシュボードの両方から使う). conds: 計画の条件 (id 付き) のリスト."""
+# ---------------------------------------------------------------------------
+# 司令塔と他のマシン (共有フォルダの _autorun/ でやり取りする)
+# ---------------------------------------------------------------------------
+
+def commander_label(conf=None):
+    conf = conf if conf is not None else load_conf()
+    return conf.get("autorun_commander") or conf.get("machine")
+
+
+def is_client(conf=None):
+    """このマシンが司令塔でないか (collect_config.yaml の autorun_commander が自分の machine と違う)."""
+    conf = conf if conf is not None else load_conf()
+    c = conf.get("autorun_commander")
+    return bool(c) and c != conf.get("machine")
+
+
+def shared_dir(conf=None):
+    conf = conf if conf is not None else load_conf()
+    root = conf.get("drop_root")
+    return os.path.join(os.path.expanduser(root), COMMANDER_DIR) if root else None
+
+
+def send_request(op):
+    """司令塔への依頼 (add / cancel / pause) を共有フォルダに置く. 取り込まれるのは司令塔の次の tick."""
+    conf = load_conf()
+    d = shared_dir(conf)
+    if not d:
+        raise RuntimeError("drop_root is not set in %s" % CONFIG)
+    op = dict(op, origin=conf.get("machine"), at=now_utc().isoformat())
+    # 同じ秒に続けて送っても上書きしないよう、末尾に乱数を付ける (名前順 = 送った順は保つ)
+    name = "%s_%s_%s.json" % (now_utc().strftime("%Y%m%d%H%M%S%f"), conf.get("machine") or "host",
+                              os.urandom(3).hex())
+    os.makedirs(os.path.join(d, "requests"), exist_ok=True)
+    tmp = os.path.join(d, "requests", "." + name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(op, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(d, "requests", name))
+
+
+def published(name, default=None):
+    """司令塔が書き出した写し (conds.json / summary.json / hosts.json)."""
+    d = shared_dir()
+    return load_json(os.path.join(d, name), default) if d else default
+
+
+def ingest_requests(say):
+    """他のマシンから届いた依頼を queue に取り込み、requests/done/ に結果つきで移す."""
+    d = shared_dir()
+    if not d:
+        return
+    files = sorted(glob.glob(os.path.join(d, "requests", "*.json")))
+    by_id = None
+    for p in files:
+        op = load_json(p, None)
+        if op is None:                      # 同期の途中など。次の tick でもう一度読む
+            continue
+        try:
+            if op.get("op") == "add":
+                if by_id is None:
+                    by_id = dict((c["id"], c) for c in load_conds(dashboard()))
+                picked = [by_id[i] for i in op.get("ids") or [] if i in by_id]
+                if not picked:
+                    raise RuntimeError("unknown condition id(s): %s" % ", ".join(op.get("ids") or []))
+                made = add_requests(op.get("kind") or "train", picked, op.get("n") or 1, op.get("then_eval"),
+                                    op.get("machines"), op.get("arrivals"), op.get("reassign"),
+                                    origin=op.get("origin"), like=op.get("like"), lare_model=op.get("lare_model"))
+                result = "accepted: " + ", ".join(r["id"] for r in made)
+            elif op.get("op") == "cancel":
+                result = "cancelled: " + ", ".join(cancel_requests(op.get("ids") or [])) or "nothing to cancel"
+            elif op.get("op") == "pause":
+                set_pause(bool(op.get("on")))
+                result = "paused" if op.get("on") else "resumed"
+            else:
+                raise RuntimeError("unknown op %r" % op.get("op"))
+        except Exception as e:
+            result = "error: %s" % e
+        say("[autorun] request from %s: %s %s" % (op.get("origin"), op.get("op"), result))
+        os.makedirs(os.path.join(d, "requests", "done"), exist_ok=True)
+        with open(os.path.join(d, "requests", "done", os.path.basename(p)), "w") as f:
+            json.dump(dict(op, result=result, done_at=now_utc().isoformat()), f, ensure_ascii=False)
+        os.remove(p)
+
+
+def drop_cancelled():
+    """取り消した依頼のうち、共有フォルダのマシンがまだ拾っていないジョブを inbox から消す."""
+    ids = [r["id"] for r in load_queue() if r.get("status") == "cancelled"]
+    if not ids:
+        return
+    for h in hosts_of(load_conf()):
+        if h.get("drop"):
+            for i in ids:
+                for p in glob.glob(os.path.join(h["drop_dir"], "inbox", i + "_*.json")):
+                    os.remove(p)
+
+
+def publish(say):
+    """他のマシンの find / status / hosts 用に、計画の条件・依頼の要約・マシンの状態を共有フォルダに書き出す."""
+    d = shared_dir()
+    if not d:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        try:
+            dash = dashboard()
+            out = []
+            for c in load_conds(dash):
+                rs = runs_of(c, dash)
+                cnt = lambda *ss: sum(1 for r in rs if r.get("state") in ss)
+                out.append(dict(c, counts={"done": cnt("done"), "running": cnt("running"),
+                                           "failed": cnt("failed", "stalled")}))
+            save_json(os.path.join(d, "conds.json"), json.loads(json.dumps(out, default=str)))
+        except Exception as e:
+            say("[autorun] publish conds: %s" % e)
+        save_json(os.path.join(d, "summary.json"),
+                  dict(summary(), commander=commander_label(), at=now_utc().isoformat()))
+        if LAST_STATES:
+            keep = ("label", "reachable", "n_train", "n_eval", "cpu_free", "mem_free_mb", "gpu_free_mb", "gpu_util")
+            save_json(os.path.join(d, "hosts.json"),
+                      {"at": now_utc().isoformat(),
+                       "hosts": [dict((k, st.get(k)) for k in keep) for st in LAST_STATES.values()]})
+    except (IOError, OSError) as e:
+        say("[autorun] publish: %s" % e)
+
+
+def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None, reassign=None, origin=None,
+                 like=None, lare_model=None):
+    """依頼を足す (コマンドとダッシュボードの両方から使う). conds: 計画の条件 (id 付き) のリスト.
+
+    司令塔でないマシンでは、共有フォルダ経由で司令塔に送る (返り値の id は "(sent)")。
+    like / lare_model: 実績の無い条件を、別の条件 (like) の設定で LaRe モデルだけ替えて学習する (template_for)
+    """
+    if is_client():
+        send_request({"op": "add", "kind": kind, "ids": [c["id"] for c in conds], "n": int(n),
+                      "then_eval": bool(then_eval), "machines": machines or None, "arrivals": arrivals,
+                      "reassign": reassign, "like": like, "lare_model": lare_model})
+        return [{"id": "(sent)", "kind": kind, "count": int(n), "then_eval": bool(then_eval),
+                 "cond_text": [cond_text(c) for c in conds] if kind == "eval" else cond_text(conds[0])}]
     q = load_queue()
     made = []
     if kind == "train":
@@ -1018,14 +1423,16 @@ def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None
             req = {"id": new_req_id(q), "kind": "train", "cond": c["id"], "cond_text": cond_text(c),
                    "count": int(n), "then_eval": bool(then_eval), "arrivals": arrivals,
                    "eval_reassign": reassign, "machines": machines or None, "status": "open",
-                   "created": now_utc().isoformat()}
+                   "created": now_utc().isoformat(), "origin": origin}
+            if like and lare_model:
+                req.update(like=like, lare_model=lare_model)
             q.append(req)
             made.append(req)
     else:
         req = {"id": new_req_id(q), "kind": "eval", "conds": [c["id"] for c in conds],
                "cond_text": [cond_text(c) for c in conds], "arrivals": arrivals,
                "reassign": reassign if reassign is not None else [False, True], "machines": machines or None,
-               "status": "open", "created": now_utc().isoformat()}
+               "status": "open", "created": now_utc().isoformat(), "origin": origin}
         q.append(req)
         made.append(req)
     save_json(QUEUE, q)
@@ -1033,6 +1440,9 @@ def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None
 
 
 def cancel_requests(ids):
+    if is_client():
+        send_request({"op": "cancel", "ids": list(ids)})
+        return list(ids)
     q = load_queue()
     hit = []
     for r in q:
@@ -1044,6 +1454,9 @@ def cancel_requests(ids):
 
 
 def set_pause(on):
+    if is_client():
+        send_request({"op": "pause", "on": bool(on)})
+        return
     os.makedirs(STATE, exist_ok=True)
     if on:
         open(PAUSE, "w").close()
@@ -1051,12 +1464,22 @@ def set_pause(on):
         os.remove(PAUSE)
 
 
-def summary(limit_closed=8):
-    """ダッシュボード用の軽い要約 (ssh もダッシュボードの API も使わない)."""
+def summary(limit_closed=0):
+    """ダッシュボード用の軽い要約 (ssh もダッシュボードの API も使わない).
+
+    司令塔でないマシンでは、司令塔が書き出した写しを返す (remote に書き出した時刻)。
+    終わった依頼 (完了・取り消し・エラー) は既定では出さない (2026-11-12 ユーザーの希望)。
+    記録は queue.json に残り、`autorun.py status --all` で見られる
+    """
+    if is_client():
+        s = published("summary.json") or {"requests": [], "paused": False, "hosts": []}
+        s["remote"] = {"commander": s.get("commander"), "at": s.get("at")}
+        return s
     q = load_queue()
     led = ledger()
     out = []
-    closed = [r for r in q if r.get("status") != "open"][-limit_closed:]
+    # [-0:] はリスト全体になるので、0 件のときは明示的に空にする
+    closed = [r for r in q if r.get("status") != "open"][-limit_closed:] if limit_closed > 0 else []
     for r in [r for r in q if r.get("status") == "open"] + closed[::-1]:
         mine = [x for x in led if x.get("req") == r["id"]]
         d = {"id": r["id"], "kind": r["kind"], "status": r.get("status"), "note": r.get("note"),
@@ -1075,8 +1498,7 @@ def summary(limit_closed=8):
 
 
 def cmd_add(args):
-    dash = dashboard()
-    conds = load_conds(dash)
+    conds = client_conds() if is_client() else load_conds(dashboard())
     by_id = dict((c["id"], c) for c in conds)
     for i in args.ids:
         if i not in by_id:
@@ -1085,16 +1507,51 @@ def cmd_add(args):
     machines = [m.strip() for m in args.machines.split(",")] if args.machines else None
     arrivals = _arrivals_arg(args.arrivals) if args.arrivals else None
     reassign = [x.strip().lower() in ("t", "true", "1") for x in args.reassign.split(",")] if args.reassign else None
+    if bool(args.like) != bool(args.lare_model):
+        print("--like and --lare-model go together")
+        return 1
+    if args.like and (args.kind != "train" or args.like not in by_id):
+        print("--like needs `add train` and a condition id from `find`")
+        return 1
     made = add_requests(args.kind, [by_id[i] for i in args.ids], args.n, args.then_eval, machines,
-                        arrivals, reassign)
+                        arrivals, reassign, like=args.like, lare_model=args.lare_model)
     for r in made:
         what = ("train x%d%s" % (r["count"], " + eval" if r.get("then_eval") else "")) if r["kind"] == "train" else "eval"
         print("%s accepted: %s  %s" % (r["id"], what, r.get("cond_text")))
-    print("It is launched at the next tick (every 15 min), or now with: python tools/autorun.py tick")
+    if is_client():
+        print("Sent to the commander (%s) through the shared folder. It is accepted at its next tick (every 15 min)."
+              % commander_label())
+    else:
+        print("It is launched at the next tick (every 15 min), or now with: python tools/autorun.py tick")
+    return 0
+
+
+def cmd_status_client(args):
+    s = summary()
+    print("(copy written by the commander %s at %s)" % (s["remote"].get("commander"),
+                                                      fmt_dt(parse_dt(s["remote"].get("at")))))
+    if s.get("paused"):
+        print("** paused: no new launches **")
+    for r in s.get("requests") or []:
+        if not args.all and r.get("status") != "open" and r["id"] not in args.ids:
+            continue
+        if args.ids and r["id"] not in args.ids:
+            continue
+        if r["kind"] == "train":
+            print("%s [%s] train %d/%d launched%s on %s  %s" % (
+                r["id"], r["status"], r.get("launched") or 0, r.get("count") or 0,
+                " +eval" if r.get("then_eval") else "", ",".join(r.get("hosts") or []) or "-", r.get("cond_text")))
+        else:
+            print("%s [%s] eval %d models on %s" % (r["id"], r["status"], r.get("models") or 0,
+                                                   ",".join(r.get("hosts") or []) or "-"))
+        if r.get("note"):
+            print("    note: %s" % r["note"])
     return 0
 
 
 def cmd_status(args):
+    if is_client():
+        return cmd_status_client(args)
     q = load_queue()
     if not q:
         print("no requests.")
@@ -1154,6 +1611,16 @@ def cmd_cancel(args):
 
 
 def cmd_hosts(args):
+    if is_client():
+        h = published("hosts.json") or {}
+        print("(copy written by the commander %s at %s)" % (commander_label(), fmt_dt(parse_dt(h.get("at")))))
+        f = lambda v, fmt="%d": "-" if v is None else fmt % v
+        for st in h.get("hosts") or []:
+            print("%-5s reachable=%s  train %d  eval %d  free: cpu %s cores, mem %s MB, gpu %s MB (util %s%%)" % (
+                st["label"], st.get("reachable"), st.get("n_train") or 0, st.get("n_eval") or 0,
+                f(st.get("cpu_free"), "%.1f"), f(st.get("mem_free_mb")), f(st.get("gpu_free_mb")),
+                f(st.get("gpu_util"))))
+        return 0
     conf = load_conf()
     dash = dashboard()
     led = ledger()
@@ -1175,6 +1642,38 @@ def cmd_hosts(args):
     return 0
 
 
+def cmd_pull(args):
+    """共有フォルダのマシン (黒・M2 など) に git pull --ff-only をさせる / その結果を見る.
+
+    worker が次に動いたとき (5 分おき) に train_repo で git pull する。動いている学習・評価は止めない。
+    ssh のマシン (GPU1・GPU2) は対象外 (GPU 版のリポジトリは別に管理する)。
+    """
+    hosts = dict((h["label"], h) for h in hosts_of(load_conf()) if h.get("drop"))
+    labels = args.machines or sorted(hosts)
+    bad = [m for m in labels if m not in hosts]
+    if bad:
+        print("not a shared-folder machine: %s (choose from %s)" % (", ".join(bad), ", ".join(sorted(hosts))))
+        return 1
+    for m in labels:
+        h = hosts[m]
+        if args.check:
+            done = sorted(glob.glob(os.path.join(h["drop_dir"], "started", "pull_*.json")))
+            waiting = glob.glob(os.path.join(h["drop_dir"], "inbox", "pull_*.json"))
+            last = load_json(done[-1], {}) if done else {}
+            print("%-4s last: %s  %s%s  (code now: %s)" % (
+                m, last.get("id", "-"), last.get("result") or "",
+                ("ERROR " + last["error"]) if last.get("error") else "",
+                drop_status(h).get("train_head")))
+            if waiting:
+                print("      waiting in inbox: %s" % ", ".join(os.path.basename(w) for w in waiting))
+            continue
+        job_id = "pull_%s_%s" % (m, time.strftime("%m%d%H%M%S"))
+        drop_put(h, "inbox", job_id + ".json", {"id": job_id, "kind": "pull", "host": m})
+        print("%s: git pull is queued (%s). The worker runs it within ~5 min; check with `autorun.py pull --check`"
+              % (m, job_id))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Run LDRP training / evaluation requests on several machines.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1190,12 +1689,19 @@ def main(argv=None):
     a.add_argument("--machines", help="comma separated host labels to use (default: all enabled)")
     a.add_argument("--arrivals", help='e.g. "8x5=fixed,mmpp,bernoulli:0.05;aoba00=fixed,mmpp,bernoulli:0.01"')
     a.add_argument("--reassign", help="execution-time reassign to evaluate, e.g. F,T (default both)")
+    a.add_argument("--like", metavar="ID", help="(train) copy the parameters of this condition's runs when the "
+                                                "requested condition has no run yet (use with --lare-model)")
+    a.add_argument("--lare-model", metavar="FILE", help="(train, with --like) LaRe-Path model file name to use "
+                                                        "instead of the one in the --like runs")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("ids", nargs="*")
     s.add_argument("--all", action="store_true", help="include finished / cancelled requests")
     c = sub.add_parser("cancel", help="cancel requests (launched runs keep running)")
     c.add_argument("ids", nargs="+")
     sub.add_parser("hosts", help="show machines and free slots")
+    g = sub.add_parser("pull", help="make shared-folder machines (e.g. 黒, M2) run git pull --ff-only")
+    g.add_argument("machines", nargs="*", help="host labels (default: all shared-folder machines)")
+    g.add_argument("--check", action="store_true", help="show the result of the last pull instead")
     sub.add_parser("pause", help="stop launching new jobs")
     sub.add_parser("resume", help="resume launching")
     t = sub.add_parser("tick", help="launch what can be launched now")
@@ -1212,13 +1718,15 @@ def main(argv=None):
         return cmd_cancel(args)
     if args.cmd == "hosts":
         return cmd_hosts(args)
+    if args.cmd == "pull":
+        return cmd_pull(args)
     if args.cmd == "pause":
         set_pause(True)
-        print("paused. running jobs are not touched.")
+        print(("sent to the commander: " if is_client() else "") + "paused. running jobs are not touched.")
         return 0
     if args.cmd == "resume":
         set_pause(False)
-        print("resumed.")
+        print(("sent to the commander: " if is_client() else "") + "resumed.")
         return 0
     if args.cmd == "tick":
         tick(dry_run=args.dry_run)

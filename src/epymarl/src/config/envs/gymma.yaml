@@ -12,6 +12,9 @@ env_args:
   pretrained_lare_path_model_name: "FT_QMIX_PATH_Safe_map_8x5_2agents_10.0M_Safe_map_aoba00_2agents_5.0M_checkpoint"
   use_finetuning_lare_path: False
   finetuning_lare_path_model_name: "Safe_QMIX_PATH_map_8x5_2agents_6.7M_checkpoint.pth"
+  # LaRe-Path の評価関数の版 (1 = DRP の 10 因子 / 2・3 = LLM 生成)。design/lare_factor_versions.md
+  # ここに無いと sacred が env_args.lare_path_factor_version=2 を「新しいキー」として拒否する
+  lare_path_factor_version: 1
   allow_reassign_before_pickup: False
   task_arrival: "fixed"
   task_density: 0.3

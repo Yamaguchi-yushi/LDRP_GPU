@@ -3,9 +3,9 @@ import time
 import os
 import json
 
-_SLOT = os.path.expanduser("~/.ldrp/batch_%d.json" % os.getpid())
+_SLOT = os.path.expanduser("~/.ldrp/batch_%d.json" % os.getpid())   # for dashboard
 
-def _publish_batch(started, cmd=None):
+def _publish_batch(started, cmd=None):      # for dashboard
     try:
         os.makedirs(os.path.dirname(_SLOT), exist_ok=True)
         rec = {"pid": os.getpid(), "total": num_runs,
@@ -29,7 +29,7 @@ command = [
 num_runs = 1
 maxpurocesses = 1
 running_processes = []
-_publish_batch(0)
+_publish_batch(0)   # for dashboard
 
 for i in range(num_runs):
     #algとmap，実行step数確認，drp_envのpbs用の変更箇所
@@ -40,13 +40,17 @@ for i in range(num_runs):
     command = (
         f'python src/epymarl/src/main.py --config=mappo --env-config=gymma --beat-interval=3600 '
         f'with env_args.time_limit=500 '
-        f't_max=30050000 '
-        f'env_args.key="drp_env:drp_safe-7agent_map_8x5-v2" '
+        f't_max=50050000 '
+        f'env_args.key="drp_env:drp_safe-10agent_map_8x5-v2" '
         f'env_args.state_repre_flag="onehot_fov" '
-        f'env_args.use_lare_path=False '
+        f'env_args.use_lare_path=True '
         f'env_args.use_lare_path_training=True '
+        # LaRe-Path の評価関数の版 (1: DRP の 10 因子 = 既定 / 2: LLM 生成 v1 / 3: LLM 生成 v2)。
+        # 版 1 なら書かなくてよい。2・3 は学習済みデコーダが無いので pretrained / finetuning を False にして scratch で回す
+        # (design/lare_factor_versions.md §4.4・§8.7)
+        # f'env_args.lare_path_factor_version=2 '
         f'env_args.use_pretrained_lare_path=True '
-        f'env_args.pretrained_lare_path_model_name="FT_QMIX_PATH_Safe_map_8x5_5agents_10.0M_Safe_map_aoba00_5agents_10.0M_checkpoint.pth" '
+        f'env_args.pretrained_lare_path_model_name="QMIX_PATH_Safe_map_8x5_5agents_10.0M_checkpoint_waitedit.pth" '
         f'env_args.use_finetuning_lare_path=False '
         f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
         f'env_args.allow_reassign_before_pickup=True '
@@ -130,7 +134,7 @@ for p in running_processes:
     p.wait()
 
 print("All runs completed.")
-try:
+try:    # for dashboard
     os.remove(_SLOT)
 except OSError:
     pass

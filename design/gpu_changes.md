@@ -409,6 +409,35 @@ heartbeat と時刻が一致せず、原因不明。
 
 ---
 
+## 2026-11-14 PC コミット取り込み (`835dfcf` 〜 `1ff4397`, 12 件)
+
+`a4930df` を共通の祖先として、各ファイルに PC 側の差分だけを 3-way マージ (`git merge-file`) で適用。
+主な中身は **LaRe-Path の評価関数の版切り替え (`lare_path_factor_version`, 版 1〜3)** と tools の更新。
+
+### 衝突解決メモ
+
+| ファイル | 衝突内容 | 採用 |
+|---|---|---|
+| `src/main/drp_env/drp_env.py` (3 箇所) | 版 2・3 用の記録 (`_lare_events` 等)、info に `off_command` / `off_done` / `spawn` を追加、配達完了時の `_reassign_event = True` | PC 側。GPU 固有 (`lare_device`、LaRe の既定値、`reset_prepick_assignments`) は残っていることを確認 |
+| `src/main/drp_env/wrapper/safe_marl.py` (2 箇所) | PC が **動的エージェント用の処理をすべてコメントアウト** (「[動的台数] 2026-11-02 一旦無効化」) し、`_lare_override` を追加 | PC 側 (PC 版と同一)。**`use_dynamic_agents=True` の run では、非アクティブ機も安全制御の対象になり、station の渋滞防止も効かなくなる**。台数固定の run には影響なし |
+| `train.py` (3 箇所) | 実験条件 | **GPU 版を維持**。PC の `lare_path_factor_version` の説明コメントだけ追加 |
+| `MANUAL.md` | 更新履歴の先頭 | 両方残す (PC の新しい履歴 7 件を GPU 固有の履歴の上に挿入) |
+| `tools/collect_runs.py` / `dashboard/app.py` / `lare_models.py` / `autorun.py` | GPU 側に PC の途中の版が入っていた | PC の最新版を採用し、**`collect_runs.py` の t_env 第 3 フォールバックを入れ直した** |
+
+### 取り込みで入った変更 (PC 版の MANUAL に詳細あり)
+
+- `lare_path_factor_version` (既定 1 = 従来どおり)。版 2・3 は学習済みデコーダが無いので scratch でのみ使う
+- **LaRe のモデルが無い・読めないと `gym.make` で止まる** (PC 10/16。2026-10-16 に GPU 側で見つけた「黙って LaRe なしになる」問題の修正)
+- 新規モデル `FT_QMIX_PATH_Safe_map_aoba00_5agents_10.0M_Safe_map_aoba00_7agents_10.0M_checkpoint.pth`
+- `.claude/settings.json` (応答を日本語にする念押しの hook のみ)
+
+### 動作確認 (2026-11-14)
+
+台数固定・動的・LaRe 版 1 (pretrained)・版 2・版 3 (scratch) で reset → 30 step が通ること、存在しないモデル名で
+`FileNotFoundError` になることを確認。
+
+---
+
 ## PC→GPU 取り込み手順
 
 1. PC 版の変更を `git fetch` / `git cherry-pick` 等で取得

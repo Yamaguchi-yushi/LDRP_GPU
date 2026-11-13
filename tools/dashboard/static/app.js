@@ -1435,9 +1435,11 @@ function valueAt(xs, ys, x) {
   const sl = ys.slice(Math.max(0, i - 3), i + 4).filter(v => v != null);
   return sl.length ? sl.reduce((a, b) => a + b, 0) / sl.length : null;
 }
-// 同じ条件の run を 1 本にする。共通の x の格子に線形補間して、全 run が届いている範囲だけ平均
+// 同じ条件の run を 1 本にする。共通の x の格子に線形補間して平均する。
+// 横軸は最も長い run の端まで。各点ではそこまで届いている run だけで平均する
+// (短い run に合わせると、途中で止めた run や学習中の seed があるだけで、終わった run の後半が見えなくなる)
 function meanSeries(list) {
-  const end = Math.min(...list.map(s => s.xs[s.xs.length - 1]));
+  const end = Math.max(...list.map(s => s.xs[s.xs.length - 1]));
   const grid = [];
   for (let i = 0; i <= 200; i++) grid.push(end * i / 200);
   const interp = (xs, ys, x) => {
@@ -1445,7 +1447,7 @@ function meanSeries(list) {
     for (let k = 1; k < xs.length; k++)
       if (xs[k] >= x) { const t = (x - xs[k - 1]) / (xs[k] - xs[k - 1] || 1);
                         return ys[k - 1] + t * (ys[k] - ys[k - 1]); }
-    return ys[ys.length - 1];
+    return null;                               // この run はここまで届いていない
   };
   // 平均に加えて seed の範囲 (最小・最大) と標本標準偏差も持つ (図の帯に使う)
   const ys = [], mn = [], mx = [], sd = [];

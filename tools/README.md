@@ -6,6 +6,7 @@
 | [eval_report.py](eval_report.py) | **方策評価** | `results/summary.csv` を条件ごとに分解して表示 |
 | [plan.py](plan.py) | 実験計画 | `plans/*.md` をパースする。Notion の表をそのまま貼れる |
 | [dashboard/](dashboard/) | 両方 | ローカル Web アプリ (学習の進捗 / 評価結果 の 2 タブ) |
+| [autorun.py](autorun.py) | 両方 | 依頼した学習・評価を空いているマシンに自動で投入する。使い方とセットアップは [AUTORUN.md](AUTORUN.md) |
 
 **収集される側のマシン** (SSH で繋がらない Mac など) のセットアップは
 [SETUP_export_machine.md](SETUP_export_machine.md) を参照。そのマシンで

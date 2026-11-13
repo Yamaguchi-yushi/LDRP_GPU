@@ -1,0 +1,15 @@
+{
+  "language": "japanese",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '【必読・最優先】応答は必ず日本語で書く (CLAUDE.md「最優先: 応答は必ず日本語」)。途中経過・質問・完了報告も含めすべて日本語。英語にするのはプログラムが出力する文字列だけ。'"
+          }
+        ]
+      }
+    ]
+  }
+}

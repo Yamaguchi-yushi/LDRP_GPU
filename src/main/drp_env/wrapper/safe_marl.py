@@ -21,8 +21,9 @@ class SafeEnv(DrpEnv):
 		cur = [self.obs[i][0], self.obs[i][1]]
 		a = int(action_i)
 		# 非アクティブ機は待機のみ (drp_env._get_avail_agent_actions の先頭分岐)
-		if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
-			return cur
+		# [動的台数] 2026-11-02 一旦無効化 (台数固定では発動しない)
+		# if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
+			# return cur
 		# 非タスクモードで最終ゴール上に居るときは goal のみ (EE_map の先頭分岐)
 		if not self.ee_env.is_task_flag and [cur[0], cur[1]] == self.pos[self.goal_array[i]]:
 			if a != int(self.goal_array[i]):
@@ -58,37 +59,43 @@ class SafeEnv(DrpEnv):
 		if not hasattr(self, "safety_intervention_count"):
 			self.safety_intervention_count = 0
 
+		# このステップ、機体ごとに動きを止めたか (LaRe-Path の観測 版 2 以降で使う)
+		override = [0] * self.agent_num
+
 		i = 0
 		do = True
 
 		while do:
 			do = False
 			for i in range(self.agent_num):
-				if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
-					continue
+				# [動的台数] 2026-11-02 一旦無効化 (台数固定では発動しない)
+				# if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
+					# continue
 
-				# one agent can reach the station node at the same time
-				if getattr(self, "use_dynamic_agents", False) and self.pending_off[i] \
-					and self.current_goal[i] == None:
-					st = self.goal_array[i]
-					busy = any(
-						k != i and self.active[k] and (int(self.current_start[k]) == st
-									or (self.pending_off[k] and self.goal_array[k] == st
-									and self.current_goal[k] != None))
-									for k in range(self.agent_num))
-					if busy:
-						joint_action[i] = self.current_start[i]
-						continue
-
+				# # one agent can reach the station node at the same time
+				# if getattr(self, "use_dynamic_agents", False) and self.pending_off[i] \
+					# and self.current_goal[i] == None:
+					# st = self.goal_array[i]
+					# busy = any(
+						# k != i and self.active[k] and (int(self.current_start[k]) == st 
+									# or (self.pending_off[k] and self.goal_array[k] == st
+									# and self.current_goal[k] != None))
+									# for k in range(self.agent_num))
+					# if busy:
+						# joint_action[i] = self.current_start[i]
+						# continue
+						
 				#act8，他のエージェントと向かう先が同じ場合
 				#自分がノード上にいる時
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
-						if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
-							continue
+						# [動的台数] 2026-11-02 一旦無効化
+						# if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
+							# continue
 						if j != i and joint_action[i] == joint_action[j]:
 							if joint_action[i] != self.current_start[i]:
 								self.safety_intervention_count += 1
+								override[i] = 1
 								joint_action[i] = self.current_start[i]
 								do = True #条件が変わる可能性があるため，もう一度ループを回す
 							break
@@ -97,11 +104,13 @@ class SafeEnv(DrpEnv):
 				#自分がノード上にいる時
 				if self.current_goal[i] == None:
 					for j in range(self.agent_num):
-						if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
-							continue
+						# [動的台数] 2026-11-02 一旦無効化
+						# if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
+							# continue
 						if j != i and (joint_action[j] == self.current_start[i] and joint_action[i] == self.current_start[j]):
 							if joint_action[i] != self.current_start[i]:
 								self.safety_intervention_count += 1
+								override[i] = 1
 								joint_action[i] = self.current_start[i]
 								do = True
 							break
@@ -109,21 +118,25 @@ class SafeEnv(DrpEnv):
 			if not do:
 				pred = [self._predict_pos(k, joint_action[k]) for k in range(self.agent_num)]
 				for i in range(self.agent_num):
-					if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
-						continue
+					# [動的台数] 2026-11-02 一旦無効化
+					# if getattr(self, "use_dynamic_agents", False) and not self.active[i]:
+						# continue
 					hit = False
 					for j in range(self.agent_num):
-						if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
-							continue
+						# [動的台数] 2026-11-02 一旦無効化
+						# if getattr(self, "use_dynamic_agents", False) and not self.active[j]:
+							# continue
 						if j != i and math.dist(pred[i], pred[j]) < self.colli_distan_value:
 							hit = True
 							break
 					if hit and joint_action[i] != self.current_start[i]:
 						self.safety_intervention_count += 1
+						override[i] = 1
 						joint_action[i] = self.current_start[i]
 						do = True
 						break
-
+					
+		self._lare_override = override
 		joint_action = {"pass": joint_action, "task": task_assign} if task_assign is not None else joint_action
 		obs, ri_array, self.terminated, info = super().step(joint_action)
 

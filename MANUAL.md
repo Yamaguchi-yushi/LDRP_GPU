@@ -524,6 +524,103 @@ use_lare_path_training: false   # 学習はする, 環境の報酬は元のま�
 
 ---
 
+### 2026-11-14 LaRe-Path の評価関数を番号で切り替える (`lare_path_factor_version`, 版 1〜3)
+
+- **意図**: LaRe-Path の評価関数 (因子) を、DRP 用の 10 因子 (MARL4DRP の評価関数) と、LLM が LDRP 用に生成した評価関数とで比べられるようにする。評価関数ごとに前提の観測の並びが違うので、観測の作り方と評価関数を 1 組にして番号で選ぶ
+- **変わること**:
+  - 新しい設定キー `lare_path_factor_version` (env_args / `gym.make` の引数、既定 1)
+    - `1`: DRP 用の 10 因子 (今までと同じ)
+    - `2`: LLM 生成の評価関数 v1 (`src/lare/path/factors_ldrp_v1.py`) + 19 区間の観測 (`obs_ldrp.py`)
+    - `3`: LLM 生成の評価関数 v2 (`src/lare/path/factors_ldrp_v2.py`) + 長さ 7N + 4NK + 6K + 26 の観測 (`obs_ldrp_v2.py`)。評価関数は辺の長さの表 (adj) も使う
+    - 登録に無い番号は `gym.make` の時点で `ValueError: unknown lare_path_factor_version` で止まる
+  - **LaRe-Path の保存ファイル名**: 版 2 以降は `PATH` の後ろに版が入る (例: `QMIX_PATH_F2_Safe_map_8x5_5agents_1.0M_checkpoint.pth`)。版 1 は今までどおり
+  - 保存するファイルに `factor_version` を書く。読み込み時に版を照合し、違う版のデコーダは `ValueError: factor_version mismatch` で止まる (版の書かれていない今までのファイル・MARL4DRP 形式は版 1 として扱う)
+  - 版 2・3 の学習済みデコーダはまだ無いので、`use_pretrained_lare_path=False`・`use_finetuning_lare_path=False` (scratch) で回す。env の既定は pretrained が ON なので、指定し忘れると起動時に止まる
+  - SafeEnv が機体ごとに「このステップ動きを止めたか」を env (`_lare_override`) に書くようになった (版 2・3 の観測で使う)
+- **触ったファイル**: 新規 `src/lare/path/factor_versions.py` / `obs_ldrp.py` / `obs_ldrp_v2.py` / `factors_ldrp_v1.py` / `factors_ldrp_v2.py`。変更 `src/lare/path/lare_path_module.py`、`src/main/drp_env/drp_env.py`、`src/main/drp_env/wrapper/safe_marl.py`、`train.py` (使い方のコメントのみ)。設計は [design/lare_factor_versions.md](design/lare_factor_versions.md)
+- **互換性**: `lare_path_factor_version` を指定しない (= 1) ときの因子・報酬・保存ファイル名・読み込みは今までと同じ (`tools/lare_factor_smoke.py` で変更前と同じ報酬の合計を確認)。保存ファイルに `factor_version` のキーが 1 つ増える (今までのコードで読んでも無視される)。ダッシュボードは版 2・3 の run を `safe F2` / `safe F3` として別の条件に数える
+
+---
+
+### 2026-10-16 LaRe のモデルが無い・読めないときは、学習を始めずに止める
+
+- **意図**: 指定した pretrained / finetuning の LaRe モデルが無い・読めないと、今までは警告を出すだけで **LaRe を切って (環境の報酬で) 学習が進んだ**。読めないときは scratch に切り替わった。config.json には「LaRe あり (事前学習あり)」と残るので、後から見分けられない。2026-10-15 に GPU で、未配置のモデルを指定した 4 本がこうなっていた
+- **変わること**:
+  - `use_pretrained_lare_path` / `use_finetuning_lare_path` で指定したモデルが `src/lare/path/models/` に無いと、`gym.make` の時点で `FileNotFoundError` で止まる (学習が始まらない)
+  - モデルはあるが読めない (壊れている・デコーダの形が違う) と `ValueError: [LaRe-Path][PRETRAINED] Load failed: …` で止まる (今までは「falling back to scratch」の警告だけ)
+  - LaRe-Task (`use_pretrained_lare_task` / `use_finetuning_lare_task`) も同じ
+  - それ以外の想定外の初期化の失敗は、今までどおり「Failed to initialize, falling back to env reward」で環境の報酬に戻る
+- **触ったファイル**: `src/main/drp_env/drp_env.py` (`_init_lare_path` / `_load_lare_path_weights` / `_init_lare_task` / `_load_lare_task_weights`)。設計は [design/lare_factor_versions.md §4.5](design/lare_factor_versions.md)
+- **互換性**: **破壊的変更**。モデル名の打ち間違い・置き忘れがある train.py は、今までは (LaRe なしで) 動いていたが、これからは起動直後に止まる。モデルが読める run・scratch・LaRe なしの挙動は変わらない。GPU 版 (LDRP_GPU) は別に直す必要がある
+
+---
+
+### 2026-10-14 学習時の到着率の範囲を、評価用モデルの名前 (method_tag) に入れる
+
+- **意図**: 学習時の到着率の範囲を変えた run (tools/plans/plan_arrival_range.md) が、既定の範囲の run と同じ名前の列 (`map_8x5_7_mappo_safe_base_seed5.th` など) に seed の番号違いで入っていた。番号の付き方が条件ごとにばらばらで、run.py で範囲をそろえて評価できず、評価結果も別の範囲が同じ条件の seed として平均されてしまう
+- **変わること**:
+  - collect_runs.py が決める method_tag に、既定 U(0.01, 0.10) 以外で学習した run だけ範囲を足す (例: `safe` → `safe_p0.01-0.15`)。評価用モデルの名前は `map_8x5_7_mappo_safe_p0.01-0.15_base_seed0.th` になり、範囲ごとに seed0 から数える
+  - 評価の条件名にもタグが入る (`…/safe_mappo_safe_p0.01-0.15_base_tp_…`) ので、集計・ダッシュボードの評価タブで別の条件として扱われる
+  - run.py では `method_tag = ["safe", "safe_p0.01-0.15", "safe_p0.01-0.2", "safe_p0.05-0.2"]` のように並べて評価する (タグの数字は `%g` 表記なので 0.20 は `0.2`)
+  - 保管リポジトリ (`~/LDRP_models/arrival_range/`) の 36 本を新しい名前で置き直し、評価用の置き場 (`src/all_policy/models/safe/` と `src/task_assign/models/safe/`) にも設置した
+- **触ったファイル**: `tools/collect_runs.py` (`derive`)
+- **互換性**: 既定の範囲で学習した run (AAMAS / reassign の計画) の名前は変わらない。保管リポジトリの古い名前 (`…_seed5.th` など、到着率範囲の run) のファイルと manifest.jsonl の行は消した
+
+---
+
+### 2026-10-07 評価のログを回ごとのフォルダに分けて残す
+
+- **意図**: run.py はログを同じ名前に書いていたので、同じ条件・同じ seed を回し直すと前の結果が消えていた。また、ログの名前からは、どの回 (どの設定) で回したものかが分からなかった
+- **変わること**:
+  - run.py は、起動するたびに `logs/<起動日時 (秒まで)>_<回の名前>/` のフォルダを作り、その下に今までと同じ形 (`map_8x5/safe/mappo/7agent/…_seed0.txt`) でログを書く
+  - 回の名前は、run.py の `run_tag` に書けばそれを、空なら一覧から自動で作る (例: `8x5_N5-7-10_mappo_tp-ppo_safe_trainReassign-off-on_p0.01-0.2-mmpp_execReassign-on-off`)
+  - 回のフォルダに `batch_info.txt` (run.py の一覧・model_seed・git のコミット・コマンド数)、`summary.csv` (この回だけの集計)、`summary_all.csv` (この回が終わった時点の全体の集計の写し) を残す
+  - `results/summary.csv` (ダッシュボードの評価タブが読む) は、今までどおり `logs/` の下の全部のログから作り直す。同じ条件・同じ seed は新しい方を使う
+  - 上書きの守り: 同じ名前のフォルダがあれば止まり、ログは「新しく作るときだけ書ける」開き方 (`"x"`) にした
+  - aggregate.py の `duplicate entry` の警告は、「古い結果を N 件置き換えた」の 1 行にまとめた
+- **触ったファイル**: `run.py`, `aggregate.py`
+- **互換性**: 今ある日時無しのログ (`logs/map_8x5/…`) はそのまま残り、集計にも使われる (更新時刻が古いので、新しい評価が優先される)。ログを直接読んでいるスクリプトがあれば、置き場所が 1 段深くなる点に注意
+
+---
+
+### 2026-10-02 評価のタスク到着を複数指定して 1 回で回す (確率固定 + MMPP)
+
+- **意図**: 評価 (test.py) が到着のモードと確率を env に渡しておらず、env の既定 `task_arrival="fixed"` (毎ステップ 1 件、待ち行列は常に満杯) で評価していた。学習 (Bernoulli p=0.01〜0.10 / MMPP) と大きく違う負荷だった。学習と同じ範囲の到着で評価し、到着ごとの性能を出せるようにする
+- **変わること**:
+  - run.py に一覧 `task_arrival` (例 `"bernoulli:0.02"`, `"mmpp"`, `"fixed"`) と `allow_reassign` (`"False"` / `"True"`) を追加。run.py はこれを `arrival=a,b,...` / `allow_reassign=...` の 1 つの引数にまとめて test.py に渡し、**test.py 1 回で「到着 × 再割当の有無」の全組み合わせを順に回す**。ログは 1 条件 × 1 seed につき 1 本のまま (中に複数の `[RESULT]` 行)
+  - test.py が引数 `arrival=` / `allow_reassign=` を受け付ける。引数なしのときは default.yaml の `eval_arrivals` / `eval_allow_reassign` を使う
+  - default.yaml に新キー `eval_arrivals`, `eval_allow_reassign`, `task_arrival`, `task_density`, `task_p_high`, `task_p_low`, `task_switch_prob`。MMPP の値 (0.10 / 0.01 / 0.01) は学習と同じで、run.py からは変えない
+  - 条件名 (`condition`) の末尾に到着の目印が付く: `_bern{p}` (例 `_bern0.05`) / `_mmpp`。再割当ありは従来どおり `_envreassign`
+  - `bernoulli` の確率の書き忘れは、回し始める前に `ValueError` で止まる
+- **触ったファイル**: `src/config/default.yaml`, `test.py`, `runner.py` (`_condition_id`), `run.py`, `tools/eval_report.py` (条件名の分解に `arrival` / `dynamic` を追加)
+- **互換性**: **`fixed` は目印を付けないので、従来の条件名・ログ名と同じ**。ただし test.py を引数なしで回したときの既定は、従来の「fixed × 再割当なし/あり の 2 周」から **default.yaml の `eval_arrivals` × `eval_allow_reassign`** に変わる。到着の数だけ評価時間が増える (1 条件約 16 分の実測 × 組み合わせ数)。同じ到着ならシナリオは条件間で同一 (`episode_seed_base`)。test.py で PPO 割当を学習するとき (`train_task_assigner=True`) は、到着は `task_arrival`、再割当は `allow_reassign_before_pickup` の 1 通りだけ。詳細は [design/multi_seed_eval.md §11](design/multi_seed_eval.md#11-評価時のタスク到着を切り替える-確率固定-3-種--mmpp)
+
+---
+
+### 2026-09-30 PPO 割当の評価で学習済み割当方策を読む / dynamic をモデル名で判定
+
+- **意図**: `task_assigner=ppo` で評価すると、経路方策は TP と組で学習したモデル (`..._safe_base_seedK.th`) を読み、割当方策は何も読まずに乱数初期化の重みで割り当てていた。どちらもエラーにならず、別条件の結果が黙って出ていた。あわせて、動的台数で評価するかを default.yaml ではなく「モデルが動的台数で学習されたか」で決めたい
+- **変わること**:
+  - 評価のモデル名 (stem) が `tools/collect_runs.py` の install 名と同じ規則になった: `{map}_{N}_{planner}[_{method_tag}][_ppo][_dyn]_{reassign}_seed{K}.th`。`_ppo` は `task_assigner=ppo` のとき、`_dyn` は `use_dynamic_agents=True` のときだけ付く
+  - `task_assigner=ppo` の評価 (`training=False`) で、割当方策を `src/task_assign/models/safe/` から経路方策と**同じ名前・同じ `model_seed`** で読む。無ければ `FileNotFoundError` で止まる。`ppo_task_checkpoint_path` を指定したときはそちらが優先
+  - `[RESULT]` 行に `task_model=` (読んだ割当方策のファイル名) が出る。aggregate.py はこれを指標でなくメタ情報として扱う
+  - test.py が `use_dynamic_agents=True/False` 引数を受け付ける (default.yaml より優先)
+  - run.py は各条件で `_dyn` 無し / 有りの両方の名前を探し、モデルがある方だけ `use_dynamic_agents=...` を付けて回す。`model_seed` を数値で固定したときも、ファイルがある方だけ回す
+  - dynamic の評価は条件名 (`condition`) に `_dyn`、run.py のログ名に `_dyn` が付く
+- **触ったファイル**: `src/all_policy/policy.py` (`model_stem` の引数追加, `model_stem_form_args`, `PATH_MODELS_DIR` / `TASK_MODELS_DIR`), `src/task_assign/task_policy/ppo.py` (`load_model_file`), `runner.py`, `test.py`, `run.py`, `aggregate.py`
+- **互換性**: **TP / FIFO かつ静的台数の評価は、読むファイル名・条件名・ログ名とも従来どおり**。PPO 条件と dynamic 条件は、以前のログとは条件名もモデルも違う (以前の PPO 評価の結果は誤ったモデルでの結果なので使わない)。policy.py の定数 `MODELS_DIR` は `PATH_MODELS_DIR` に改名 (外部から import していた場合は `ImportError`)。動的台数の他の設定 (`min_active_agents` 等) は従来どおり default.yaml から取るので、学習時と揃える。詳細は [design/multi_seed_eval.md §9](design/multi_seed_eval.md#9-次の実装-学習済みタスク割当方策-ppo-の評価モード)
+
+---
+
+### 2026-09-27 台数可変時の観測: 非アクティブ機を占有から外す
+
+- **意図**: `use_dynamic_agents=True` のとき、非アクティブ機が観測 (`onehot_fov` の塞がり -1) にだけ占有として残っていた。衝突判定からは除外されているので実際には通れる場所が塞がって見え、さらに非アクティブ機が全員同じステーションに重なることで観測の判定式 (「1 ノードに立てるのは 1 台」前提) が崩れていた
+- **変わること**: dynamic 条件で、非アクティブ機がいるときだけ他機から見た塞がり (-1) が減る。ステーションの隣・ステーション上・帰投中の 3 場面で誤って「塞がり」になっていたものが「空き」になる。ステーションに稼働機が本当にいる場合は従来どおり塞がり。観測の次元は変わらない
+- **触ったファイル**: `src/main/drp_env/state_repre/wrapper/fov_wrapper.py` (`neighbor_filter_obs`)
+- **互換性**: **台数固定 (`use_dynamic_agents=False`) では完全に従来どおり** (8,000 回比較で不一致 0)。dynamic でも全機稼働なら変わらない。既存モデルは読み込めるが、**修正前に学習した dynamic のモデル・run とは観測の意味が違う**ので比較には使わない。GPU 版リポ (LDRP_GPU) には別途同じ変更が必要。詳細は [design/dynamic_agent_count.md](design/dynamic_agent_count.md) の「観測から非アクティブ機を外した」
+
+---
+
 ### 2026-09-08 学習 run の収集・監視ツール `tools/` 追加 — PC 版から取り込み
 
 - **意図**: このマシンで走らせている学習の進捗・完遂状態を、集約マシン (Mac) 側から機械的に把握できるようにする。「設定した `t_max` まで完遂したか」「途中でプロセスが死んでいないか」を手作業で確認しなくて済ませる。PC 版コミット `64aaa84` / `8d3e834` の取り込み

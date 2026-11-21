@@ -2018,7 +2018,9 @@ def pull_eval_logs(hosts, repo=None, timeout=120, verbose=False, drop_root=None)
         if verbose:
             sys.stderr.write("  $ %s\n" % " ".join(cmd))
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            # errors="replace": macOS の rsync はファイル名の日本語 (例 q49_黒_...) を
+            # UTF-8 でないバイト列で出すことがあり、そのままだと UnicodeDecodeError で collect 全体が止まる
+            p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
         except (subprocess.TimeoutExpired, OSError) as e:
             errors.append((h.get("label"), "eval log pull: %s" % e))
             continue

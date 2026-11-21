@@ -6,6 +6,8 @@ launchd から 5 分おきに 1 回ずつ呼ぶ (登録: python tools/autorun_wo
        train: 添付の LaRe モデルを train_repo に置き、autorun_train.py で epymarl を起動 (Mac ではスリープ防止つき)
        eval : コードの束を eval_repo に展開し (中身が変わったときだけ)、方策モデルを置いて
               tools/eval_lare_factor.py を CPU で起動
+       pull : train_repo で git pull --ff-only
+       stop : 評価のジョブ target の親 (eval_lare_factor.py) を止める (動いている test.py は最後まで走る)
   2. eval_repo/logs/ の *.txt を共有フォルダの eval_logs/ に写す (司令塔の collect が手元の logs/ に取り込む)
   3. このマシンの空き具合などを status.json に書く (司令塔はこれを ssh の代わりに読む)
 
@@ -120,6 +122,10 @@ def spawn(cmd, cwd, out_path, env=None):
 def start_train(s, job):
     for f in job.get("files") or []:
         put_file(os.path.join(s["base"], f["src"]), os.path.join(s["train_repo"], f["dest"]))
+    # このマシンの checkpoints/ にしか無い LaRe モデルを models/ にコピーする (環境は models/ からしか読まない)
+    lp = os.path.join(s["train_repo"], "src", "lare", "path")
+    for name in job.get("copy_lare_from_checkpoints") or []:
+        put_file(os.path.join(lp, "checkpoints", name), os.path.join(lp, "models", name))
     path = os.path.join(HOME_DIR, "jobs", job["id"] + ".json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -187,6 +193,8 @@ def take_jobs(s):
             kind = job.get("kind")
             if kind == "pull":
                 job["result"] = git_pull(s)
+            elif kind == "stop":
+                job["result"] = stop_eval(job["target"])
             else:
                 (start_train if kind == "train" else start_eval)(s, job)
             job["started_at"] = AR.now_utc().isoformat()
@@ -201,6 +209,35 @@ def take_jobs(s):
     with open(ERRORS, "w") as f:
         json.dump(errors, f, ensure_ascii=False)
     return errors
+
+
+def stop_eval(target):
+    """評価のジョブ target (例 q49_黒_11201725) の親 (tools/eval_lare_factor.py) に SIGTERM を送る (司令塔の `autorun.py stop`).
+
+    親だけを止めるので、動いている test.py (子) は最後まで走ってログに [RESULT] を書く。次のモデルには進まない。
+    学習のジョブは対象外 (autorun_train.py を止めても学習本体が残るため)。
+    """
+    p = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, errors="replace")
+    key = "jobs/%s.json" % target
+    pids = []
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        tok = parts[1].split()
+        # 先頭が python で、引数に eval_lare_factor.py とこのジョブのファイルがあるものだけ
+        # (caffeinate は中の python が終われば一緒に終わる。シェルの行は先頭が sh・zsh なので外れる)
+        if not (os.path.basename(tok[0]).startswith("python")
+                and any(t.endswith("eval_lare_factor.py") for t in tok)
+                and any(t.endswith(key) for t in tok)):
+            continue
+        if int(parts[0]) != os.getpid():
+            pids.append(int(parts[0]))
+    if not pids:
+        return "no running evaluation for %s" % target
+    for pid in pids:
+        os.kill(pid, 15)
+    return "sent SIGTERM to %s (running test.py children keep going)" % ", ".join(str(x) for x in pids)
 
 
 # git pull で手元の版を優先するファイル (マシンごとに書き換えて使うもの)。
@@ -233,6 +270,31 @@ def git_pull(s):
                 f.write(kept[rel])                      # 念のための写し (書き戻しに失敗しても残る)
             git("checkout", "--", rel)
     r = git("pull", "--ff-only")
+    # 共有フォルダで送ったモデル (git に入っていない) が、あとで git に入ると pull が止まる。
+    # 上流の版と同じ中身のものだけ退避してやり直す (違う中身なら何もしない)。2026-11-14 M2 で実際に起きた
+    blocked = []
+    if r.returncode != 0 and "untracked working tree files would be overwritten" in (r.stdout + r.stderr):
+        lines = (r.stdout + r.stderr).splitlines()
+        k = next(n for n, l in enumerate(lines) if "untracked working tree files" in l)
+        blocked = [l.strip() for l in lines[k + 1:] if l.startswith(("\t", "  ")) and l.strip()]
+        moved = []
+        for rel in blocked:
+            up = subprocess.run(["git", "-C", repo, "show", "FETCH_HEAD:%s" % rel], capture_output=True, timeout=60)
+            path = os.path.join(repo, rel)
+            if up.returncode != 0 or not os.path.exists(path):
+                break
+            with open(path, "rb") as f:
+                if f.read() != up.stdout:
+                    break
+            bak = os.path.join(HOME_DIR, "keep_local", "%s.%s" % (rel.replace("/", "_"), time.strftime("%Y%m%d%H%M%S")))
+            os.makedirs(os.path.dirname(bak), exist_ok=True)
+            shutil.move(path, bak)
+            moved.append((path, bak))
+        else:
+            r = git("pull", "--ff-only")
+        for path, bak in moved:                     # 置き直されなかったときは元に戻す
+            if not os.path.exists(path):
+                shutil.move(bak, path)
     after = git("rev-parse", "--short", "HEAD").stdout.strip()
     notes = []
     for rel, data in kept.items():
@@ -274,9 +336,11 @@ def write_status(s, errors):
     tr, er = s["train_repo"], s["eval_repo"]
     cfg = os.path.join(tr, "src", "epymarl", "src", "config")
     algs = dict((os.path.basename(p)[:-5], read(p)) for p in glob.glob(os.path.join(cfg, "algs", "*.yaml")))
-    lare = []
-    for sub in ("models", "checkpoints"):
-        lare += [os.path.basename(p) for p in glob.glob(os.path.join(tr, "src", "lare", "path", sub, "*.pth"))]
+    # 環境が事前学習モデルを読むのは models/ だけなので、models/ と checkpoints/ を分けて知らせる
+    # (以前は合わせて lare_models に入れていたため、checkpoints/ にしか無いモデルも「ある」とみなされていた)
+    lare, ckpt = [], []
+    for sub, out in (("models", lare), ("checkpoints", ckpt)):
+        out += [os.path.basename(p) for p in glob.glob(os.path.join(tr, "src", "lare", "path", sub, "*.pth"))]
     head = subprocess.run("git rev-parse --short HEAD 2>/dev/null; git status --porcelain 2>/dev/null | wc -l",
                           shell=True, cwd=tr, capture_output=True, text=True).stdout
     probe = subprocess.run(["bash", "-c", AR.PROBE], capture_output=True, text=True, timeout=60).stdout
@@ -284,7 +348,7 @@ def write_status(s, errors):
           "train_repo": tr, "eval_repo": er, "probe": probe, "train_head": " ".join(head.split()),
           "epymarl_config": {"default": read(os.path.join(cfg, "default.yaml")),
                              "gymma": read(os.path.join(cfg, "envs", "gymma.yaml")), "algs": algs},
-          "lare_models": sorted(set(lare)), "errors": errors}
+          "lare_models": sorted(set(lare)), "lare_checkpoints": sorted(set(ckpt)), "errors": errors}
     os.makedirs(s["base"], exist_ok=True)
     tmp = os.path.join(s["base"], ".status.json.tmp")
     with open(tmp, "w") as f:

@@ -29,6 +29,7 @@ ssh で届かないマシン (黒) は共有フォルダ (collect_config.yaml �
 """
 
 import argparse
+import contextlib
 import datetime
 import glob
 import hashlib
@@ -299,14 +300,19 @@ def host_state(h, dash, led, matched=None):
     label = h["label"]
     st = {"label": label, "reachable": label not in (dash.get("unreachable") or {}),
           "train_eta": [], "pending_train": 0, "n_eval": 0, "cpu_free": None, "mem_free_mb": None,
-          "gpu_free_mb": None, "gpu_util": None, "measured": {}}
+          "gpu_free_mb": None, "gpu_util": None, "measured": {}, "n_train_algo": {}}
     for r in dash.get("runs") or []:
         if r.get("machine") == label and r.get("state") == "running":
             st["train_eta"].append(parse_dt(r.get("eta")) or now_utc() + datetime.timedelta(days=1))
+            a = str(r.get("algo") or "").lower()
+            st["n_train_algo"][a] = st["n_train_algo"].get(a, 0) + 1
     # 投入したがまだ run が見えていない学習 (猶予の間は動いているものとして数える)
     mine_running = []
+    st["our_jobs"] = []                 # このマシンで autorun の学習が動いている (or 起動待ち) のジョブ
     for x in led:
         if x.get("kind") != "train" or x.get("host") != label:
+            continue
+        if x.get("killed"):             # 手で止めたジョブ (台帳に killed を書いたもの) は数えない
             continue
         run = (matched or {}).get(x.get("job"))
         if run is None:
@@ -314,8 +320,15 @@ def host_state(h, dash, led, matched=None):
             if age < grace_of(x):
                 st["pending_train"] += 1
                 st["train_eta"].append(now_utc() + datetime.timedelta(seconds=float(x.get("est_sec") or 0)))
-        elif run.get("state") == "running" and (run.get("progress") or 0) > 0.01:
-            mine_running.append(x)
+                st["our_jobs"].append(x["job"])
+                m = re.search(r"--config=(\w+)", x.get("cmd") or "")
+                if m:
+                    a = m.group(1).lower()
+                    st["n_train_algo"][a] = st["n_train_algo"].get(a, 0) + 1
+        elif run.get("state") == "running":
+            st["our_jobs"].append(x["job"])
+            if (run.get("progress") or 0) > 0.01:
+                mine_running.append(x)
     st["n_train"] = len(st["train_eta"])
     if h.get("drop"):
         # ssh で届かないマシン: worker が数分おきに PROBE と同じものを status.json に書いている
@@ -443,19 +456,45 @@ def footprint(rec, db):
 
     同じ (アルゴリズム, マップ, 台数) の実測があればそれ。同じアルゴリズム・マップで台数だけ違う実測があれば、
     見積もりの比 (台数で変わる分) で換算する。どちらも無ければ見積もり。実測を使うときは 1.2 倍の余裕を見る。
+    メモリは「実測」と「見積もり (リプレイバッファが埋まりきったとき)」の大きいほう。QMIX はバッファ
+    (5000 エピソード) が埋まるにつれて増えるので、学習の初めに測った値だと少なすぎる (2026-11-14)
     """
     est = estimate_train(rec)
     got = db.get(fp_key(rec))
     if got and got.get("n"):
-        return {"cpu": got["cpu"] * 1.2, "mem": got["mem"] * 1.2, "gpu": got["gpu"] * 1.2, "measured": "same"}
+        return {"cpu": got["cpu"] * 1.2, "mem": max(got["mem"] * 1.2, est["mem"]), "gpu": got["gpu"] * 1.2,
+                "measured": "same"}
     cfg, _env, n, mp = _train_shape(rec)
     near = [(k, v) for k, v in db.items()
             if k.startswith("train|%s|%s|" % (cfg.get("name"), mp)) and v.get("n") and v.get("est")]
+    if not near:
+        # 同じマップの実測も無ければ、同じアルゴリズムの別のマップの実測 (見積もりとの比) を使う。
+        # 見積もりの CPU (MAPPO 9.5 コア) は実測 (3〜4 コア) よりずっと大きく、これだけで入らなくなるため
+        near = [(k, v) for k, v in db.items()
+                if k.startswith("train|%s|" % cfg.get("name")) and v.get("n") and v.get("est")]
     if near:
         k, v = min(near, key=lambda kv: abs(int(kv[0].rsplit("|", 1)[1]) - n))
         r = lambda f: (v[f] / max(v["est"][f], 1e-6)) * est[f] * 1.2
-        return {"cpu": r("cpu"), "mem": r("mem"), "gpu": r("gpu"), "measured": k}
+        return {"cpu": r("cpu"), "mem": max(r("mem"), est["mem"]), "gpu": r("gpu"), "measured": k}
     return dict(est, measured=None)
+
+
+def mem_growth(st, recs_by_job, db):
+    """このマシンで動いている autorun の学習が、これから増やすメモリの合計 (MB).
+
+    1 本ごとに「最後の見積もり (footprint) − 今の実測」(実測が無ければ見積もり全部)。
+    今の空き (mem_free_mb) からこれを引いたものが、本当に使ってよい空き。
+    """
+    total = 0.0
+    # 1 つのジョブに依頼を順番に並べたもの (q19+q20 など) は同じ job が 2 回入るので、1 回だけ数える
+    for job in sorted(set(st.get("our_jobs") or [])):
+        rec = recs_by_job.get(job)
+        if rec is None:
+            continue
+        full = footprint(rec, db)["mem"]
+        now_mb = (st.get("measured", {}).get(job) or {}).get("mem") or 0.0
+        total += max(0.0, full - now_mb)
+    return total
 
 
 def update_footprints(states, led, recs_by_job, dry_run):
@@ -574,7 +613,8 @@ def template_for(req, cond, dash, recs, by_id):
     差し替えた結果が依頼した条件に判定されるかは launch_train の check_command_condition で確かめる。
     """
     rec = pick_template(cond, dash, recs)
-    if rec is not None or not req.get("like") or not req.get("lare_model"):
+    if rec is not None or not req.get("like") or not (req.get("lare_model") or req.get("factor_version")
+                                                       or req.get("set")):
         return rec
     base_cond = by_id.get(req["like"])
     base = pick_template(base_cond, dash, recs) if base_cond is not None else None
@@ -583,9 +623,23 @@ def template_for(req, cond, dash, recs, by_id):
     env = dict(base.get("env") or {})
     if not env.get("use_lare_path"):
         return None
-    for k in LARE_NAME_KEYS:
-        if env.get(k):
-            env[k] = req["lare_model"]
+    if req.get("lare_model"):
+        for k in LARE_NAME_KEYS:
+            if env.get(k):
+                env[k] = req["lare_model"]
+    # 評価関数の版: 指定 (--factor-version) が優先。無ければ使う LaRe モデルの名前 (_PATH_F2_ など) から。
+    # 版 1 は書かない (今までの run と同じコマンドにする)
+    ver = req.get("factor_version")
+    if ver is None and req.get("lare_model"):
+        m = re.search(r"_PATH_F(\d+)_", req["lare_model"])
+        ver = int(m.group(1)) if m else 1
+    if ver is not None:
+        if int(ver) == 1:
+            env.pop("lare_path_factor_version", None)
+        else:
+            env["lare_path_factor_version"] = int(ver)
+    # --set 名前=値: 雛形の env_args を上書き (台数の違う条件を作るときの env の key など)
+    env.update(req.get("set") or {})
     # GPU 版にだけある装置の指定。cpu なら外しても同じ (Mac のコードには無く、残すと env の生成で落ちる)
     if env.get("lare_device") in (None, "cpu"):
         env.pop("lare_device", None)
@@ -712,30 +766,52 @@ def ensure_lare_model(h, env):
         names.append(env.get("pretrained_lare_path_model_name"))
     if env.get("use_lare_path") and env.get("use_finetuning_lare_path"):
         names.append(env.get("finetuning_lare_path_model_name"))
+    # 環境 (drp_env) が事前学習モデルを読むのは src/lare/path/models/ だけ。checkpoints/ にあっても読まない。
+    # そこで「host の models/ にある」まで揃えてから起動する (2026-11-14: 以前は checkpoints/ にあれば良しとしていた)
+    #   1. host の models/ にある            → そのまま
+    #   2. この Mac の models/ にある         → host の models/ へ送る
+    #   3. host の checkpoints/ にだけある    → host の中で checkpoints/ から models/ へコピー
+    #      (その LaRe モデルを作った学習が host で終わったばかりで、まだこの Mac に回収されていないとき)
+    #   どれでもなければ、まだ使えないので投入しない (次の tick で見直す)
     attach = []
     if h.get("drop"):
-        have = set(drop_status(h).get("lare_models") or [])
+        ds = drop_status(h)
+        new_worker = "lare_checkpoints" in ds        # 新しい worker は models/ と checkpoints/ を分けて知らせる
+        have = set(ds.get("lare_models") or []) if new_worker else set()
+        ckpt = set(ds.get("lare_checkpoints") or [])
+        copy = []
         for n in [x for x in names if x and x not in have]:
             local = os.path.join(REPO, "src", "lare", "path", "models", n)
-            if not os.path.exists(local):
-                raise RuntimeError("LaRe model %s is not on %s nor in this Mac's models/" % (n, h["label"]))
-            drop_put(h, "files", n, src=local)
-            attach.append({"src": "files/" + n, "dest": "src/lare/path/models/" + n})
-        return attach
+            if os.path.exists(local):
+                drop_put(h, "files", n, src=local)
+                attach.append({"src": "files/" + n, "dest": "src/lare/path/models/" + n})
+            elif n in ckpt:
+                copy.append(n)
+            else:
+                raise RuntimeError("LaRe model %s is not in %s's models/ nor in this Mac's models/ (not ready yet)"
+                                   % (n, h["label"]))
+        return {"files": attach, "copy_lare_from_checkpoints": copy}
     for n in [x for x in names if x]:
-        script = "ls %s/src/lare/path/models/%s %s/src/lare/path/checkpoints/%s 2>/dev/null | head -1" % (
-            h["train_repo"], shlex.quote(n), h["train_repo"], shlex.quote(n))
-        rc, out, _ = run_on(h, script)
-        if out.strip():
+        lp = "%s/src/lare/path" % h["train_repo"]
+        q = shlex.quote(n)
+        rc, out, _ = run_on(h, "if [ -s %s/models/%s ]; then echo models; elif [ -s %s/checkpoints/%s ]; then echo ckpt; fi"
+                            % (lp, q, lp, q))
+        where = out.strip()
+        if where == "models":
             continue
         local = os.path.join(REPO, "src", "lare", "path", "models", n)
-        if not os.path.exists(local):
-            raise RuntimeError("LaRe model %s is not on %s nor in this Mac's models/" % (n, h["label"]))
-        rsync_to(h, [local], "%s/src/lare/path/models/" % h["train_repo"])
-    return attach
+        if os.path.exists(local):
+            rsync_to(h, [local], "%s/models/" % lp)
+        elif where == "ckpt":
+            rc, _, err = run_on(h, "cp -n %s/checkpoints/%s %s/models/%s" % (lp, q, lp, q))
+            if rc != 0:
+                raise RuntimeError("cannot copy LaRe model %s into models/ on %s: %s" % (n, h["label"], err.strip()))
+        else:
+            raise RuntimeError("LaRe model %s is not on %s nor in this Mac's models/ (not ready yet)" % (n, h["label"]))
+    return {"files": [], "copy_lare_from_checkpoints": []}
 
 
-def launch_train(h, req, cond, rec, conf, dry_run):
+def launch_train(h, req, cond, rec, conf, dry_run, mem_mb=None):
     cmd = build_train_command(h, rec)
     if not check_command_condition(cmd, cond, conf):
         raise RuntimeError("generated command is not judged as the requested condition")
@@ -746,12 +822,15 @@ def launch_train(h, req, cond, rec, conf, dry_run):
     if h.get("drop"):
         # worker が拾って autorun_train.py で起動する (ssh のマシンと同じ ~/.ldrp/autorun/jobs/<id>.json に写す)
         drop_put(h, "inbox", job_id + ".json", {"id": job_id, "kind": "train", "commands": [cmd],
-                                                "max_processes": 1, "files": attach})
+                                                "max_processes": 1, "files": attach["files"],
+                                                "copy_lare_from_checkpoints": attach["copy_lare_from_checkpoints"]})
         return {"cmd": cmd, "job": job_id, "code": drop_status(h).get("train_head")}
     run_on(h, "mkdir -p ~/%s/jobs ~/%s/logs" % (REMOTE_DIR, REMOTE_DIR))
     rsync_to(h, [os.path.join(TOOLS, "autorun_train.py")], "~/%s/" % REMOTE_DIR if not h["local"]
              else os.path.expanduser("~/%s/" % REMOTE_DIR))
     job = {"id": job_id, "commands": [cmd], "max_processes": 1}
+    if mem_mb is not None:
+        job["mem_mb"] = round(mem_mb)       # 最後まで膨らんだときの見積もり (GPU 側の控えの worker が見る)
     rc, _, err = run_on(h, "cat > ~/%s/jobs/%s.json" % (REMOTE_DIR, job_id), stdin=json.dumps(job))
     if rc != 0:
         raise RuntimeError("cannot write job on %s: %s" % (h["label"], err.strip()))
@@ -878,6 +957,8 @@ def launch_eval(h, req, jobs, n_par, dry_run):
                 if not EV.place(src, os.path.join(h["eval_repo"], rel), j["name"]):
                     raise RuntimeError("a different file named %s is already in %s" % (j["name"], rel))
             else:
+                # rsync は置き場の親フォルダまでは作らない (models/safe/ が無いマシンで失敗する)
+                run_on(h, "mkdir -p %s" % shlex.quote("%s/%s" % (h["eval_repo"], rel)))
                 rsync_to(h, [src], "%s/%s/" % (h["eval_repo"], rel))
     payload = [dict(j, files=[]) for j in jobs]
     rc, _, err = run_on(h, "mkdir -p ~/%s/jobs && cat > ~/%s/jobs/%s.json" % (REMOTE_DIR, REMOTE_DIR, job_id),
@@ -950,6 +1031,169 @@ def take(st, fp):
             st[k] -= fp[f]
 
 
+# ---------------------------------------------------------------------------
+# 控え (standby, 2026-11-18〜): 司令塔 (白) が寝ている・外出していても、GPU が自分で次の学習を入れる
+#
+#   白の tick (GPU に届くとき)
+#     1. GPU の ~/.ldrp/autorun/commander_seen を新しくし (= 司令塔がいる印)、
+#        GPU が自分で起動した記録 (standby_started.jsonl) を読んで台帳に取り込む
+#     2. 通常どおり投入する
+#     3. まだ入っていない学習のうち先頭から数件を、その GPU の控え (standby.json) に書く
+#        (1 つのジョブは 1 台の GPU の控えにだけ載せる)
+#   GPU の autorun_standby.py (cron 5 分おき)
+#     commander_seen が 30 分以上古い (= 白が来ていない) ときだけ、控えを先頭から、今の空き
+#     (本数・メモリ・CPU) に入る分を 1 回に 1 本起動し、standby_started.jsonl に残す
+#   二重投入を防ぐため、白から届かない GPU の控えに載っているジョブは、控えを書いてから
+#   autorun_standby_lease_hours (既定 24 時間) の間は他のマシンに入れない。GPU 側もその期限を
+#   過ぎた控えは起動しない
+# ---------------------------------------------------------------------------
+STANDBY_STATE = os.path.join(STATE, "standby.json")    # 白側の写し: label -> {"at", "jobs": [...]}
+STANDBY_ABSENT_SEC = 30 * 60
+
+
+def standby_hosts(conf):
+    """控えを置く host (ssh で届く Linux のマシンで、autorun.standby が 1 以上)."""
+    return [h for h in hosts_of(conf) if h.get("enabled") and not h.get("drop") and not h["local"]
+            and int(h.get("standby") or 0) > 0]
+
+
+def standby_lease_sec(conf):
+    return float(conf.get("autorun_standby_lease_hours") or 24) * 3600
+
+
+def _standby_shell(inner):
+    """~/.ldrp/autorun で、GPU 側の worker と同じロック (standby.lock) を取って inner を実行するシェル."""
+    d = "~/%s" % REMOTE_DIR
+    return ("mkdir -p %s && cd %s && if command -v flock >/dev/null 2>&1; then flock standby.lock sh -c %s; "
+            "else sh -c %s; fi" % (d, d, shlex.quote(inner), shlex.quote(inner)))
+
+
+def standby_sync(hosts, say, dry_run):
+    """司令塔がいる印を GPU に付け、GPU が自分で起動した学習を台帳に取り込む. 返り値: 届いた host の label."""
+    reached = set()
+    known = set(x.get("job") for x in ledger())
+    for h in hosts:
+        inner = ("true" if dry_run else "touch commander_seen") + "; cat standby_started.jsonl 2>/dev/null; true"
+        rc, out, _ = run_on(h, _standby_shell(inner), timeout=60)
+        if rc != 0:
+            continue
+        reached.add(h["label"])
+        for line in out.splitlines():
+            try:
+                x = json.loads(line)
+            except ValueError:
+                continue
+            if x.get("job") in known or dry_run:
+                continue
+            os.makedirs(STATE, exist_ok=True)
+            rec = {"kind": "train", "req": x.get("req"), "host": h["label"], "cond": x.get("cond"),
+                   "job": x["job"], "cmd": x.get("cmd"), "code": None, "est_sec": x.get("est_sec"),
+                   "grace": LAUNCH_GRACE_SEC, "at": x.get("at"), "by": "standby"}
+            with open(LEDGER, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            known.add(x["job"])
+            say("[autorun] %s started %s by itself while the commander was away (at %s)"
+                % (h["label"], x.get("req"), fmt_dt(parse_dt(x.get("at")))))
+    return reached
+
+
+def standby_held(hosts, reached, conf):
+    """白から届かない GPU の控えに載っていて、まだ期限内のジョブ: 依頼 id -> 本数 (他のマシンに入れない)."""
+    held = {}
+    saved = load_json(STANDBY_STATE, {})
+    lease = standby_lease_sec(conf)
+    for h in hosts:
+        if h["label"] in reached:
+            continue
+        rec = saved.get(h["label"]) or {}
+        at = parse_dt(rec.get("at"))
+        if at is None or (now_utc() - at).total_seconds() >= lease:
+            continue
+        for j in rec.get("jobs") or []:
+            held[j["req"]] = held.get(j["req"], 0) + 1
+    return held
+
+
+def standby_write(hosts, reached, units, conf, fpdb, rates, say):
+    """まだ入っていない学習を、届いた GPU の控えに書く (units は順番どおり。launched のものは除く)."""
+    saved = load_json(STANDBY_STATE, {})
+    taken = set()                       # 控えに載せた単位 (1 つの単位は 1 台にだけ)
+    model_ok = {}
+    order_h = sorted((h for h in hosts if h["label"] in reached),
+                     key=lambda h: (int(h.get("train_priority") or 0), hosts.index(h)))
+    for h in order_h:
+        jobs = []
+        cap = int(h.get("standby") or 0)
+        for i, u in enumerate(units):
+            if len(jobs) >= cap:
+                break
+            if u["kind"] != "train" or u.get("launched") or i in taken or u["req"].get("series"):
+                continue
+            if u["req"].get("machines") and h["label"] not in u["req"]["machines"]:
+                continue
+            if int(h.get("max_train") or 0) <= 0:
+                continue
+            fp = host_footprint(h, u["rec"], fpdb)
+            try:
+                cmd = build_train_command(h, u["rec"])
+                if not check_command_condition(cmd, u["cond"], conf):
+                    continue
+                env = u["rec"].get("env") or {}
+                key = (h["label"], env.get("pretrained_lare_path_model_name"),
+                       env.get("finetuning_lare_path_model_name"))
+                if key not in model_ok:
+                    try:
+                        ensure_lare_model(h, env)       # LaRe のモデルを GPU の models/ に揃えておく
+                        model_ok[key] = True
+                    except Exception:
+                        model_ok[key] = False
+                if not model_ok[key]:
+                    continue
+            except Exception:
+                continue
+            rid = u["req"]["id"]
+            jobs.append({"job": "%s_%s_%s_s%d" % (rid, h["label"], time.strftime("%m%d%H%M%S"), len(jobs)),
+                         "req": rid, "cond": u["cond"]["id"], "cmd": cmd,
+                         "algo": str((u["rec"].get("cfg") or {}).get("name") or "").lower(),
+                         "mem_mb": round(fp["mem"]), "cpu": round(fp["cpu"], 2),
+                         "est_sec": train_sec(rates, h["label"], u["rec"])})
+            taken.add(i)
+        at = now_utc().isoformat()
+        body = {"at": at, "lease_sec": standby_lease_sec(conf), "absent_sec": STANDBY_ABSENT_SEC,
+                "host": h["label"], "python": h["python"], "train_repo": h["train_repo"],
+                "max_train": int(h.get("max_train") or 0), "mem_reserve_mb": h.get("mem_reserve_mb"),
+                "cpu_target": float(h.get("cpu_target") or 0.8), "trust_max_train": bool(h.get("trust_max_train")),
+                "max_train_by_algo": h.get("max_train_by_algo") or {}, "jobs": jobs}
+        try:
+            rsync_to(h, [os.path.join(TOOLS, "autorun_train.py"), os.path.join(TOOLS, "autorun_standby.py")],
+                     "~/%s/" % REMOTE_DIR)
+        except Exception as e:
+            say("[autorun] standby: cannot copy the worker to %s: %s" % (h["label"], e))
+            continue
+        inner = "cat > standby.json.tmp && mv standby.json.tmp standby.json"
+        rc, _, err = run_on(h, _standby_shell(inner), stdin=json.dumps(body, ensure_ascii=False), timeout=60)
+        if rc != 0:
+            say("[autorun] standby: cannot write on %s: %s" % (h["label"], err.strip()[:200]))
+            continue
+        # GPU の crontab に worker を登録 (登録済みなら何もしない)。cron が動いていなければ知らせる
+        line = ("*/5 * * * * %s $HOME/%s/autorun_standby.py >> $HOME/%s/standby.log 2>&1"
+                % (h["python"], REMOTE_DIR, REMOTE_DIR))
+        rc, out, err = run_on(h, "(crontab -l 2>/dev/null | grep -q autorun_standby.py) || "
+                                 "{ (crontab -l 2>/dev/null; echo %s) | crontab - && echo installed; }; "
+                                 "pgrep -x cron >/dev/null || pgrep -x crond >/dev/null || echo no-cron"
+                              % shlex.quote(line), timeout=60)
+        if "installed" in out:
+            say("[autorun] standby: registered the worker in %s's crontab" % h["label"])
+        if rc != 0 or "no-cron" in out:
+            say("[autorun] standby: WARNING cron is not running on %s (the standby is never started there): %s"
+                % (h["label"], (err or out).strip()[:200]))
+        saved[h["label"]] = {"at": at, "jobs": [{"job": j["job"], "req": j["req"]} for j in jobs]}
+        if jobs:
+            say("[autorun] standby on %s (started there only if the commander is away): %s"
+                % (h["label"], ", ".join(j["req"] for j in jobs)))
+    save_json(STANDBY_STATE, saved)
+
+
 def tick(dry_run=False, verbose=True):
     say = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
     if is_client():
@@ -970,14 +1214,20 @@ LAST_STATES = {}        # 直近の tick で測ったマシンの状態 (publish
 
 
 def _tick(dry_run, say):
+    conf = load_conf()
+    # 控え (standby): 先に GPU へ「司令塔がいる」印を付け、留守の間に GPU が自分で起動した学習を台帳に取り込む
+    sb_hosts = standby_hosts(conf)
+    sb_reached = standby_sync(sb_hosts, say, dry_run) if sb_hosts else set()
     if os.path.exists(PAUSE) and not dry_run:
+        standby_write(sb_hosts, sb_reached, [], conf, {}, {}, say)     # 止めている間は GPU にも起動させない
         say("[autorun] paused (%s). nothing launched." % PAUSE)
         return
     q = load_queue()
     if not any(r.get("status") == "open" for r in q):
+        if not dry_run:
+            standby_write(sb_hosts, sb_reached, [], conf, {}, {}, say)
         say("[autorun] no open requests.")
         return
-    conf = load_conf()
     dash = dashboard()
     conds = load_conds(dash)
     by_id = dict((c["id"], c) for c in conds)
@@ -1002,6 +1252,8 @@ def _tick(dry_run, say):
     fpdb = update_footprints(states, led, recs_by_job, dry_run)
     finished = EV.busy(os.path.join(REPO, "logs"))     # 評価済み + 他で予約中 (手で起動した評価も含む)
 
+    # 白から届かない GPU の控えに載っている学習は、期限までは他のマシンに入れない (二重投入を防ぐ)
+    sb_held = standby_held(sb_hosts, sb_reached, conf)
     # --- 依頼の状態を更新し、まだ投入していない分を「単位」にする ---
     units = []
     for req in q:
@@ -1035,7 +1287,10 @@ def _tick(dry_run, say):
                                   "; use --like <id> --lare-model <file> for a new LaRe model"))
                 continue
             req.pop("note", None)
-            for _ in range(req["count"] - len(launched)):
+            n_held = min(sb_held.get(req["id"], 0), req["count"] - len(launched))
+            if n_held:
+                say("[autorun] %s: %d run(s) held for the standby of an unreachable GPU" % (req["id"], n_held))
+            for _ in range(req["count"] - len(launched) - n_held):
                 units.append({"kind": "train", "req": req, "cond": cond, "rec": rec})
         else:
             targets = eval_targets(req, conds, dash)
@@ -1073,31 +1328,13 @@ def _tick(dry_run, say):
             if r is not None:
                 r["note"] = "%s: %s" % (st["label"], str(e.get("error"))[:300])
 
-    # --- 並べる: 長い連鎖 (学習 + 続く評価) から ---
-    def est(u, label):
-        if u["kind"] == "train":
-            sec = train_sec(rates, label, u["rec"])
-            if u["req"].get("then_eval"):
-                sec += 12 * EVAL_SEC_PER_COND
-            return sec
-        return sum(j["n_cond"] for j in u["jobs"]) * EVAL_SEC_PER_COND / float(next(
-            (h.get("eval_speed") or 1.0) for h in hosts if h["label"] == label))
+    # 順番: 依頼の並び (queue.json の順 = 頼んだ順。`autorun.py move` で並べ替えられる) のまま。
+    # 前は「長いものから」並べ、先のマシンの枠まで押さえていたが、2026-11-16 から
+    # 「今空いている枠に、先頭から入るものを入れる」だけにした (下の割り当てを参照)
+    rank = {}                                   # まだ投入していない依頼の中での順位 (表示用)
     for u in units:
-        u["prio"] = max(est(u, h["label"]) for h in hosts)
-    units.sort(key=lambda u: -u["prio"])
+        rank.setdefault(u["req"]["id"], len(rank) + 1)
 
-    # 空き: 学習スロットごとの空く時刻
-    free_at = {}
-    for h in hosts:
-        st = states[h["label"]]
-        busy = sorted(st["train_eta"])
-        cap = int(h.get("max_train") or 0)
-        if cap <= 0:
-            free_at[h["label"]] = []
-        elif len(busy) >= cap:                  # k 番目の枠が空くのは、len(busy)-cap+k 本目が終わったとき
-            free_at[h["label"]] = busy[len(busy) - cap:]
-        else:
-            free_at[h["label"]] = [now_utc()] * (cap - len(busy)) + busy
     eval_free = dict((h["label"], max(0, int(h.get("max_eval") or 0) - states[h["label"]]["n_eval"])) for h in hosts)
     n_train = dict((h["label"], len(states[h["label"]]["train_eta"])) for h in hosts)   # 今動いている学習の本数
 
@@ -1111,80 +1348,147 @@ def _tick(dry_run, say):
                           and (now_utc() - parse_dt(x["at"])).total_seconds() < grace_of(x))))
     # マシンの優先順位 (小さいほど先)。学習は train_priority、評価は eval_priority
     prio = lambda h, k: int(h.get(k) or 0)
+    # 同じ series の依頼は、同時に 1 本だけ動かす (1 本終わったら次)。動いている / 起動待ちのものがあれば待つ
+    req_series = dict((r["id"], r.get("series")) for r in q if r.get("series"))
+    busy_series = set()
+    for x in led:
+        sname = req_series.get(x.get("req"))
+        if not sname or x.get("kind") != "train":
+            continue
+        run = matched.get(x["job"])
+        if (run is not None and run.get("state") == "running") or (
+                run is None and (now_utc() - parse_dt(x["at"])).total_seconds() < grace_of(x)):
+            busy_series.add(sname)
     launched_any = False
+    max_wait = float(conf.get("autorun_max_wait_hours") or 12) * 3600
+    kept = {}                   # マシン -> 依頼 id。長く待っている依頼のために取っておく (後ろの依頼を入れない)
+    order_l = [x["label"] for x in hosts]
+
+    def cannot_start(h, u):
+        """このマシンで今すぐ始められないなら、その理由 (短い文字列)。始められるなら None."""
+        lab = h["label"]
+        st_h = states[lab]
+        cap = int(h.get("max_train") or 0)
+        if n_train[lab] >= cap:
+            return "full %d/%d" % (n_train[lab], cap)
+        # アルゴリズムごとの上限 (max_train_by_algo: {qmix: 1} など)。QMIX は 1 本でメモリを多く使う
+        algo = str((u["rec"].get("cfg") or {}).get("name") or "").lower()
+        cap_a = (h.get("max_train_by_algo") or {}).get(algo)
+        if cap_a is not None and st_h["n_train_algo"].get(algo, 0) >= int(cap_a):
+            return "%s %d/%d" % (algo, st_h["n_train_algo"].get(algo, 0), int(cap_a))
+        fp = host_footprint(h, u["rec"], fpdb)
+        # trust_max_train: true の host は空きの見積もりを見ず、max_train の本数だけで決める
+        # (黒・M2 は MAPPO を 2 本確実に回せるが、見積もり (1 本 9.5 コア) では 1 本も入らないため)
+        if not h.get("trust_max_train") and not fits(st_h, fp, h):
+            if st_h["cpu_free"] is not None and st_h["cpu_free"] < fp["cpu"]:
+                return "cpu %.1f free < %.1f" % (st_h["cpu_free"], fp["cpu"])
+            if st_h["mem_free_mb"] is not None and st_h["mem_free_mb"] < fp["mem"]:
+                return "memory %.1f GB free < %.1f" % (st_h["mem_free_mb"] / 1024, fp["mem"] / 1024)
+            return "gpu memory"
+        # 他の人と共有のマシンでは、動いている学習がこれから増やす分も先に取っておき、さらに
+        # mem_reserve_mb を残す (他の人の学習が増えても落ちないように)
+        if st_h.get("mem_free_mb") is not None and h.get("mem_reserve_mb") is not None:
+            room = (st_h["mem_free_mb"] - mem_growth(st_h, recs_by_job, fpdb) - fp["mem"]
+                    - float(h["mem_reserve_mb"]))
+            if room < 0:
+                return "memory short by %.1f GB" % (-room / 1024)
+        elif h.get("mem_reserve_mb") is not None:
+            return "free memory unknown"        # 空きが測れていないときは入れない
+        # 他の人が GPU を使っている (使用率が高い) ときは今は入れない (CPU だけで学習するなら見ない)
+        gutil, umax = st_h.get("gpu_util"), h.get("max_gpu_util")
+        if umax is not None and gutil is not None and gutil > float(umax) and not cpu_only(h, u["rec"]):
+            return "gpu busy %d%%" % gutil
+        if lab in shared and n_auto >= total_cap:
+            return "autorun total %d/%d" % (n_auto, total_cap)
+        return None
+
     for u in units:
         allowed = [h for h in hosts if states[h["label"]]["reachable"]
                    and (not u["req"].get("machines") or h["label"] in u["req"]["machines"])]
+        if u["kind"] == "train" and u["req"].get("series") in busy_series:
+            continue
         if u["kind"] == "train":
-            cands = []
+            allowed = [h for h in allowed if int(h.get("max_train") or 0) > 0]    # 学習しないマシン (白) は除く
+            # --- 割り当て (2026-11-16〜): 依頼の順番どおりに、今空いている枠へ入れる ---
+            # 先頭の依頼が今どこにも入らなければ (メモリが足りない・枠が埋まっている)、後ろの依頼で
+            # 入るものを先に入れる。先のマシンの枠を押さえて待つことはしない。
+            # ただし autorun_max_wait_hours (既定 12 時間) 以上待った依頼には、いちばん早く空きそうな
+            # マシンを 1 台取っておき、後ろの依頼でそのマシンを埋めない (後回しにされ続けないように)
+            rid = u["req"]["id"]
+            ok, why = [], {}
             for h in allowed:
-                if not free_at[h["label"]]:
-                    continue
-                start = free_at[h["label"]][0]
-                fin = max(start, now_utc()) + datetime.timedelta(seconds=train_sec(rates, h["label"], u["rec"]))
-                if start <= now_utc():
-                    # 今すぐ入れる枠なら、1 本が使う量がマシンの空きに収まるかを見る (収まらなければ今は入れない)
-                    # trust_max_train: true の host は空きの見積もりを見ず、max_train の本数だけで決める
-                    # (黒・M2 は MAPPO を 2 本確実に回せるが、見積もり (1 本 9.5 コア) では 1 本も入らないため)
-                    if (not h.get("trust_max_train")
-                            and not fits(states[h["label"]], host_footprint(h, u["rec"], fpdb), h)):
-                        continue
-                    # 他の人が GPU を使っている (使用率が高い) ときは今は入れない (CPU だけで学習するなら見ない)
-                    gutil, umax = states[h["label"]].get("gpu_util"), h.get("max_gpu_util")
-                    if (umax is not None and gutil is not None and gutil > float(umax)
-                            and not cpu_only(h, u["rec"])):
-                        continue
-                    if h["label"] in shared and n_auto >= total_cap:
-                        say("[autorun] %s: %s skipped, %d training run(s) by autorun already on shared machines "
-                            "(autorun_max_train_total=%d)" % (u["req"]["id"], h["label"], n_auto, total_cap))
-                        continue
-                cands.append((h, fin, start))
-            if not cands:
+                r = cannot_start(h, u)
+                if r is None and kept.get(h["label"], rid) != rid:
+                    r = "kept for %s" % kept[h["label"]]
+                if r is None:
+                    ok.append(h)
+                else:
+                    why[h["label"]] = r
+            # 届かないマシンも理由に出す (候補から黙って消えると、マシンが空いているのに気づけない)
+            for h in hosts:
+                if (not states[h["label"]]["reachable"] and int(h.get("max_train") or 0) > 0
+                        and (not u["req"].get("machines") or h["label"] in u["req"]["machines"])):
+                    why[h["label"]] = "unreachable"
+            if not ok:
+                since = parse_dt(u["req"].get("blocked_since"))
+                if since is None:
+                    since = now_utc()
+                    if not dry_run:
+                        u["req"]["blocked_since"] = since.isoformat()
+                waited = (now_utc() - since).total_seconds()
+                if waited >= max_wait and rid not in kept.values():
+                    # 空になっても入らないマシン (動いている学習が 0 本) は取っておいても無駄なので除く
+                    cand = [h for h in allowed if h["label"] not in kept and n_train[h["label"]] > 0
+                            and not str(why.get(h["label"], "")).startswith("gpu busy")]
+                    if cand:
+                        hk = min(cand, key=lambda h: (min(states[h["label"]]["train_eta"]),
+                                                      order_l.index(h["label"])))
+                        kept[hk["label"]] = rid
+                        why[hk["label"]] += " (kept for this request)"
+                msg = "; ".join("%s: %s" % kv for kv in why.items()) or "no allowed machine is reachable"
+                if waited >= 3600:
+                    msg += "  [waiting %.0f h]" % (waited / 3600)
+                if not dry_run:
+                    u["req"]["wait_reason"] = msg
+                say("[autorun] %s waits (#%d in queue)  %s" % (rid, rank.get(rid, 0), msg))
                 continue
-            # 今すぐ入れられるマシンのうち最も優先度の高い段 (top) と、それより優先度の高いマシンの「後で空く枠」
-            # の中から、終わる時刻が最も早いものを選ぶ。黒 (train_priority 0) が空いていれば黒、黒が埋まって
-            # いても黒で待つほうが早く終わるなら待つ、そうでなければ GPU マシン (1) に入れる
-            # = 学習が多くて黒だけでは遅くなるときだけ GPU マシンも使う
-            # 同じ段に今すぐ入れられるマシンが複数あるときは、動いている学習が少ないマシンへ (同数なら設定ファイルで
-            # 先に書かれたマシン)。黒と M2 を同じ段にすると 黒 1 → M2 1 → 黒 2 の順に埋まる
-            # (MAPPO の CPU 学習は 1 本で多くのコアを使うので、1 台に 2 本より 2 台に 1 本ずつのほうが速い)
-            now_c = [c for c in cands if c[2] <= now_utc()]
-            if now_c:
-                top = min(prio(c[0], "train_priority") for c in now_c)
-                order = [x["label"] for x in hosts]
-                best = min((c for c in now_c if prio(c[0], "train_priority") == top),
-                           key=lambda c: (n_train[c[0]["label"]], order.index(c[0]["label"]), c[1]))
-                # それより優先度の高いマシンで待つほうが早く終わるなら待つ (今までどおり)
-                cands = [best] + [c for c in cands if prio(c[0], "train_priority") < top]
-            h, fin, start = min(cands, key=lambda c: c[1])
-            free_at[h["label"]].pop(0)
-            if start > now_utc():                       # 速いマシンが空くのを待つほうが早く終わる
-                free_at[h["label"]].append(fin)
-                free_at[h["label"]].sort()
-                say("[autorun] %s waits for %s (free %s, finish %s)" % (u["req"]["id"], h["label"],
-                                                                      fmt_dt(start), fmt_dt(fin)))
-                continue
+            # 入れられるマシンが複数あれば、優先度の高い段 (train_priority が小さい) → 動いている学習が
+            # 少ないマシン → 設定ファイルで先に書かれたマシンの順。黒と M2 を同じ段にすると
+            # 黒 1 → M2 1 → 黒 2 の順に埋まる (MAPPO の CPU 学習は 1 台に 2 本より 2 台に 1 本ずつのほうが速い)
+            top = min(prio(x, "train_priority") for x in ok)
+            h = min((x for x in ok if prio(x, "train_priority") == top),
+                    key=lambda x: (n_train[x["label"]], order_l.index(x["label"])))
+            fin = now_utc() + datetime.timedelta(seconds=train_sec(rates, h["label"], u["rec"]))
             try:
-                info = launch_train(h, u["req"], u["cond"], u["rec"], conf, dry_run)
+                info = launch_train(h, u["req"], u["cond"], u["rec"], conf, dry_run,
+                                    mem_mb=host_footprint(h, u["rec"], fpdb)["mem"])
             except Exception as e:
                 u["req"]["note"] = str(e)[:300]
-                say("[autorun] %s: cannot launch on %s: %s" % (u["req"]["id"], h["label"], e))
+                say("[autorun] %s: cannot launch on %s: %s" % (rid, h["label"], e))
                 continue
-            free_at[h["label"]].append(fin)
-            free_at[h["label"]].sort()
+            u["launched"] = True
+            if not dry_run:
+                u["req"].pop("blocked_since", None)
+                u["req"].pop("wait_reason", None)
             n_train[h["label"]] += 1
+            states[h["label"]]["train_eta"].append(fin)
+            if u["req"].get("series"):
+                busy_series.add(u["req"]["series"])
+            na = states[h["label"]]["n_train_algo"]
+            a_new = str((u["rec"].get("cfg") or {}).get("name") or "").lower()
+            na[a_new] = na.get(a_new, 0) + 1          # 同じ tick で同じアルゴリズムを続けて入れすぎないように
             if h["label"] in shared:
                 n_auto += 1
             fp = host_footprint(h, u["rec"], fpdb)
             take(states[h["label"]], fp)
             say("[autorun] %s train %s on %s  (est. finish %s; needs %.1f cores, %.1f GB RAM, %.1f GB GPU%s)%s" % (
-                u["req"]["id"], cond_text(u["cond"]), h["label"], fmt_dt(fin), fp["cpu"], fp["mem"] / 1024,
+                rid, cond_text(u["cond"]), h["label"], fmt_dt(fin), fp["cpu"], fp["mem"] / 1024,
                 fp["gpu"] / 1024, ", measured" if fp.get("measured") else ", estimated",
                 "  [dry-run]" if dry_run else ""))
             if dry_run:
                 say("    $ " + info["cmd"])
             else:
-                ledger_add({"kind": "train", "req": u["req"]["id"], "host": h["label"], "cond": u["cond"]["id"],
+                ledger_add({"kind": "train", "req": rid, "host": h["label"], "cond": u["cond"]["id"],
                             "job": info["job"], "cmd": info["cmd"], "code": info.get("code"),
                             "est_sec": (fin - now_utc()).total_seconds(),
                             "grace": DROP_GRACE_SEC if h.get("drop") else LAUNCH_GRACE_SEC})
@@ -1226,6 +1530,8 @@ def _tick(dry_run, say):
                 launched_any = True
     if not dry_run:
         save_json(QUEUE, q)
+        if sb_hosts:
+            standby_write(sb_hosts, sb_reached, units, conf, fpdb, rates, say)
     if not launched_any and not dry_run:
         say("[autorun] nothing launched this time.")
 
@@ -1344,7 +1650,9 @@ def ingest_requests(say):
                     raise RuntimeError("unknown condition id(s): %s" % ", ".join(op.get("ids") or []))
                 made = add_requests(op.get("kind") or "train", picked, op.get("n") or 1, op.get("then_eval"),
                                     op.get("machines"), op.get("arrivals"), op.get("reassign"),
-                                    origin=op.get("origin"), like=op.get("like"), lare_model=op.get("lare_model"))
+                                    origin=op.get("origin"), like=op.get("like"), lare_model=op.get("lare_model"),
+                                    factor_version=op.get("factor_version"), series=op.get("series"),
+                                    env_set=op.get("set"))
                 result = "accepted: " + ", ".join(r["id"] for r in made)
             elif op.get("op") == "cancel":
                 result = "cancelled: " + ", ".join(cancel_requests(op.get("ids") or [])) or "nothing to cancel"
@@ -1404,7 +1712,7 @@ def publish(say):
 
 
 def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None, reassign=None, origin=None,
-                 like=None, lare_model=None):
+                 like=None, lare_model=None, factor_version=None, series=None, env_set=None):
     """依頼を足す (コマンドとダッシュボードの両方から使う). conds: 計画の条件 (id 付き) のリスト.
 
     司令塔でないマシンでは、共有フォルダ経由で司令塔に送る (返り値の id は "(sent)")。
@@ -1413,7 +1721,8 @@ def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None
     if is_client():
         send_request({"op": "add", "kind": kind, "ids": [c["id"] for c in conds], "n": int(n),
                       "then_eval": bool(then_eval), "machines": machines or None, "arrivals": arrivals,
-                      "reassign": reassign, "like": like, "lare_model": lare_model})
+                      "reassign": reassign, "like": like, "lare_model": lare_model,
+                      "factor_version": factor_version, "series": series, "set": env_set})
         return [{"id": "(sent)", "kind": kind, "count": int(n), "then_eval": bool(then_eval),
                  "cond_text": [cond_text(c) for c in conds] if kind == "eval" else cond_text(conds[0])}]
     q = load_queue()
@@ -1424,8 +1733,12 @@ def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None
                    "count": int(n), "then_eval": bool(then_eval), "arrivals": arrivals,
                    "eval_reassign": reassign, "machines": machines or None, "status": "open",
                    "created": now_utc().isoformat(), "origin": origin}
-            if like and lare_model:
-                req.update(like=like, lare_model=lare_model)
+            if like and (lare_model or factor_version or env_set):
+                req.update(like=like, lare_model=lare_model, factor_version=factor_version)
+                if env_set:
+                    req["set"] = env_set
+            if series:
+                req["series"] = series
             q.append(req)
             made.append(req)
     else:
@@ -1437,6 +1750,51 @@ def add_requests(kind, conds, n=1, then_eval=False, machines=None, arrivals=None
         made.append(req)
     save_json(QUEUE, q)
     return made
+
+
+@contextlib.contextmanager
+def queue_lock():
+    """依頼の一覧 (queue.json) を書き換えるコマンド同士 (tick・add・cancel・move) を 1 つずつにする.
+
+    tick は数分かかり、その間に add / cancel すると、tick が最後に古い一覧で上書きして変更が消える
+    (2026-11-14 に起きた)。fcntl.flock は同じファイルを開いた別プロセスとの排他。プロセスが落ちれば自動で外れる。
+    """
+    import fcntl
+    os.makedirs(STATE, exist_ok=True)
+    f = open(os.path.join(STATE, "queue.lock"), "w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("waiting for another autorun command (probably a tick) to finish ...", flush=True)
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
+def move_requests(ids, where, ref=None):
+    """依頼を並べ替える. where = top / bottom / before / after (before・after は ref の依頼の前・後)."""
+    q = load_queue()
+    by = dict((r["id"], r) for r in q)
+    bad = [i for i in list(ids) + ([ref] if ref else []) if i not in by]
+    if bad:
+        raise ValueError("unknown request id: %s" % ", ".join(bad))
+    moving = [by[i] for i in ids]
+    rest = [r for r in q if r["id"] not in ids]
+    if where == "top":
+        opens = [i for i, r in enumerate(rest) if r.get("status") == "open"]
+        pos = opens[0] if opens else len(rest)
+    elif where == "bottom":
+        pos = len(rest)
+    else:
+        if ref in ids:
+            raise ValueError("%s is one of the requests being moved" % ref)
+        pos = next(i for i, r in enumerate(rest) if r["id"] == ref) + (1 if where == "after" else 0)
+    q = rest[:pos] + moving + rest[pos:]
+    save_json(QUEUE, q)
+    return [r for r in q if r.get("status") == "open"]
 
 
 def cancel_requests(ids):
@@ -1507,14 +1865,25 @@ def cmd_add(args):
     machines = [m.strip() for m in args.machines.split(",")] if args.machines else None
     arrivals = _arrivals_arg(args.arrivals) if args.arrivals else None
     reassign = [x.strip().lower() in ("t", "true", "1") for x in args.reassign.split(",")] if args.reassign else None
-    if bool(args.like) != bool(args.lare_model):
-        print("--like and --lare-model go together")
+    env_set = {}
+    for kv in args.set or []:
+        if "=" not in kv:
+            print("--set needs NAME=VALUE (got %s)" % kv)
+            return 1
+        k, v = kv.split("=", 1)
+        try:
+            env_set[k.strip()] = json.loads(v)         # 数値・true/false・null は型つきで
+        except ValueError:
+            env_set[k.strip()] = v                     # それ以外は文字列
+    if bool(args.like) != bool(args.lare_model or args.factor_version or env_set):
+        print("--like goes with --lare-model, --factor-version and/or --set")
         return 1
     if args.like and (args.kind != "train" or args.like not in by_id):
         print("--like needs `add train` and a condition id from `find`")
         return 1
     made = add_requests(args.kind, [by_id[i] for i in args.ids], args.n, args.then_eval, machines,
-                        arrivals, reassign, like=args.like, lare_model=args.lare_model)
+                        arrivals, reassign, like=args.like, lare_model=args.lare_model,
+                        factor_version=args.factor_version, series=args.series, env_set=env_set or None)
     for r in made:
         what = ("train x%d%s" % (r["count"], " + eval" if r.get("then_eval") else "")) if r["kind"] == "train" else "eval"
         print("%s accepted: %s  %s" % (r["id"], what, r.get("cond_text")))
@@ -1591,6 +1960,8 @@ def cmd_status(args):
                 r["id"], r["status"], len(mine), r["count"], " +eval" if r.get("then_eval") else "", r.get("cond_text")))
             if parts:
                 print("    " + ", ".join(parts) + ("   finish ~%s" % fmt_dt(max(etas)) if etas else ""))
+            if r.get("wait_reason") and r["status"] == "open" and len(mine) < r["count"]:
+                print("    waits: %s" % r["wait_reason"])
         else:
             models = sorted(set(m for x in mine for m in x.get("models") or []))
             done_c = sum(1 for m in models for k in finished if k[0] == m)
@@ -1601,6 +1972,45 @@ def cmd_status(args):
         if r.get("note"):
             print("    note: %s" % r["note"])
     return 0
+
+
+def cmd_order(args):
+    """まだ投入していない依頼を、投入する順に出す (投入済みのものは status で見る)."""
+    led = ledger()
+    q = []
+    for r in load_queue():
+        if r.get("status") != "open":
+            continue
+        n = sum(1 for x in led if x.get("req") == r["id"] and x.get("kind") == r["kind"])
+        if r["kind"] == "train" and n >= r["count"]:
+            continue
+        q.append((r, n))
+    if not q:
+        print("no request is waiting to be launched.")
+        return 0
+    sb = {}                             # 依頼 id -> 控えに載っている GPU (白が来ないときだけそこで起動される)
+    for lab, rec in load_json(STANDBY_STATE, {}).items():
+        for j in rec.get("jobs") or []:
+            sb.setdefault(j["req"], []).append(lab)
+    for i, (r, n) in enumerate(q, 1):
+        state = ("%d/%d launched" % (n, r["count"])) if r["kind"] == "train" else "eval"
+        mach = (" only " + ",".join(r["machines"])) if r.get("machines") else ""
+        print("#%-3d %-4s %-14s %s%s" % (i, r["id"], state, r.get("cond_text") or "", mach))
+        if r.get("wait_reason") and (r["kind"] != "train" or n < r["count"]):
+            print("            waits: %s" % r["wait_reason"])
+        if r["id"] in sb:
+            print("            standby on %s (started there if the commander is away)" % ",".join(sb[r["id"]]))
+    return 0
+
+
+def cmd_move(args):
+    where = "top" if args.top else "bottom" if args.bottom else "before" if args.before else "after"
+    try:
+        move_requests(args.ids, where, args.before or args.after)
+    except ValueError as e:
+        print(e)
+        return 1
+    return cmd_order(args)
 
 
 def cmd_cancel(args):
@@ -1674,6 +2084,41 @@ def cmd_pull(args):
     return 0
 
 
+def cmd_stop(args):
+    """評価の依頼 (qN) で起動した評価を止める. 親 (eval_lare_factor.py) だけを止め、動いている test.py は最後まで走らせる.
+
+    共有フォルダのマシン (黒・M2) は inbox に stop の指示を置き、worker が次に動いたとき (5 分おき) に止める。
+    ssh のマシン (GPU1・GPU2) はその場で止める。依頼そのものは残るので、要らなければ cancel も行う。
+    """
+    if is_client():
+        print("stop works only on the commander")
+        return 1
+    hosts = dict((h["label"], h) for h in hosts_of(load_conf()))
+    jobs = [x for x in ledger() if x.get("kind") == "eval" and x.get("req") in args.ids
+            and (not args.machines or x.get("host") in args.machines)]
+    if not jobs:
+        print("no evaluation launched for %s" % ", ".join(args.ids))
+        return 1
+    for x in jobs:
+        h = hosts.get(x.get("host"))
+        if h is None:
+            print("%s: unknown host %s" % (x["job"], x.get("host")))
+            continue
+        if h.get("drop"):
+            sid = "stop_%s_%s" % (h["label"], time.strftime("%m%d%H%M%S"))
+            drop_put(h, "inbox", sid + ".json", {"id": sid, "kind": "stop", "target": x["job"], "host": h["label"]})
+            print("%s on %s: stop is queued (%s). The worker runs it within ~5 min; the result is in "
+                  "started/%s.json" % (x["job"], h["label"], sid, sid))
+        else:
+            # 先頭が python の行だけ (この命令自身のシェル・awk の行は外れる)。
+            # 親だけに SIGTERM を送るので子の test.py は走り続ける
+            cmd = ("ps -eo pid=,args= | awk '$2 ~ /python/ && /eval_lare_factor[.]py/ && /jobs\\/%s[.]json/ {print $1}'"
+                   " | xargs -r kill -TERM; echo done" % x["job"])
+            rc, out, err = run_on(h, cmd)
+            print("%s on %s: %s" % (x["job"], h["label"], "SIGTERM sent" if rc == 0 else "failed: " + err.strip()))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Run LDRP training / evaluation requests on several machines.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1693,15 +2138,34 @@ def main(argv=None):
                                                 "requested condition has no run yet (use with --lare-model)")
     a.add_argument("--lare-model", metavar="FILE", help="(train, with --like) LaRe-Path model file name to use "
                                                         "instead of the one in the --like runs")
+    a.add_argument("--series", metavar="NAME", help="(train) requests with the same series name run one at a "
+                                                    "time, in the order they were added")
+    a.add_argument("--factor-version", type=int, metavar="N", help="(train, with --like) LaRe-Path evaluation "
+                   "function version (env_args.lare_path_factor_version) to use instead of the --like runs' one")
+    a.add_argument("--set", action="append", metavar="NAME=VALUE",
+                   help="(train, with --like) override an env_args value of the --like runs, e.g. "
+                        "--set key=drp_env:drp_safe-2agent_map_8x5-v2 (repeatable)")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("ids", nargs="*")
     s.add_argument("--all", action="store_true", help="include finished / cancelled requests")
     c = sub.add_parser("cancel", help="cancel requests (launched runs keep running)")
     c.add_argument("ids", nargs="+")
+    sub.add_parser("order", help="show open requests in the order they are launched")
+    m = sub.add_parser("move", help="change the order of requests (launch earlier / later)")
+    m.add_argument("ids", nargs="+")
+    mg = m.add_mutually_exclusive_group(required=True)
+    mg.add_argument("--top", action="store_true", help="move to the front")
+    mg.add_argument("--bottom", action="store_true", help="move to the end")
+    mg.add_argument("--before", metavar="ID", help="put just before this request")
+    mg.add_argument("--after", metavar="ID", help="put just after this request")
     sub.add_parser("hosts", help="show machines and free slots")
     g = sub.add_parser("pull", help="make shared-folder machines (e.g. 黒, M2) run git pull --ff-only")
     g.add_argument("machines", nargs="*", help="host labels (default: all shared-folder machines)")
     g.add_argument("--check", action="store_true", help="show the result of the last pull instead")
+    st = sub.add_parser("stop", help="stop evaluations launched for these requests (running test.py runs finish)")
+    st.add_argument("ids", nargs="+")
+    st.add_argument("--machines", type=lambda s: [x for x in s.split(",") if x], default=None,
+                    help="only these hosts (comma separated)")
     sub.add_parser("pause", help="stop launching new jobs")
     sub.add_parser("resume", help="resume launching")
     t = sub.add_parser("tick", help="launch what can be launched now")
@@ -1710,8 +2174,19 @@ def main(argv=None):
 
     if args.cmd == "find":
         return cmd_find(args)
+    if args.cmd in ("add", "cancel", "move") or (args.cmd == "tick" and not args.dry_run):
+        with queue_lock():
+            return _main_locked(args)
+    if args.cmd == "order":
+        return cmd_order(args)
+    return _main_locked(args)
+
+
+def _main_locked(args):
     if args.cmd == "add":
         return cmd_add(args)
+    if args.cmd == "move":
+        return cmd_move(args)
     if args.cmd == "status":
         return cmd_status(args)
     if args.cmd == "cancel":
@@ -1720,6 +2195,8 @@ def main(argv=None):
         return cmd_hosts(args)
     if args.cmd == "pull":
         return cmd_pull(args)
+    if args.cmd == "stop":
+        return cmd_stop(args)
     if args.cmd == "pause":
         set_pause(True)
         print(("sent to the commander: " if is_client() else "") + "paused. running jobs are not touched.")

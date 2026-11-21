@@ -24,6 +24,8 @@ If `/opt/anaconda3/envs/ldrp/bin/python` does not exist on this machine, use the
 | 「今どうなってる」「いつ終わる」 | `status` (`status --all` for finished ones too) |
 | 「q3 やめて」「さっきのを取り消して」 | `cancel <qN>` (only not-yet-launched parts stop; running runs keep running — say so) |
 | 「今夜は止めて」「再開して」 | `pause` / `resume` |
+| 「次に何が入る」「待っている順番は」 | `order` (requests not launched yet, in launch order, with the reason each one waits) |
+| 「q43 を先に」「これは後回しで」 | `move <qN> --top` / `--bottom` / `--before <qM>` / `--after <qM>` (requests are launched in this order onto whichever machine frees up first; a request that does not fit now is skipped and later ones go first) |
 | 「マシンの空きは」 | `hosts` |
 | 「GPU2 だけで」「GPU1 は使わないで」 | add `--machines GPU2` (comma separated labels) to `add` |
 | 評価条件の指定 (到着率・reassign) | `--arrivals "8x5=fixed,mmpp,bernoulli:0.05;aoba00=fixed,mmpp,bernoulli:0.01"` / `--reassign F,T` |

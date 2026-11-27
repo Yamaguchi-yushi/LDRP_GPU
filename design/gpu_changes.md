@@ -438,6 +438,23 @@ heartbeat と時刻が一致せず、原因不明。
 
 ---
 
+## 2026-11-27 PC コミット取り込み (`7fbbf07 fineturning update`)
+
+LaRe-Path のデコーダを指定ステップから学習し始める `lare_path_train_start_step` (既定 0) の追加。
+
+| ファイル | 衝突内容 | 採用 |
+|---|---|---|
+| `src/lare/path/lare_path_module.py` | `LarePathCfg` の末尾 (GPU の `device` と PC の `train_start_step`) | 両方残す |
+| `src/main/drp_env/drp_env.py` | LaRe-Path の初期化引数 (GPU の `device=lare_device` と PC の `train_start_step=`) | 両方残す |
+| `train.py` | PC の実験条件 (版 2・10M から学習開始) | **GPU 版を維持**。使い方の例をコメントで 1 行追加 |
+
+- **LaRe-Path の保存ファイル名が変わる**: 学習量の部分が `10.0M` → `0.0M-10.0M` (開始〜終了)。既定の 0 でもこの形。
+  既存モデルの名前は変わらない
+- `tools/collect_runs.py` の GPU 固有の t_env 第 3 フォールバックは維持
+- あわせて GPU 機で学習した LaRe-Path モデル 9 本 (F2/F3 の FT 6 本、F3 8x5_2、F4 8x5_5 / aoba00_5) を追加 (PC 版には無い)
+
+---
+
 ## PC→GPU 取り込み手順
 
 1. PC 版の変更を `git fetch` / `git cherry-pick` 等で取得

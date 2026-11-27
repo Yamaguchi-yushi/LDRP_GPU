@@ -24,7 +24,16 @@ LARE_DIRS = (("models", os.path.join(REPO, "src", "lare", "path", "models")),
              ("checkpoints", os.path.join(REPO, "src", "lare", "path", "checkpoints")),
              ("fetched", os.path.join(REPO, "src", "lare", "path", "fetched")))
 
-SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_([\d.]+)M")
+# ステップ欄は古い名前 "10.0M" と新しい名前 "0.0M-10.0M" (開始-終了) の両方を読む
+SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_(?:([\d.]+)M-)?([\d.]+)M")
+
+
+def seg_label(mp, n, start, end):
+    """collect_runs.lare_seg_label と同じ: 開始 0 は "8x5_2 10M"、それ以外は "aoba00_7 10-20M"."""
+    s = float(start or 0)
+    if s > 0:
+        return "%s_%s %g-%gM" % (mp, n, s, float(end))
+    return "%s_%s %gM" % (mp, n, float(end))
 VER_RE = re.compile(r"_PATH_F(\d+)_")
 ALGO_RE = re.compile(r"(?:^|_)([A-Z][A-Z0-9]*)_PATH")
 ARROW_RE = re.compile(r"\s*(?:→|->|=>)\s*|\s+")
@@ -35,7 +44,7 @@ def parse_name(name):
     if not name.endswith(".pth") or "_PATH" not in name:
         return None
     ms = list(SEG_RE.finditer(name))
-    segs = ["%s_%s %gM" % (m.group(1), m.group(2), float(m.group(3))) for m in ms]
+    segs = [seg_label(m.group(1), m.group(2), m.group(3), m.group(4)) for m in ms]
     if not segs:
         return None
     v = VER_RE.search(name)
@@ -96,6 +105,8 @@ def scan():
 
 
 SETTING_VER_RE = re.compile(r"\s+F(\d+)\s*$")
+# デコーダの更新を遅らせた条件の印 (collect_runs.derive が setting に付ける " start10M")
+SETTING_START_RE = re.compile(r"\s+start([\d.]+)M\b")
 
 
 def expected_of(cond):
@@ -108,10 +119,13 @@ def expected_of(cond):
     m = SETTING_VER_RE.search(setting)
     version = int(m.group(1)) if m else 1
     src = SETTING_VER_RE.sub("", setting).strip()
+    sm = SETTING_START_RE.search(src)
+    start = float(sm.group(1)) if sm else 0.0
+    src = SETTING_START_RE.sub("", src).strip()
     if src.lower() in ("safe", "unsafe", ""):
         src = ""
     mp = str(cond.get("map") or "").replace("map_", "", 1)
-    stage = "%s_%s %gM" % (mp, cond.get("agents"), float(cond.get("t_max_m") or 0))
+    stage = seg_label(mp, cond.get("agents"), start, float(cond.get("t_max_m") or 0))
     chain = norm_chain((src + " " + stage) if src else stage)
     return chain, version, (cond.get("algo") or None)
 
@@ -173,7 +187,7 @@ def auto_install(conds, rows, matches, dry_run=False, log=None):
     return placed
 
 
-CHAIN_SEG_RE = re.compile(r"^\S+_\d+ [\d.]+M$")
+CHAIN_SEG_RE = re.compile(r"^\S+_\d+ [\d.]+(?:-[\d.]+)?M$")
 WHERE_LABEL = {"models": "✔ models", "checkpoints": "checkpoints/", "fetched": "fetched/"}
 NOTE_PC_RE = re.compile(r"[(（]([^)）]+)[)）]")
 

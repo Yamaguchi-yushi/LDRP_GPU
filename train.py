@@ -54,6 +54,8 @@ for i in range(num_runs):
         f'env_args.use_finetuning_lare_path=False '
         f'env_args.finetuning_lare_path_model_name="QMIX_PATH_Safe_map_8x5_2agents_5.0M_checkpoint.pth" '
         f'env_args.allow_reassign_before_pickup=True '
+        # LaRe-Path のデコーダを何ステップ目から学習し始めるか (既定 0 = 最初から)。例: 10M から
+        # f'env_args.lare_path_train_start_step={10 * 1_000_000} '
         # --- タスク到着のランダム化 (学習用) ---------------------------------
         # True: エピソード毎に bernoulli(p ランダム) / mmpp を引き直す。
         #       1 つの方策を全シナリオで評価するために必要

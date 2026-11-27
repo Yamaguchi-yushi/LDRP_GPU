@@ -67,6 +67,7 @@ class DrpEnv(gym.Env):
 			# 学習頻度 (update_freq) とは独立. 0 にすると毎更新ごとに保存.
 			lare_path_save_freq_steps=500_000,
 			lare_path_factor_version=1,	# LaRe-Path の評価関数の版 (src/lare/path/factor_versions.py)
+			lare_path_train_start_step=0,	# デコーダを更新開始するステップ数
 			lare_task_save_freq_steps=500_000,
 			lare_device="auto",
 			# PBS 互換モード: True にすると待機分岐で current_goal を非 None に保つ
@@ -234,6 +235,7 @@ class DrpEnv(gym.Env):
 		# 保存間引きしきい値 (累積環境ステップ単位). LaRe-Path/Task の自動保存に適用.
 		self.lare_path_save_freq_steps = int(lare_path_save_freq_steps)
 		self.lare_path_factor_version = int(lare_path_factor_version)
+		self.lare_path_train_start_step = int(lare_path_train_start_step)
 		self.lare_task_save_freq_steps = int(lare_task_save_freq_steps)
 		self.lare_device = lare_device  # 内部用に保存. "auto" を解決して torch.device にするのは各モジュールの初期化時.
 
@@ -318,6 +320,11 @@ class DrpEnv(gym.Env):
 		steps_in_millions = self._lare_total_step_account / 1_000_000
 		return f"{steps_in_millions:.1f}M"
 
+	def _lare_get_path_steps_str(self):
+		start = self.lare_path_train_start_step / 1_000_000
+		end = self._lare_total_step_account / 1_000_000
+		return f"{start:.1f}M-{end:.1f}M"
+
 	def _lare_get_source_base_name(self):
 		"""For finetuning: model_name から ".pth"/"_final"/"_checkpoint"/先頭 "FT_" を除いた
 		ベース名を返す (FT_ プレフィックスの多重付与を防ぐ). model_name は models/ 配下の
@@ -351,7 +358,7 @@ class DrpEnv(gym.Env):
 		algo = self._lare_get_algorithm_name()
 		map_name = getattr(self, "map_name", "unknown_map")
 		agents = getattr(self, "agent_num", "?")
-		steps = self._lare_get_steps_str()
+		steps = self._lare_get_path_steps_str()
 		if self.use_finetuning_lare_path and self.finetuning_lare_path_model_name:
 			source = self._lare_get_source_base_name()
 			return f"FT_{source}_{safe_seg}{map_name}_{agents}agents_{steps}_{suffix}.pth"
@@ -524,6 +531,7 @@ class DrpEnv(gym.Env):
 				autosave_path=autosave,
 				save_freq_steps=self.lare_path_save_freq_steps,
 				device=lare_device,
+				train_start_step=self.lare_path_train_start_step,
 			)
 			self.lare_path_module = LaRePathModule(self, cfg)
 

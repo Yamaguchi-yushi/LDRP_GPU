@@ -72,6 +72,8 @@ class LaRePathConfig:
     # ので、学習頻度 ≠ 保存頻度 を独立に制御できる. 0 にすると毎更新ごとに保存.
     save_freq_steps: int = 500_000
     device: str = "auto"
+    # デコーダを更新開始するステップ数
+    train_start_step: int = 0
 
 
 class LaRePathModule:
@@ -129,6 +131,7 @@ class LaRePathModule:
         self.is_trained = False
         self.is_pretrained = False
         self.episode_count = 0
+        self._recording = self.cfg.train_start_step <= 0
         self.update_count = 0
         self.last_loss = None
         self.use_lare_training = bool(self.cfg.use_lare_training)
@@ -231,14 +234,22 @@ class LaRePathModule:
         return r_hat.detach().cpu().numpy()
 
     def record_step(self, factors_per_agent, env_reward_sum):
+        if not self._recording:
+            return
         self.buffer.add_step(factors_per_agent, env_reward_sum)
 
     def end_episode(self):
         self.buffer.end_episode()
         self.episode_count += 1
+        if not self._recording:
+            step = int(getattr(self.env, "_lare_total_step_account", 0))
+            self._recording = step >= self.cfg.train_start_step
 
         # Frozen / pretrained mode: never update the decoder.
         if self.frozen:
+            return
+
+        if int(getattr(self.env, "_lare_total_step_account", 0)) < self.cfg.train_start_step:
             return
 
         # MARL4DRP の評価期間方式 (drp_env.py:1340-1382 相当):

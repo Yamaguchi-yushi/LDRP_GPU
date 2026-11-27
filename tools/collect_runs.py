@@ -68,8 +68,18 @@ ENV_KEYS = (
 T_ENV_RE = re.compile(r"t_env:\s*(\d+)\s*/\s*(\d+)")
 # LaRe 側のログ行:  "t_env:   10050000 | Episode:    20100"
 T_ENV_ALT_RE = re.compile(r"t_env:\s*(\d+)\s*\|")
-# LaRe モデル名の 1 区間: "Safe_map_8x5_2agents_10.0M" -> ("8x5", "2", "10.0")
-LARE_SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_([\d.]+)M")
+# LaRe モデル名の 1 区間: "Safe_map_8x5_2agents_10.0M" -> ("8x5", "2", None, "10.0")
+# 2026-11 からはステップ欄が「開始-終了」: "..._2agents_0.0M-10.0M" -> ("8x5", "2", "0.0", "10.0")
+# (design/lare_train_start_step.md)。開始の無い古い名前は開始 0 として読む
+LARE_SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_(?:([\d.]+)M-)?([\d.]+)M")
+
+
+def lare_seg_label(mp, n, start, end):
+    """区間 1 つの表示: 開始 0 なら "8x5_2 10M" (今までどおり)、そうでなければ "aoba00_7 10-20M"."""
+    s = float(start or 0)
+    if s > 0:
+        return "%s_%s %g-%gM" % (mp, n, s, float(end))
+    return "%s_%s %gM" % (mp, n, float(end))
 # 環境キー: "drp_env:drp_safe-7agent_map_8x5-v2"
 ENV_KEY_RE = re.compile(r"drp(_safe)?-(\d+)agent_(.+?)-v\d")
 
@@ -530,7 +540,9 @@ def find_model(index, repo, algo, seed, env_key):
 # 同じ条件を同じマシンで回し直すと同じ名前で上書きされるので、
 # 「run の開始から終了 (+10 分) の間に書かれたもの」だけをその run のものとみなす
 LARE_PATH_CKPT_DIR = os.path.join("src", "lare", "path", "checkpoints")
-LARE_STEP_RE = re.compile(r"_([\d.]+)M_(checkpoint|final)\.pth$")
+# 末尾のステップ欄: "_10.0M_checkpoint.pth" (古い名前) / "_0.0M-10.0M_checkpoint.pth"
+# group(1) = 開始 (古い名前では None), group(2) = 累積ステップ, group(3) = checkpoint / final
+LARE_STEP_RE = re.compile(r"_(?:([\d.]+)M-)?([\d.]+)M_(checkpoint|final)\.pth$")
 LARE_VER_RE = re.compile(r"_PATH_F(\d+)_")
 _LARE_LS = {}
 
@@ -578,6 +590,7 @@ def find_lare_model(repo, env, start_time, end_time):
         version = int(env.get("lare_path_factor_version") or 1)
     except (TypeError, ValueError):
         version = 1
+    start_m = lare_train_start_m(env)
     explicit = env.get("lare_path_autosave_path")
     if explicit:
         d = os.path.dirname(os.path.join(repo, os.path.expanduser(str(explicit))))
@@ -597,6 +610,8 @@ def find_lare_model(repo, env, start_time, end_time):
         head = n[:sm.start() + 1]                     # "..._{N}agents_" まで
         if not head.endswith(stage):
             continue
+        if abs(float(sm.group(1) or 0) - start_m) > 0.05:
+            continue                                  # 学習開始ステップの違う run のもの
         if fin:
             if not n.startswith("FT_%s_%s" % (_lare_source_base(fin), stage)):
                 continue
@@ -615,7 +630,7 @@ def find_lare_model(repo, env, start_time, end_time):
             continue
         if (lo is not None and st.st_mtime < lo) or (hi is not None and st.st_mtime > hi):
             continue
-        key = (float(sm.group(1)), sm.group(2) == "final")
+        key = (float(sm.group(2)), sm.group(3) == "final")
         if best is None or key > best[0]:
             best = (key, n, st)
     if best is None:
@@ -1359,8 +1374,7 @@ def pretty_lare_models(name):
     parts = []
     last = None
     for m in LARE_SEG_RE.finditer(str(name)):
-        steps = float(m.group(3))
-        parts.append("%s_%s %gM" % (m.group(1), m.group(2), steps))
+        parts.append(lare_seg_label(m.group(1), m.group(2), m.group(3), m.group(4)))
         last = m
     if not parts:
         return str(name)
@@ -1370,6 +1384,14 @@ def pretty_lare_models(name):
     # 付けないと元のモデルの run と同じ setting・同じ評価用モデル名になる
     mark = lare_edit_mark(str(name)[last.end():])
     return "%s %s" % (out, mark) if mark else out
+
+
+def lare_train_start_m(env):
+    """env_args の lare_path_train_start_step (デコーダの更新を始める累積ステップ) を M 単位で. 無ければ 0."""
+    try:
+        return float((env or {}).get("lare_path_train_start_step") or 0) / 1e6
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def lare_edit_mark(tail):
@@ -1520,6 +1542,12 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         d["setting"] = env_label
         d["lare_mode"] = ("scratch" if env.get("use_lare_path_training")
                           else "scratch(frozen)")
+    # デコーダの更新を遅らせた run (env_args.lare_path_train_start_step > 0) は、
+    # setting に " start10M" のように付ける。付けないと遅らせない run と同じ条件に数えられる
+    # (design/lare_train_start_step.md)。固定して使うだけの run (pretrained) では意味が無いので付けない
+    st_m = lare_train_start_m(env) if env.get("use_lare_path") else 0.0
+    if st_m > 0 and d["lare_mode"] != "pretrained":
+        d["setting"] = "%s start%gM" % (d["setting"], st_m)
     # LaRe-Path の評価関数の版 (env_args.lare_path_factor_version)。版 1 (今まで) は
     # 表記を変えない。2 以降は setting に " F2" のように付け、LaRe なしの run や
     # 版 1 の run と同じ条件に数えられないようにする (design/lare_factor_versions.md)

@@ -234,7 +234,7 @@ class LaRePathModule:
         return r_hat.detach().cpu().numpy()
 
     def record_step(self, factors_per_agent, env_reward_sum):
-        if not self._recording:
+        if self.frozen or not self._recording:
             return
         self.buffer.add_step(factors_per_agent, env_reward_sum)
 
@@ -338,6 +338,7 @@ class LaRePathModule:
             ),
             "factor_dim": self.factor_dim,
             "factor_version": self.factor_version,
+            "train_start_step": int(self.cfg.train_start_step),
             "n_agents": self.n_agents,
             "use_transformer": self.use_transformer,
             "update_count": self.update_count,

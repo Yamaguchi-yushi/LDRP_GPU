@@ -640,10 +640,19 @@ def template_for(req, cond, dash, recs, by_id):
             env["lare_path_factor_version"] = int(ver)
     # --set 名前=値: 雛形の env_args を上書き (台数の違う条件を作るときの env の key など)
     env.update(req.get("set") or {})
+    # 学習の長さ: --like の条件と章の t_max が違えば、章の長さにする (端数 50000 などは雛形のまま)。
+    # 例: 10M の章の run を雛形に、15M の章 (デコーダの更新を 5M から始める追加学習) を出すとき (2026-11-27)
+    cfg = dict(base.get("cfg") or {})
+    want = (cond or {}).get("t_max_m")
+    if want and cfg.get("t_max"):
+        t = int(cfg["t_max"])
+        tail = t - int(round(t / 1e6)) * 1000000
+        if int(round(t / 1e6)) != int(round(float(want))):
+            cfg["t_max"] = int(round(float(want) * 1e6)) + tail
     # GPU 版にだけある装置の指定。cpu なら外しても同じ (Mac のコードには無く、残すと env の生成で落ちる)
     if env.get("lare_device") in (None, "cpu"):
         env.pop("lare_device", None)
-    return dict(base, env=env, uid=None)
+    return dict(base, cfg=cfg, env=env, uid=None)
 
 
 _YAML_CACHE = {}
@@ -737,8 +746,11 @@ def build_train_command(h, rec):
     if bad:
         raise RuntimeError("template does not round-trip on %s: %s" % (h["label"], ", ".join(bad[:5])))
     toks = ["%s=%s" % (k, _fmt(v)) for k, v in over] + ["env_args.%s=%s" % (k, _fmt(v)) for k, v in eover]
-    cmd = "%s src/epymarl/src/main.py --config=%s --env-config=gymma with %s" % (
-        h["python"], algo, " ".join(toks))
+    # --beat-interval: sacred の heartbeat (既定 10 秒) と torch の計算が重なると SIGSEGV / SIGFPE で
+    # 落ちることがある (GPU2 の q22, q59 で実測)。host の autorun: に beat_interval: 900 があれば間隔を広げる
+    beat = " --beat-interval=%d" % int(h["beat_interval"]) if h.get("beat_interval") else ""
+    cmd = "%s src/epymarl/src/main.py --config=%s --env-config=gymma%s with %s" % (
+        h["python"], algo, beat, " ".join(toks))
     if cpu_only(h, rec):
         # GPU を見せずに起動する (train.py のコメントにある CPU 実行と同じ)。epymarl は GPU が無いと CPU で動く。
         # host の cpu_algos を消せば元に戻る (一時的な処置, 2026-11-12)

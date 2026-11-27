@@ -206,7 +206,9 @@ table.ctbl td,table.ctbl th{padding:2px 8px}
 table.ctbl td.cbest{font-weight:700}
 /* 学習曲線の章: 図 | 凡例、その下に評価表 */
 .cpair{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
-.cpair>.cchart{flex:1 1 560px;min-width:0}
+/* 図は縮めない (基準 900px または画面幅)。凡例が横に収まらなければ凡例のほうを図の下へ回す
+   (2026-11-23: 以前は 560px まで縮んでよく、凡例が多い aoba00 で図が小さくなった) */
+.cpair>.cchart{flex:1 0 min(900px,100%);min-width:0}
 /* 図の横の凡例: 1 項目 1 行。行数 (app.js の LEG_ROWS) を超えたら列を右に足す */
 .vlegend{flex:0 0 auto;display:grid;grid-auto-flow:column;column-gap:14px;align-content:start}
 .vlegend .cleg{white-space:nowrap;margin:0 0 4px 0}

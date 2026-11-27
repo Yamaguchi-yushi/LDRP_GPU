@@ -103,6 +103,9 @@ GLOBAL_SKIP_KEYS = frozenset((
     "env.rand_p_min", "env.rand_p_max", "env.task_p_low", "env.task_p_high",
     # LaRe の評価関数の版。計画表の setting 列 (F1 / F2 / F3) で条件として振っている
     "env.lare_path_factor_version",
+    # LaRe のデコーダの更新を始めるステップ。setting 列 (10M-20M など) で条件として振っている
+    # (design/lare_train_start_step.md)。0 (既定) は collect_runs.param_fields が落とす
+    "env.lare_path_train_start_step",
 ))
 GLOBAL_MIN_GROUP = 3    # 比べる相手がこれ未満なら多数派を決めない
 GLOBAL_MAJORITY = 0.5   # 多数派とみなす割合 (これ未満 = 意図的に振っているキー)

@@ -75,10 +75,10 @@ LARE_SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_(?:([\d.]+)M-)?([\d.]+)M")
 
 
 def lare_seg_label(mp, n, start, end):
-    """区間 1 つの表示: 開始 0 なら "8x5_2 10M" (今までどおり)、そうでなければ "aoba00_7 10-20M"."""
+    """区間 1 つの表示: 開始 0 なら "8x5_2 10M" (今までどおり)、そうでなければ "aoba00_7 10M-20M"."""
     s = float(start or 0)
     if s > 0:
-        return "%s_%s %g-%gM" % (mp, n, s, float(end))
+        return "%s_%s %gM-%gM" % (mp, n, s, float(end))
     return "%s_%s %gM" % (mp, n, float(end))
 # 環境キー: "drp_env:drp_safe-7agent_map_8x5-v2"
 ENV_KEY_RE = re.compile(r"drp(_safe)?-(\d+)agent_(.+?)-v\d")
@@ -254,6 +254,20 @@ def param_fields(cfg_full, env_full, dropped=None):
         if not env.get(flag, False):
             for k in dependents:
                 drop(k)
+    # LaRe-Path のデコーダの更新を始めるステップ (2026-11-27 新設。gymma.yaml の既定 0)。
+    # 0 は今までどおり = キーが無い古い run と同じ。残すと、新設後の run だけ
+    # 「同じ条件で設定が違う」(params✗ / 他と違う) の警告になる。LaRe なしの run でも使われない
+    try:
+        if not env.get("use_lare_path") or int(env.get("lare_path_train_start_step") or 0) == 0:
+            drop("lare_path_train_start_step")
+    except (TypeError, ValueError):
+        pass
+    # 評価関数の版も同じ: 1 (既定) を明示した run とキーの無い run は同じ (11-21〜22 の GPU1 の run で警告が出ていた)
+    try:
+        if not env.get("use_lare_path") or int(env.get("lare_path_factor_version") or 1) == 1:
+            drop("lare_path_factor_version")
+    except (TypeError, ValueError):
+        pass
     # 事前学習 (固定) が指定されていると追加学習の指定は無視される
     # (drp_env.py の _init_lare_path: finetuning = ... and not pretrained)
     if env.get("use_pretrained_lare_path") and env.get("pretrained_lare_path_model_name"):
@@ -1543,11 +1557,12 @@ def derive(rec, stale_minutes, method_tag_map=None, expected_t_max=None,
         d["lare_mode"] = ("scratch" if env.get("use_lare_path_training")
                           else "scratch(frozen)")
     # デコーダの更新を遅らせた run (env_args.lare_path_train_start_step > 0) は、
-    # setting に " start10M" のように付ける。付けないと遅らせない run と同じ条件に数えられる
+    # setting に " 10M-20M" (開始-この run の長さ) のように付ける。付けないと遅らせない run と同じ条件に数えられる
     # (design/lare_train_start_step.md)。固定して使うだけの run (pretrained) では意味が無いので付けない
     st_m = lare_train_start_m(env) if env.get("use_lare_path") else 0.0
     if st_m > 0 and d["lare_mode"] != "pretrained":
-        d["setting"] = "%s start%gM" % (d["setting"], st_m)
+        end_m = d.get("group_m") or round((d.get("t_max") or 0) / 1e6)
+        d["setting"] = "%s %gM-%gM" % (d["setting"], st_m, end_m)
     # LaRe-Path の評価関数の版 (env_args.lare_path_factor_version)。版 1 (今まで) は
     # 表記を変えない。2 以降は setting に " F2" のように付け、LaRe なしの run や
     # 版 1 の run と同じ条件に数えられないようにする (design/lare_factor_versions.md)

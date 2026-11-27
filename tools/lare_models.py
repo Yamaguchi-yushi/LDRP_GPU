@@ -29,10 +29,10 @@ SEG_RE = re.compile(r"map_(.+?)_(\d+)agents_(?:([\d.]+)M-)?([\d.]+)M")
 
 
 def seg_label(mp, n, start, end):
-    """collect_runs.lare_seg_label と同じ: 開始 0 は "8x5_2 10M"、それ以外は "aoba00_7 10-20M"."""
+    """collect_runs.lare_seg_label と同じ: 開始 0 は "8x5_2 10M"、それ以外は "aoba00_7 10M-20M"."""
     s = float(start or 0)
     if s > 0:
-        return "%s_%s %g-%gM" % (mp, n, s, float(end))
+        return "%s_%s %gM-%gM" % (mp, n, s, float(end))
     return "%s_%s %gM" % (mp, n, float(end))
 VER_RE = re.compile(r"_PATH_F(\d+)_")
 ALGO_RE = re.compile(r"(?:^|_)([A-Z][A-Z0-9]*)_PATH")
@@ -105,8 +105,8 @@ def scan():
 
 
 SETTING_VER_RE = re.compile(r"\s+F(\d+)\s*$")
-# デコーダの更新を遅らせた条件の印 (collect_runs.derive が setting に付ける " start10M")
-SETTING_START_RE = re.compile(r"\s+start([\d.]+)M\b")
+# デコーダの更新を遅らせた条件の印 (collect_runs.derive が setting に付ける " 10M-20M" = 開始-長さ)
+SETTING_START_RE = re.compile(r"\s+([\d.]+)M-[\d.]+M(?=\s|$)")
 
 
 def expected_of(cond):
@@ -187,7 +187,7 @@ def auto_install(conds, rows, matches, dry_run=False, log=None):
     return placed
 
 
-CHAIN_SEG_RE = re.compile(r"^\S+_\d+ [\d.]+(?:-[\d.]+)?M$")
+CHAIN_SEG_RE = re.compile(r"^\S+_\d+ (?:[\d.]+M-)?[\d.]+M$")
 WHERE_LABEL = {"models": "✔ models", "checkpoints": "checkpoints/", "fetched": "fetched/"}
 NOTE_PC_RE = re.compile(r"[(（]([^)）]+)[)）]")
 

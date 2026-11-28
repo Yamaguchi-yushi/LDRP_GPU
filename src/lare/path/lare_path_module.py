@@ -139,7 +139,9 @@ class LaRePathModule:
         # save_freq_steps での保存間引き用. 前回保存時の累積環境ステップ.
         # 0 で初期化 → 最初の保存は save_freq_steps (= デフォ 0.5M) を超えた時点.
         # 0 step ではセーブしない.
-        self._last_saved_step = 0
+        # 開始ステップ (train_start_step) から数える。0 から数えると、開始を遅らせた run の保存が
+        # 5.13M, 5.63M, ... とずれて、最後のファイル名が 14.6M のようになる (計画表の 15M と合わない)
+        self._last_saved_step = int(self.cfg.train_start_step)
 
         # MARL4DRP の evaluation_period 状態機械 (drp_env.py:1340-1382 相当).
         # update_freq ごとに True にセット → 連続する train_epochs ep で 1 step ずつ

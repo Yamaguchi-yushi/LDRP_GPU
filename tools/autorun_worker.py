@@ -211,6 +211,87 @@ def take_jobs(s):
     return errors
 
 
+def running_trains():
+    """このマシンで動いている学習 (epymarl の main.py) の本数を、アルゴリズムごとに数える.
+
+    終わったのに抜けきれず CPU 0% で残っているプロセス (黒で実測) は数えない:
+    CPU を 2% 以上使っているか、起動から 15 分以内のものだけを「動いている」とみなす。"""
+    p = subprocess.run(["ps", "-eo", "etime=,pcpu=,args="], capture_output=True, text=True, errors="replace")
+    out = {}
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3 or "src/epymarl/src/main.py" not in parts[2]:
+            continue
+        tok = parts[2].split()
+        if not os.path.basename(tok[0]).startswith("python"):
+            continue                        # caffeinate や sh の行は数えない (中の python を数える)
+        try:
+            cpu = float(parts[1])
+        except ValueError:
+            cpu = 0.0
+        sec = AR.CR._etime_sec(parts[0])
+        if cpu < 2.0 and not (sec is not None and sec < 15 * 60):
+            continue
+        algo = next((t.split("=", 1)[1] for t in tok if t.startswith("--config=")), "?").lower()
+        out[algo] = out.get(algo, 0) + 1
+    return out
+
+
+def take_standby(s):
+    """司令塔 (白) が来ていないとき、控え (standby/) から 1 本だけ学習を起動する (1 回の実行で 1 本まで).
+
+    白の tick が commander_seen.json を新しくしている間は何もしない。控えの中身・上限は白が standby/_meta.json に書く。"""
+    d = os.path.join(s["base"], "standby")
+    meta_p, seen_p = os.path.join(d, "_meta.json"), os.path.join(s["base"], "commander_seen.json")
+    if not os.path.exists(meta_p):
+        return
+    if ensure_local([x for x in (meta_p, seen_p) if os.path.exists(x)]):
+        return
+    meta, seen = AR.load_json(meta_p, {}), AR.load_json(seen_p, {})
+    now = AR.now_utc()
+    seen_at, meta_at = AR.parse_dt(seen.get("at")), AR.parse_dt(meta.get("at"))
+    absent = float(meta.get("absent_sec") or 3600)
+    if seen_at is not None and (now - seen_at).total_seconds() < absent:
+        return                              # 白がいる
+    if meta_at is None or (now - meta_at).total_seconds() > float(meta.get("lease_sec") or 86400):
+        return                              # 控えが古すぎる (白がその後で別のマシンに入れたかもしれない)
+    run = running_trains()
+    if sum(run.values()) >= int(meta.get("max_train") or 0):
+        return
+    caps = meta.get("max_train_by_algo") or {}
+    files = sorted(p for p in glob.glob(os.path.join(d, "*.json")) if not os.path.basename(p).startswith("_"))
+    jobs = []
+    for p in files:
+        if ensure_local([p]):
+            continue
+        job = AR.load_json(p, None)
+        if job:
+            jobs.append((int(job.get("seq") or 0), p, job))
+    for _seq, p, job in sorted(jobs, key=lambda x: x[0]):
+        algo = str(job.get("algo") or "").lower()
+        if algo in caps and run.get(algo, 0) >= int(caps[algo]):
+            continue
+        if ensure_local([x for x in job_paths(s, job) if os.path.exists(x)]) or \
+                [x for x in job_paths(s, job) if not os.path.exists(x)]:
+            log("standby %s: waiting for iCloud" % job.get("id"))
+            continue
+        started = os.path.join(s["base"], "started")
+        os.makedirs(started, exist_ok=True)
+        dst = os.path.join(started, os.path.basename(p))
+        os.replace(p, dst)                  # 移してから起動する (2 回起動しない)
+        try:
+            start_train(s, job)
+            job["started_at"] = AR.now_utc().isoformat()
+            job["by"] = "standby"
+            log("started %s from the standby (commander away since %s)" % (job["id"], seen.get("at")))
+        except Exception as e:
+            job["error"] = str(e)[:500]
+            log("cannot start standby %s: %s" % (job["id"], e))
+        with open(dst, "w") as f:
+            json.dump(job, f, ensure_ascii=False, indent=1)
+        return
+
+
 def stop_eval(target):
     """評価のジョブ target (例 q49_黒_11201725) の親 (tools/eval_lare_factor.py) に SIGTERM を送る (司令塔の `autorun.py stop`).
 
@@ -424,6 +505,11 @@ def main(argv=None):
         return uninstall() or 0
     s = settings()
     errors = AR.load_json(ERRORS, []) if args.status_only else take_jobs(s)
+    if not args.status_only:
+        try:
+            take_standby(s)
+        except Exception as e:              # 控えの失敗で、評価ログの写しや status.json を止めない
+            log("standby failed: %s" % e)
     copy_eval_logs(s)
     write_status(s, errors)
     return 0

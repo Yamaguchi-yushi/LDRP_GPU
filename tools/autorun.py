@@ -1126,10 +1126,11 @@ def standby_held(hosts, reached, conf):
     return held
 
 
-def standby_write(hosts, reached, units, conf, fpdb, rates, say):
-    """まだ入っていない学習を、届いた GPU の控えに書く (units は順番どおり。launched のものは除く)."""
+def standby_write(hosts, reached, units, conf, fpdb, rates, say, taken=None, plan=None):
+    """まだ入っていない学習を、届いた GPU の控えに書く (units は順番どおり。launched のものは除く).
+    返り値: 控えに載せた単位の番号 (共有フォルダのマシンの控えと重ねないため)."""
     saved = load_json(STANDBY_STATE, {})
-    taken = set()                       # 控えに載せた単位 (1 つの単位は 1 台にだけ)
+    taken = set() if taken is None else taken      # 控えに載せた単位 (1 つの単位は 1 台にだけ)
     model_ok = {}
     order_h = sorted((h for h in hosts if h["label"] in reached),
                      key=lambda h: (int(h.get("train_priority") or 0), hosts.index(h)))
@@ -1139,6 +1140,8 @@ def standby_write(hosts, reached, units, conf, fpdb, rates, say):
         for i, u in enumerate(units):
             if len(jobs) >= cap:
                 break
+            if plan is not None and i not in plan.get(h["label"], ()):
+                continue                    # 控えの割り振り (standby_plan) で別のマシンに配った
             if u["kind"] != "train" or u.get("launched") or i in taken or u["req"].get("series"):
                 continue
             if u["req"].get("machines") and h["label"] not in u["req"]["machines"]:
@@ -1204,6 +1207,176 @@ def standby_write(hosts, reached, units, conf, fpdb, rates, say):
             say("[autorun] standby on %s (started there only if the commander is away): %s"
                 % (h["label"], ", ".join(j["req"] for j in jobs)))
     save_json(STANDBY_STATE, saved)
+    return taken
+
+
+# ---------------------------------------------------------------------------
+# 共有フォルダのマシン (黒・M2) の控え (2026-11-28〜)。GPU の控えと同じ考え方を共有フォルダで行う
+#
+#   白の tick
+#     1. <drop_dir>/commander_seen.json を新しくする (= 司令塔がいる印。iCloud で届く)
+#     2. worker が控えから自分で起動したジョブ (<drop_dir>/started/<job>.json) を台帳に取り込む
+#     3. 通常どおり投入する
+#     4. まだ入っていない学習のうち先頭から数件を、ジョブの形のまま <drop_dir>/standby/ に置く
+#        (GPU の控えに載せたものとは重ねない)
+#   worker (tools/autorun_worker.py, 5 分おき)
+#     commander_seen.json が DROP_ABSENT_SEC より古い (= 白が来ていない) ときだけ、控えを先頭から見て、
+#     本数 (max_train / max_train_by_algo) に入る最初の 1 本を started/ に移して起動する
+#   白が留守から戻った直後は、worker が起動した記録が iCloud でまだ届いていないことがある。そこで
+#   戻ってから DROP_RETURN_HOLD_SEC の間は、控えに載っていた依頼を他のマシンに入れず、控えも書き換えない
+# ---------------------------------------------------------------------------
+DROP_ABSENT_SEC = 60 * 60           # これより長く白の印が新しくならなければ、worker が控えを起動してよい
+DROP_RETURN_HOLD_SEC = 30 * 60      # 留守から戻った直後に、控えを据え置く長さ (iCloud の同期待ち)
+LAST_TICK = os.path.join(STATE, "last_tick.json")
+
+
+def standby_plan(gpu_hosts, reached, drop_hosts, holding, units, conf):
+    """控えに載せる学習を、マシンの学習枠 (max_train) に比例するように順番に配る (2026-11-28).
+
+    前は GPU の控えから先に埋めていたので、件数を増やすと 1 台 (GPU1) が全部取り、留守の間に
+    黒・M2 が空いたままになった。先頭の学習から順に、「控えの数 / 学習枠」が一番小さいマシンへ配る
+    (同じなら train_priority の小さいほう)。返り値: label -> 単位の番号の集合."""
+    cand = [h for h in gpu_hosts if h["label"] in reached]
+    if not holding:
+        cand += drop_hosts
+    load = dict((h["label"], 0) for h in cand)
+    plan = dict((h["label"], set()) for h in cand)
+    for i, u in enumerate(units):
+        if u["kind"] != "train" or u.get("launched") or u["req"].get("series"):
+            continue
+        algo = str((u["rec"].get("cfg") or {}).get("name") or "").lower()
+        ok = []
+        for h in cand:
+            cap_t = int(h.get("max_train") or 0)
+            if load[h["label"]] >= int(h.get("standby") or 0) or cap_t <= 0:
+                continue
+            if (h.get("max_train_by_algo") or {}).get(algo) == 0:
+                continue
+            if u["req"].get("machines") and h["label"] not in u["req"]["machines"]:
+                continue
+            try:
+                if not check_command_condition(build_train_command(h, u["rec"]), u["cond"], conf):
+                    continue
+            except Exception:
+                continue
+            ok.append(h)
+        if not ok:
+            continue
+        h = min(ok, key=lambda x: (load[x["label"]] / float(int(x.get("max_train") or 1)),
+                                   int(x.get("train_priority") or 0), cand.index(x)))
+        load[h["label"]] += 1
+        plan[h["label"]].add(i)
+    return plan
+
+
+def drop_standby_hosts(conf):
+    """控えを置く共有フォルダのマシン (autorun.standby が 1 以上)."""
+    return [h for h in hosts_of(conf) if h.get("enabled") and h.get("drop") and int(h.get("standby") or 0) > 0]
+
+
+def drop_standby_begin(hosts, say, dry_run):
+    """tick の最初: 司令塔がいる印を置き、留守から戻ったかを判定し、worker が起動した控えを台帳に取り込む.
+
+    返り値: 控えを据え置く (他に入れない・書き換えない) なら True."""
+    if not hosts:
+        return False
+    st = load_json(LAST_TICK, {})
+    now = now_utc()
+    prev = parse_dt(st.get("at"))
+    hold_until = parse_dt(st.get("hold_until"))
+    if prev is not None and (now - prev).total_seconds() > DROP_ABSENT_SEC:
+        hold_until = now + datetime.timedelta(seconds=DROP_RETURN_HOLD_SEC)
+        say("[autorun] back after %s away: keeping the shared-folder standby for %d min (waiting for iCloud)"
+            % (fmt_dur((now - prev).total_seconds()), DROP_RETURN_HOLD_SEC // 60))
+    holding = hold_until is not None and now < hold_until
+    if dry_run:
+        return holding
+    saved = load_json(STANDBY_STATE, {})
+    known = set(x.get("job") for x in ledger())
+    for h in hosts:
+        drop_put(h, "", "commander_seen.json", {"at": now.isoformat()})
+        for j in (saved.get(h["label"]) or {}).get("jobs") or []:
+            if j["job"] in known:
+                continue
+            p = os.path.join(h["drop_dir"], "started", j["job"] + ".json")
+            job = load_json(p, None) if os.path.exists(p) else None
+            if not job or job.get("error"):
+                continue
+            rec = {"kind": "train", "req": j["req"], "host": h["label"], "cond": j.get("cond"),
+                   "job": j["job"], "cmd": (job.get("commands") or [None])[0], "code": None,
+                   "est_sec": j.get("est_sec"), "grace": DROP_GRACE_SEC,
+                   "at": job.get("started_at") or now.isoformat(), "by": "standby"}
+            ledger_add(rec)
+            known.add(j["job"])
+            say("[autorun] %s started %s by itself while the commander was away (at %s)"
+                % (h["label"], j["req"], fmt_dt(parse_dt(rec["at"]))))
+    save_json(LAST_TICK, {"at": now.isoformat(),
+                          "hold_until": hold_until.isoformat() if holding else None})
+    return holding
+
+
+def drop_standby_held(hosts, holding):
+    """据え置き中に、共有フォルダのマシンの控えに載っていて、まだ台帳に無いジョブ: 依頼 id -> 本数."""
+    held = {}
+    if not holding:
+        return held
+    saved = load_json(STANDBY_STATE, {})
+    known = set(x.get("job") for x in ledger())
+    for h in hosts:
+        for j in (saved.get(h["label"]) or {}).get("jobs") or []:
+            if j["job"] not in known:
+                held[j["req"]] = held.get(j["req"], 0) + 1
+    return held
+
+
+def drop_standby_write(hosts, units, conf, rates, say, taken, holding, plan=None):
+    """まだ入っていない学習を、共有フォルダのマシンの控え (<drop_dir>/standby/) にジョブの形で置く."""
+    if holding:
+        return
+    saved = load_json(STANDBY_STATE, {})
+    for h in hosts:
+        d = os.path.join(h["drop_dir"], "standby")
+        os.makedirs(d, exist_ok=True)
+        for p in glob.glob(os.path.join(d, "*.json")):       # 前の控えは置き直す (起動されたものは started/ にある)
+            os.remove(p)
+        jobs = []
+        cap = int(h.get("standby") or 0)
+        for i, u in enumerate(units):
+            if len(jobs) >= cap:
+                break
+            if plan is not None and i not in plan.get(h["label"], ()):
+                continue                    # 控えの割り振り (standby_plan) で別のマシンに配った
+            if u["kind"] != "train" or u.get("launched") or i in taken or u["req"].get("series"):
+                continue
+            if u["req"].get("machines") and h["label"] not in u["req"]["machines"]:
+                continue
+            algo = str((u["rec"].get("cfg") or {}).get("name") or "").lower()
+            if int(h.get("max_train") or 0) <= 0 or (h.get("max_train_by_algo") or {}).get(algo) == 0:
+                continue
+            try:
+                cmd = build_train_command(h, u["rec"])
+                if not check_command_condition(cmd, u["cond"], conf):
+                    continue
+                attach = ensure_lare_model(h, u["rec"].get("env") or {})
+            except Exception:
+                continue
+            rid = u["req"]["id"]
+            job_id = "%s_%s_%s_s%d" % (rid, h["label"], time.strftime("%m%d%H%M%S"), len(jobs))
+            est = train_sec(rates, h["label"], u["rec"])
+            drop_put(h, "standby", job_id + ".json",
+                     {"id": job_id, "kind": "train", "commands": [cmd], "max_processes": 1,
+                      "files": attach["files"], "copy_lare_from_checkpoints": attach["copy_lare_from_checkpoints"],
+                      "req": rid, "algo": algo, "seq": len(jobs)})
+            jobs.append({"job": job_id, "req": rid, "cond": u["cond"]["id"], "est_sec": est})
+            taken.add(i)
+        drop_put(h, "standby", "_meta.json",
+                 {"at": now_utc().isoformat(), "lease_sec": standby_lease_sec(conf), "absent_sec": DROP_ABSENT_SEC,
+                  "max_train": int(h.get("max_train") or 0), "max_train_by_algo": h.get("max_train_by_algo") or {}})
+        saved[h["label"]] = {"at": now_utc().isoformat(), "jobs": jobs}
+        if jobs:
+            say("[autorun] standby on %s (started there only if the commander is away): %s"
+                % (h["label"], ", ".join(j["req"] for j in jobs)))
+    save_json(STANDBY_STATE, saved)
 
 
 def tick(dry_run=False, verbose=True):
@@ -1230,14 +1403,18 @@ def _tick(dry_run, say):
     # 控え (standby): 先に GPU へ「司令塔がいる」印を付け、留守の間に GPU が自分で起動した学習を台帳に取り込む
     sb_hosts = standby_hosts(conf)
     sb_reached = standby_sync(sb_hosts, say, dry_run) if sb_hosts else set()
+    dsb_hosts = drop_standby_hosts(conf)
+    dsb_holding = drop_standby_begin(dsb_hosts, say, dry_run)
     if os.path.exists(PAUSE) and not dry_run:
         standby_write(sb_hosts, sb_reached, [], conf, {}, {}, say)     # 止めている間は GPU にも起動させない
+        drop_standby_write(dsb_hosts, [], conf, {}, say, set(), dsb_holding)
         say("[autorun] paused (%s). nothing launched." % PAUSE)
         return
     q = load_queue()
     if not any(r.get("status") == "open" for r in q):
         if not dry_run:
             standby_write(sb_hosts, sb_reached, [], conf, {}, {}, say)
+            drop_standby_write(dsb_hosts, [], conf, {}, say, set(), dsb_holding)
         say("[autorun] no open requests.")
         return
     dash = dashboard()
@@ -1266,6 +1443,8 @@ def _tick(dry_run, say):
 
     # 白から届かない GPU の控えに載っている学習は、期限までは他のマシンに入れない (二重投入を防ぐ)
     sb_held = standby_held(sb_hosts, sb_reached, conf)
+    for rid, n in drop_standby_held(dsb_hosts, dsb_holding).items():
+        sb_held[rid] = sb_held.get(rid, 0) + n
     # --- 依頼の状態を更新し、まだ投入していない分を「単位」にする ---
     units = []
     for req in q:
@@ -1542,8 +1721,9 @@ def _tick(dry_run, say):
                 launched_any = True
     if not dry_run:
         save_json(QUEUE, q)
-        if sb_hosts:
-            standby_write(sb_hosts, sb_reached, units, conf, fpdb, rates, say)
+        plan = standby_plan(sb_hosts, sb_reached, dsb_hosts, dsb_holding, units, conf)
+        taken = standby_write(sb_hosts, sb_reached, units, conf, fpdb, rates, say, plan=plan) if sb_hosts else set()
+        drop_standby_write(dsb_hosts, units, conf, rates, say, taken, dsb_holding, plan=plan)
     if not launched_any and not dry_run:
         say("[autorun] nothing launched this time.")
 
